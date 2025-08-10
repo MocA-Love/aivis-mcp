@@ -27,7 +27,7 @@ export class MCPService {
     this.mcpServer = new McpServer({
       name: MCP_MODEL_NAME,
       version: '1.0.0',
-      description: 'Aivis Cloud音声合成のMCPサーバー',
+      description: 'Aivis 音声合成/再生ツール',
       capabilities: {
         tools: true
       }
