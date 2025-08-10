@@ -10,8 +10,8 @@ const envPath = path.join(__dirname, '../../.env');
 dotenv.config({ path: envPath });
 
 // MCPモデル設定
-const MCP_MODEL_ID = 'aivis-speech-synthesis';
-const MCP_MODEL_NAME = 'Aivis Speech Synthesis';
+const MCP_MODEL_ID = 'aivis-speech';
+const MCP_MODEL_NAME = 'Aivis Speech';
 
 /**
  * MCPサービスクラス

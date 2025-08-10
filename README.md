@@ -54,12 +54,12 @@ AIVIS_MODEL_UUID=a59cb814-0083-4369-8542-f51a29e72af7  # デフォルトモデ�
 
 ```bash
 # MCPサーバーを登録
-claude mcp add aivis-speech \
+claude mcp add aivis \
   -s user \
   -- node /full/path/to/aivis-mcp/dist/index.js
 
 # 登録を削除する場合
-claude mcp remove aivis-speech
+claude mcp remove aivis
 ```
 
 
@@ -76,18 +76,6 @@ claude mcp remove aivis-speech
 「"了解しました"と音声で返事して」
 ```
 
-### 開発・テスト
-
-```bash
-# 開発モード（ホットリロード付き）
-npm run dev
-
-# テスト実行
-npm test
-
-# 直接テスト
-node test-synthesis.js
-```
 
 ## 音声プレイヤーのインストール
 
@@ -143,7 +131,6 @@ MCPツール呼び出し時に以下のパラメータを指定できます：
 
 1. **APIキーの確認**: `.env`ファイルにAPIキーが正しく設定されているか確認
 2. **音声プレイヤーの確認**: `which ffplay`（macOS/Linux）または`where ffplay`（Windows）でプレイヤーがインストールされているか確認
-3. **ログの確認**: `logs/aivis-speech.log`でエラーを確認（デバッグ時）
 
 ### APIキーが読み込まれない
 
