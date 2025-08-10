@@ -7,6 +7,8 @@ dist/
 # Environment variables
 .env
 
+.serena
+
 # Logs
 logs
 *.log
