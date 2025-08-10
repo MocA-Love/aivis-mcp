@@ -31,7 +31,7 @@ npm install
 npm run build
 
 # 環境変数の設定
-cp .env.sample .env
+cp .env.example .env
 # .envファイルを編集してAPIキーを設定
 ```
 
@@ -39,14 +39,41 @@ cp .env.sample .env
 
 `.env`ファイルで以下の設定を行います：
 
+### 必須設定
+
 ```env
 # Aivis Cloud API Configuration
 AIVIS_API_KEY=your_api_key_here  # 必須：Aivis Cloud APIキー
 AIVIS_API_URL=https://api.aivis-project.com/v1  # APIエンドポイント（通常は変更不要）
-
-# Model Configuration
-AIVIS_MODEL_UUID=a59cb814-0083-4369-8542-f51a29e72af7  # デフォルトモデル（好みで変更 AivisHubにサンプル音声とモデルUUIDがある）
 ```
+
+### オプション設定（環境変数で音声パラメータをカスタマイズ）
+
+```env
+# Model Configuration
+AIVIS_MODEL_UUID=a59cb814-0083-4369-8542-f51a29e72af7  # 使用する音声合成モデルのUUID
+
+# Speaker Configuration  
+AIVIS_SPEAKER_UUID=  # 話者UUID（特定の話者を使用する場合）
+
+# Style Configuration
+AIVIS_STYLE_ID=  # スタイルID（0-31）
+AIVIS_STYLE_NAME=  # スタイル名（スタイルIDの代わりに指定可能）
+
+# Voice Parameters
+AIVIS_SPEAKING_RATE=1.0  # 話速（0.5-2.0）
+AIVIS_EMOTIONAL_INTENSITY=1.0  # 感情表現の強さ（0.0-2.0）
+AIVIS_TEMPO_DYNAMICS=1.0  # テンポの緩急（0.0-2.0）
+AIVIS_PITCH=0.0  # ピッチ（-1.0-1.0）
+AIVIS_VOLUME=1.0  # 音量（0.0-2.0）
+
+# Silence Configuration
+AIVIS_LEADING_SILENCE_SECONDS=0  # 音声先頭の無音時間（秒）
+AIVIS_TRAILING_SILENCE_SECONDS=0  # 音声末尾の無音時間（秒）
+AIVIS_LINE_BREAK_SILENCE_SECONDS=0  # 改行時の無音時間（秒）
+```
+
+詳細な設定例は`.env.example`ファイルを参照してください。
 
 ## Claude Codeへの登録
 
@@ -105,25 +132,24 @@ sudo dnf install ffmpeg
 sudo dnf install mpv
 ```
 
-## 利用可能なパラメータ
+## 音声パラメータのカスタマイズ
 
-MCPツール呼び出し時に以下のパラメータを指定できます：
+音声合成のパラメータは環境変数で設定します。`.env`ファイルで以下の値をカスタマイズできます：
 
-| パラメータ | 型 | 説明 | 範囲/値 |
-|-----------|-----|------|---------|
-| text | string | 音声合成するテキスト（必須） | - |
-| model_uuid | string | モデルUUID | - |
-| speaker_uuid | string | 話者UUID | - |
-| style_id | number | スタイルID | 0-31 |
-| style_name | string | スタイル名 | - |
-| speaking_rate | number | 話速 | 0.5-2.0 |
-| emotional_intensity | number | 感情表現の強さ | 0.0-2.0 |
-| tempo_dynamics | number | テンポの緩急 | 0.0-2.0 |
-| pitch | number | ピッチ | -1.0-1.0 |
-| volume | number | 音量 | 0.0-2.0 |
-| leading_silence_seconds | number | 音声先頭の無音時間（秒） | 0.0- |
-| trailing_silence_seconds | number | 音声末尾の無音時間（秒） | 0.0- |
-| line_break_silence_seconds | number | 改行時の無音時間（秒） | 0.0- |
+| 環境変数 | 説明 | 範囲/デフォルト値 |
+|---------|------|-----------------|
+| AIVIS_MODEL_UUID | モデルUUID | - |
+| AIVIS_SPEAKER_UUID | 話者UUID | - |
+| AIVIS_STYLE_ID | スタイルID | 0-31 |
+| AIVIS_STYLE_NAME | スタイル名 | - |
+| AIVIS_SPEAKING_RATE | 話速 | 0.5-2.0 (デフォルト: 1.0) |
+| AIVIS_EMOTIONAL_INTENSITY | 感情表現の強さ | 0.0-2.0 (デフォルト: 1.0) |
+| AIVIS_TEMPO_DYNAMICS | テンポの緩急 | 0.0-2.0 (デフォルト: 1.0) |
+| AIVIS_PITCH | ピッチ | -1.0-1.0 (デフォルト: 0.0) |
+| AIVIS_VOLUME | 音量 | 0.0-2.0 (デフォルト: 1.0) |
+| AIVIS_LEADING_SILENCE_SECONDS | 音声先頭の無音時間（秒） | 0.0- (デフォルト: 0) |
+| AIVIS_TRAILING_SILENCE_SECONDS | 音声末尾の無音時間（秒） | 0.0- (デフォルト: 0) |
+| AIVIS_LINE_BREAK_SILENCE_SECONDS | 改行時の無音時間（秒） | 0.0- (デフォルト: 0) |
 
 ## トラブルシューティング
 

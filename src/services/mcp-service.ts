@@ -37,37 +37,31 @@ export class MCPService {
     this.mcpServer.tool(
       MCP_MODEL_ID,
       {
-        text: z.string().describe('音声合成するテキスト'),
-        model_uuid: z.string().optional().describe('モデルUUID'),
-        speaker_uuid: z.string().optional().describe('話者UUID'),
-        style_id: z.number().optional().describe('スタイルID (0-31)'),
-        style_name: z.string().optional().describe('スタイル名'),
-        speaking_rate: z.number().min(0.5).max(2.0).optional().describe('話速 (0.5-2.0)'),
-        emotional_intensity: z.number().min(0.0).max(2.0).optional().describe('感情表現の強さ (0.0-2.0)'),
-        tempo_dynamics: z.number().min(0.0).max(2.0).optional().describe('テンポの緩急 (0.0-2.0)'),
-        pitch: z.number().min(-1.0).max(1.0).optional().describe('ピッチ (-1.0-1.0)'),
-        volume: z.number().min(0.0).max(2.0).optional().describe('音量 (0.0-2.0)'),
-        leading_silence_seconds: z.number().min(0.0).optional().describe('音声先頭の無音時間 (秒)'),
-        trailing_silence_seconds: z.number().min(0.0).optional().describe('音声末尾の無音時間 (秒)'),
-        line_break_silence_seconds: z.number().min(0.0).optional().describe('改行時の無音時間 (秒)')
+        text: z.string().describe('音声合成するテキスト')
       },
       async (params) => {
         try {
-          // Aivis Cloud APIリクエストの作成
+          // 環境変数からデフォルト値を取得
+          const getEnvNumber = (key: string, defaultValue?: number) => {
+            const value = process.env[key];
+            return value ? parseFloat(value) : defaultValue;
+          };
+
+          // Aivis Cloud APIリクエストの作成（環境変数から設定を取得）
           const synthesisRequest = {
             text: params.text,
-            model_uuid: params.model_uuid,
-            speaker_uuid: params.speaker_uuid,
-            style_id: params.style_id,
-            style_name: params.style_name,
-            speaking_rate: params.speaking_rate,
-            emotional_intensity: params.emotional_intensity,
-            tempo_dynamics: params.tempo_dynamics,
-            pitch: params.pitch,
-            volume: params.volume,
-            leading_silence_seconds: params.leading_silence_seconds,
-            trailing_silence_seconds: params.trailing_silence_seconds,
-            line_break_silence_seconds: params.line_break_silence_seconds
+            model_uuid: process.env.AIVIS_MODEL_UUID,
+            speaker_uuid: process.env.AIVIS_SPEAKER_UUID,
+            style_id: getEnvNumber('AIVIS_STYLE_ID'),
+            style_name: process.env.AIVIS_STYLE_NAME,
+            speaking_rate: getEnvNumber('AIVIS_SPEAKING_RATE'),
+            emotional_intensity: getEnvNumber('AIVIS_EMOTIONAL_INTENSITY'),
+            tempo_dynamics: getEnvNumber('AIVIS_TEMPO_DYNAMICS'),
+            pitch: getEnvNumber('AIVIS_PITCH'),
+            volume: getEnvNumber('AIVIS_VOLUME'),
+            leading_silence_seconds: getEnvNumber('AIVIS_LEADING_SILENCE_SECONDS'),
+            trailing_silence_seconds: getEnvNumber('AIVIS_TRAILING_SILENCE_SECONDS'),
+            line_break_silence_seconds: getEnvNumber('AIVIS_LINE_BREAK_SILENCE_SECONDS')
           };
 
           // バックグラウンドで音声合成を実行（awaitしない）
