@@ -1,7 +1,7 @@
-# Aivis Speech MCP サーバー
+# Aivis Cloud MCP サーバー
 
-Aivis Cloud APIを使用したMCPサーバーです。
-MCP対応アプリケーションから高品質な音声合成機能を利用できるようにします。
+Aivis Cloud APIを使用したMCPサーバー
+Claude Codeで音声合成機能を利用できるようにします。
 音声合成と再生はバックグラウンドで行うよう工夫してるので開発効率の邪魔をしません。
 
 ## 特徴
@@ -9,7 +9,7 @@ MCP対応アプリケーションから高品質な音声合成機能を利用�
 - **即座にレスポンス**:
   バックグラウンドで音声生成・再生を行い、即座に"OK"を返します
 - **ストリーミング再生**: 音声データを受信しながらリアルタイムで再生
-- **クロスプラットフォーム対応**:
+- **クロスプラットフォーム対応?**:
   Windows、macOSで動作するはず(macでしか動作確認してない)
 
 ## 必要条件
@@ -18,7 +18,7 @@ MCP対応アプリケーションから高品質な音声合成機能を利用�
 - npm 9.x以上
 - Aivis Cloud
   APIキー（[Aivis Hub](https://hub.aivis-project.com/cloud-api/api-keys)から取得）
-- 音声プレイヤー（ffplay推奨、mpv、afplayも対応）
+- 音声プレイヤー（ffplay推奨、mpv、afplayも対応?）
 
 ## インストール
 
@@ -38,45 +38,29 @@ cp .env.example .env
 # .envファイルを編集してAPIキーを設定
 ```
 
+## FFmpegのインストール
+
+### macOS
+
+```bash
+brew install ffmpeg
+```
+
+### Windows
+
+- [FFmpeg公式サイト](https://ffmpeg.org/download.html)からダウンロード
+
+> [!NOTE]
+> ffplayがインストールされていない場合、一時ファイル経由での再生となり遅延が発生。
+
 ## 環境設定
 
 `.env`ファイルで以下の設定を行います：
 
-### 必須設定
-
 ```env
-# Aivis Cloud API Configuration
 AIVIS_API_KEY=your_api_key_here  # 必須：Aivis Cloud APIキー
 AIVIS_API_URL=https://api.aivis-project.com/v1  # APIエンドポイント（通常は変更不要）
 ```
-
-### オプション設定（環境変数で音声パラメータをカスタマイズ）
-
-```env
-# Model Configuration
-AIVIS_MODEL_UUID=a59cb814-0083-4369-8542-f51a29e72af7  # 使用する音声合成モデルのUUID
-
-# Speaker Configuration  
-AIVIS_SPEAKER_UUID=  # 話者UUID（特定の話者を使用する場合）
-
-# Style Configuration
-AIVIS_STYLE_ID=  # スタイルID（0-31）
-AIVIS_STYLE_NAME=  # スタイル名（スタイルIDの代わりに指定可能）
-
-# Voice Parameters
-AIVIS_SPEAKING_RATE=1.0  # 話速（0.5-2.0）
-AIVIS_EMOTIONAL_INTENSITY=1.0  # 感情表現の強さ（0.0-2.0）
-AIVIS_TEMPO_DYNAMICS=1.0  # テンポの緩急（0.0-2.0）
-AIVIS_PITCH=0.0  # ピッチ（-1.0-1.0）
-AIVIS_VOLUME=1.0  # 音量（0.0-2.0）
-
-# Silence Configuration
-AIVIS_LEADING_SILENCE_SECONDS=0  # 音声先頭の無音時間（秒）
-AIVIS_TRAILING_SILENCE_SECONDS=0  # 音声末尾の無音時間（秒）
-AIVIS_LINE_BREAK_SILENCE_SECONDS=0  # 改行時の無音時間（秒）
-```
-
-詳細な設定例は`.env.example`ファイルを参照してください。
 
 ## Claude Codeへの登録
 
@@ -96,24 +80,12 @@ claude mcp remove aivis
 
 ```
 「aivis mcpで"こんにちは"と言って」
-「音声で"作業が完了しました"と教えて」
-「"了解しました"と音声で返事して」
 ```
 
 ## カスタムコマンド
-Claude Codeでカスタムコマンドとしてaivis.mdのように登録することで簡単に音声で報告してくれるようにできます
 
-## 音声プレイヤーのインストール
-
-### macOS
-
-```bash
-brew install ffmpeg
-```
-
-### Windows
-
-- [FFmpeg公式サイト](https://ffmpeg.org/download.html)からダウンロード
+Claude
+Codeでカスタムコマンドとしてaivis.mdのように登録することで簡単に音声で報告してくれるようにできます
 
 ## 音声パラメータのカスタマイズ
 
@@ -133,22 +105,6 @@ brew install ffmpeg
 | AIVIS_LEADING_SILENCE_SECONDS    | 音声先頭の無音時間（秒） | 0.0- (デフォルト: 0)       |
 | AIVIS_TRAILING_SILENCE_SECONDS   | 音声末尾の無音時間（秒） | 0.0- (デフォルト: 0)       |
 | AIVIS_LINE_BREAK_SILENCE_SECONDS | 改行時の無音時間（秒）   | 0.0- (デフォルト: 0)       |
-
-## トラブルシューティング
-
-### 音声が再生されない
-
-1. **APIキーの確認**: `.env`ファイルにAPIキーが正しく設定されているか確認
-2. **音声プレイヤーの確認**:
-   `which ffplay`（macOS）または`where ffplay`（Windows）でプレイヤーがインストールされているか確認
-
-### APIキーが読み込まれない
-
-MCPサーバーは異なる作業ディレクトリで起動される場合があるため、`.env`ファイルは絶対パスで読み込まれます。`.env`ファイルがプロジェクトルートに存在することを確認してください。
-
-### 音声の遅延
-
-ffplayがインストールされていない場合、一時ファイル経由での再生となり遅延が発生する可能性があります。
 
 ## アーキテクチャ
 
@@ -178,7 +134,3 @@ ffplayがインストールされていない場合、一時ファイル経由�
 └───────────────┘     └──────────┘
     音声生成            ストリーミング再生
 ```
-
-## ライセンス
-
-[MIT](LICENSE)
