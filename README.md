@@ -4,6 +4,9 @@ Aivis Cloud APIを使用したMCPサーバー
 Claude Codeで音声合成機能を利用できるようにします。
 音声合成と再生はバックグラウンドで行うよう工夫してるので開発効率の邪魔をしません。
 
+# デモ
+https://github.com/user-attachments/assets/6e66db38-8c8a-4315-bd7b-234eceef143c
+
 ## 特徴
 
 - **即座にレスポンス**:
