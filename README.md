@@ -5,7 +5,9 @@ Claude Codeで音声合成機能を利用できるようにします。
 音声合成と再生はバックグラウンドで行うよう工夫してるので開発効率の邪魔をしません。
 
 # デモ
-https://github.com/user-attachments/assets/6e66db38-8c8a-4315-bd7b-234eceef143c
+https://github.com/user-attachments/assets/c42722bd-8f2f-4543-bdc6-71668db3751d
+
+
 
 ## 特徴
 
