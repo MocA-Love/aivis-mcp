@@ -18,6 +18,7 @@ const MCP_MODEL_NAME = 'Aivis Speech';
  */
 export class MCPService {
   private mcpServer: McpServer;
+  private workerProcessStarted: boolean;
 
   /**
    * コンストラクタ
@@ -33,11 +34,15 @@ export class MCPService {
       }
     });
 
+    this.workerProcessStarted = false;
+
     // 音声合成ツールの登録
     this.mcpServer.tool(
       MCP_MODEL_ID,
       {
-        text: z.string().describe('音声合成するテキスト')
+        text: z.string().describe('音声合成するテキスト'),
+        model_uuid: z.string().optional().describe('音声合成モデルのUUID（未指定時は環境変数）'),
+        wait_ms: z.number().int().min(0).max(60000).optional().describe('API呼び出し前の待機時間（ミリ秒、最大60000）')
       },
       async (params) => {
         try {
@@ -50,8 +55,8 @@ export class MCPService {
           // Aivis Cloud APIリクエストの作成（環境変数から設定を取得）
           const synthesisRequest = {
             text: params.text,
-            model_uuid: process.env.AIVIS_MODEL_UUID,
-            speaker_uuid: process.env.AIVIS_SPEAKER_UUID,
+            wait_ms: params.wait_ms,
+            model_uuid: params.model_uuid ?? process.env.AIVIS_MODEL_UUID,
             style_id: getEnvNumber('AIVIS_STYLE_ID'),
             style_name: process.env.AIVIS_STYLE_NAME,
             speaking_rate: getEnvNumber('AIVIS_SPEAKING_RATE'),
@@ -99,6 +104,7 @@ export class MCPService {
     console.error('Starting MCP Server with stdio transport...');
 
     try {
+      this.startWorkerProcess();
       // 標準入出力トランスポートを作成して接続
       const transport = new StdioServerTransport();
       await this.mcpServer.connect(transport);
@@ -110,6 +116,29 @@ export class MCPService {
       console.error('Error starting MCP server:', error);
       throw error;
     }
+  }
+
+  async runWorker(): Promise<void> {
+    await aivisSpeechService.runWorkerLoop();
+  }
+
+  private startWorkerProcess(): void {
+    if (this.workerProcessStarted) {
+      return;
+    }
+    this.workerProcessStarted = true;
+
+    const env = {
+      ...process.env,
+      AIVIS_WORKER_MODE: '1'
+    };
+
+    const child = require('child_process').spawn(
+      process.execPath,
+      [process.argv[1]],
+      { env, stdio: 'ignore', detached: true }
+    );
+    child.unref();
   }
 }
 

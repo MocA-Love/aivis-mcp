@@ -1,7 +1,7 @@
 # Aivis Cloud MCP サーバー
 
 Aivis Cloud APIを使用したMCPサーバー
-Claude Codeで音声合成機能を利用できるようにします。
+Claude Code, Codexで音声合成機能を利用できるようにします。
 音声合成と再生はバックグラウンドで行うよう工夫してるので開発効率の邪魔をしません。
 
 # デモ
@@ -12,8 +12,9 @@ https://github.com/user-attachments/assets/c42722bd-8f2f-4543-bdc6-71668db3751d
 ## 特徴
 
 - **即座にレスポンス**:
-  バックグラウンドで音声生成・再生を行い、即座に"OK"を返します
+  バックグラウンドで音声生成・再生を行い、即座に`OK (R:xxxxms)`を返します
 - **ストリーミング再生**: 音声データを受信しながらリアルタイムで再生
+- **キューで順次再生**: Redisキューで順番に再生し、複数プロセス/複数同時呼び出しでも音声の重なりを防止
 - **クロスプラットフォーム対応?**:
   Windows、macOSで動作するはず(macでしか動作確認してない)
 
@@ -24,6 +25,7 @@ https://github.com/user-attachments/assets/c42722bd-8f2f-4543-bdc6-71668db3751d
 - Aivis Cloud
   APIキー（[Aivis Hub](https://hub.aivis-project.com/cloud-api/api-keys)から取得）
 - 音声プレイヤー（ffplay推奨、mpv、afplayも対応?）
+- Redis（ローカルで起動）
 
 ## インストール
 
@@ -43,12 +45,52 @@ cp .env.example .env
 # .envファイルを編集してAPIキーを設定
 ```
 
+## Redisのインストール
+
+### macOS
+
+```bash
+brew install redis
+```
+
+### Windows
+
+```powershell
+winget install Redis.Redis
+```
+
+### Linux (Ubuntu/Debian)
+
+```bash
+sudo apt update
+sudo apt install redis-server
+```
+
+### Linux (Fedora)
+
+```bash
+sudo dnf install redis
+```
+
 ## FFmpegのインストール
 
 ### macOS
 
 ```bash
 brew install ffmpeg
+```
+
+### Linux (Ubuntu/Debian)
+
+```bash
+sudo apt update
+sudo apt install ffmpeg
+```
+
+### Linux (Fedora)
+
+```bash
+sudo dnf install ffmpeg
 ```
 
 ### Windows
@@ -65,11 +107,10 @@ brew install ffmpeg
 ```env
 AIVIS_API_KEY=your_api_key_here  # 必須：Aivis Cloud APIキー
 AIVIS_API_URL=https://api.aivis-project.com/v1  # APIエンドポイント（通常は変更不要）
+REDIS_URL=redis://127.0.0.1:6379  # Redis接続先（通常は変更不要）
 ```
 
 ## Claude Codeへの登録
-
-### コマンドラインから登録
 
 ```bash
 # MCPサーバーを登録
@@ -81,10 +122,25 @@ claude mcp add aivis \
 claude mcp remove aivis
 ```
 
+## Codexへの登録
+
+```bash
+codex mcp add aivis -- node /Users/magu/github/aivis-mcp/dist/index.js
+```
+
 ## 使い方
 
 ```
 「aivis mcpで"こんにちは"と言って」
+```
+
+### パラメータ指定例
+
+```json
+{
+  "text": "こんにちは",
+  "model_uuid": "your-model-uuid"
+}
 ```
 
 ## カスタムコマンド
@@ -99,7 +155,6 @@ Codeでカスタムコマンドとしてaivis.mdのように登録すること�
 | 環境変数                         | 説明                     | 範囲/デフォルト値          |
 | -------------------------------- | ------------------------ | -------------------------- |
 | AIVIS_MODEL_UUID                 | モデルUUID               | -                          |
-| AIVIS_SPEAKER_UUID               | 話者UUID                 | -                          |
 | AIVIS_STYLE_ID                   | スタイルID               | 0-31                       |
 | AIVIS_STYLE_NAME                 | スタイル名               | -                          |
 | AIVIS_SPEAKING_RATE              | 話速                     | 0.5-2.0 (デフォルト: 1.0)  |
@@ -124,14 +179,19 @@ Codeでカスタムコマンドとしてaivis.mdのように登録すること�
 └────────┬────────┘
          │
 ┌────────▼────────┐
-│  MCP Service    │ ← バックグラウンド処理
+│  MCP Service    │ ← 即応答
 │ (mcp-service.ts)│   即座に"OK"を返す
 └────────┬────────┘
          │
 ┌────────▼────────────┐
-│ AivisSpeech Service │ ← 音声合成と再生
-│(aivis-speech-svc.ts)│
+│  Worker Process     │ ← キューを順次処理
+│ (aivis-speech-svc)  │   音声合成と再生
 └──────┬──────────────┘
+       │
+┌──────▼────────┐
+│    Redis      │
+│    Queue      │
+└──────┬────────┘
        │
 ┌──────▼────────┐     ┌──────────┐
 │ Aivis Cloud   │     │ ffplay/  │

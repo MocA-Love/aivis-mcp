@@ -7,6 +7,11 @@ import mcpService from './services/mcp-service';
  */
 async function main() {
   try {
+    if (process.env.AIVIS_WORKER_MODE === '1') {
+      await mcpService.runWorker();
+      return;
+    }
+
     // MCPサーバーを起動
     await mcpService.start();
 

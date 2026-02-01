@@ -4,6 +4,8 @@ import path from 'path';
 import { spawn } from 'child_process';
 import { platform } from 'os';
 import dotenv from 'dotenv';
+import { createClient, type RedisClientType } from 'redis';
+import { v4 as uuidv4 } from 'uuid';
 
 // .envファイルを絶対パスで読み込む
 const envPath = path.join(__dirname, '../../.env');
@@ -17,6 +19,15 @@ export class AivisSpeechService {
   private apiKey: string;
   private defaultModelUuid: string;
   private defaultOutputFormat: string;
+  private redisClient: RedisClientType;
+  private redisWorkerClient: RedisClientType;
+  private redisUrl: string;
+  private queueKey: string;
+  private workerLockKey: string;
+  private workerId: string;
+  private workerHeartbeat?: NodeJS.Timeout;
+  private workerActive: boolean;
+  private debugEnabled: boolean;
 
   /**
    * コンストラクタ
@@ -26,7 +37,21 @@ export class AivisSpeechService {
     this.apiKey = process.env.AIVIS_API_KEY || '';
     this.defaultModelUuid = process.env.AIVIS_MODEL_UUID || 'a59cb814-0083-4369-8542-f51a29e72af7';
     this.defaultOutputFormat = 'mp3'; // mp3固定
-    
+    this.redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+    this.queueKey = process.env.AIVIS_QUEUE_KEY || 'aivis-mcp:queue';
+    this.workerLockKey = process.env.AIVIS_WORKER_LOCK_KEY || 'aivis-mcp:worker-lock';
+    this.workerId = uuidv4();
+    this.workerActive = false;
+    this.debugEnabled = process.env.AIVIS_DEBUG === '1';
+    this.redisClient = createClient({ url: this.redisUrl });
+    this.redisWorkerClient = createClient({ url: this.redisUrl });
+
+    this.redisClient.on('error', (error) => {
+      console.error('Redis error:', error);
+    });
+    this.redisWorkerClient.on('error', (error) => {
+      console.error('Redis worker error:', error);
+    });
   }
 
 
@@ -36,14 +61,194 @@ export class AivisSpeechService {
    * @param params 音声合成パラメータ
    */
   async synthesizeInBackground(params: any): Promise<void> {
-    // バックグラウンドで実行（即座にresolveして戻る）
-    setImmediate(async () => {
-      try {
-        await this.synthesizeAndPlay(params);
-      } catch (error) {
-        console.error('Background synthesis error:', error);
+    try {
+      await this.ensureRedisReady();
+      if (this.debugEnabled) {
+        console.error('[queue] enqueue', {
+          instance: this.workerId,
+          wait_ms: params.wait_ms
+        });
       }
-    });
+      await this.redisClient.rPush(this.queueKey, JSON.stringify(params));
+    } catch (error) {
+      console.error('Queue enqueue error:', error);
+    }
+  }
+
+  private async ensureRedisReady(): Promise<void> {
+    if (this.redisClient.isOpen && this.redisWorkerClient.isOpen) {
+      return;
+    }
+
+    await this.ensureRedisRunning();
+    if (!this.redisClient.isOpen) {
+      await this.redisClient.connect();
+    }
+    if (!this.redisWorkerClient.isOpen) {
+      await this.redisWorkerClient.connect();
+    }
+  }
+
+  private async ensureRedisRunning(): Promise<void> {
+    const probe = createClient({ url: this.redisUrl });
+    try {
+      await probe.connect();
+      await probe.ping();
+      await probe.disconnect();
+      if (this.debugEnabled) {
+        console.error('[redis] ready');
+      }
+      return;
+    } catch (error) {
+      await probe.disconnect().catch(() => undefined);
+      if (this.debugEnabled) {
+        console.error('[redis] not running, try start');
+      }
+      await this.tryStartRedis();
+      for (let i = 0; i < 10; i += 1) {
+        try {
+          const retry = createClient({ url: this.redisUrl });
+          await retry.connect();
+          await retry.ping();
+          await retry.disconnect();
+          if (this.debugEnabled) {
+            console.error('[redis] started');
+          }
+          return;
+        } catch {
+          await this.sleep(200);
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async tryStartRedis(): Promise<void> {
+    const lockPath = path.join(process.cwd(), 'temp', 'redis-start.lock');
+    try {
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+      const lockFd = fs.openSync(lockPath, 'wx');
+      fs.closeSync(lockFd);
+    } catch (error) {
+      if (this.debugEnabled) {
+        console.error('[redis] start skipped (lock exists)');
+      }
+      return;
+    }
+
+    try {
+      const child = spawn('redis-server', ['--save', '', '--appendonly', 'no'], {
+        detached: true,
+        stdio: 'ignore'
+      });
+      child.unref();
+      if (this.debugEnabled) {
+        console.error('[redis] start attempted');
+      }
+    } catch (error) {
+      console.error('Failed to start redis-server:', error);
+    } finally {
+      setTimeout(() => {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {}
+      }, 3000);
+    }
+  }
+
+  async runWorkerLoop(): Promise<void> {
+    await this.ensureRedisReady();
+
+    if (!(await this.tryAcquireWorkerLock())) {
+      if (this.debugEnabled) {
+        console.error('[worker] lock not acquired, exiting', { instance: this.workerId });
+      }
+      return;
+    }
+
+    if (this.debugEnabled) {
+      console.error('[worker] lock acquired', { instance: this.workerId });
+    }
+
+    const heartbeatMs = 5000;
+    this.workerHeartbeat = setInterval(() => {
+      this.refreshWorkerLock().catch((error) => {
+        console.error('Worker lock refresh error:', error);
+      });
+    }, heartbeatMs);
+
+    await this.startWorker();
+  }
+
+  private async tryAcquireWorkerLock(): Promise<boolean> {
+    const acquired = await this.redisClient.set(
+      this.workerLockKey,
+      this.workerId,
+      { NX: true, PX: 20000 }
+    );
+    return Boolean(acquired);
+  }
+
+  private async refreshWorkerLock(): Promise<void> {
+    if (!this.redisClient.isOpen) {
+      return;
+    }
+    const updated = await this.redisClient.eval(
+      'if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("PEXPIRE", KEYS[1], ARGV[2]) else return 0 end',
+      {
+        keys: [this.workerLockKey],
+        arguments: [this.workerId, '20000']
+      }
+    );
+    if (!updated) {
+      if (this.debugEnabled) {
+        console.error('[worker] lock lost', { instance: this.workerId });
+      }
+      this.stopWorker();
+    }
+  }
+
+  private stopWorker(): void {
+    if (this.workerHeartbeat) {
+      clearInterval(this.workerHeartbeat);
+      this.workerHeartbeat = undefined;
+    }
+    this.workerActive = false;
+  }
+
+  private async startWorker(): Promise<void> {
+    if (this.workerActive) {
+      return;
+    }
+    this.workerActive = true;
+
+    while (this.workerActive) {
+      try {
+        const result = await this.redisWorkerClient.brPop(this.queueKey, 1);
+        if (!result) {
+          continue;
+        }
+        if (this.debugEnabled) {
+          console.error('[queue] dequeue', { instance: this.workerId });
+        }
+        const payload = JSON.parse(result.element);
+        if (this.debugEnabled) {
+          console.error('[synthesize] start', { instance: this.workerId });
+        }
+        await this.synthesizeAndPlay(payload);
+        if (this.debugEnabled) {
+          console.error('[synthesize] done', { instance: this.workerId });
+        }
+      } catch (error) {
+        console.error('Queue worker error:', error);
+      }
+    }
+
+    this.stopWorker();
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -56,6 +261,11 @@ export class AivisSpeechService {
       if (!this.apiKey) {
         console.error('APIキーが設定されていません');
         return;
+      }
+
+      if (typeof params.wait_ms === 'number' && params.wait_ms > 0) {
+        const waitMs = Math.min(params.wait_ms, 60000);
+        await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
       }
 
       // リクエストパラメータを構築
@@ -164,19 +374,21 @@ export class AivisSpeechService {
 
       // ファイルから再生（OS標準のプレイヤーを使用）
       if (system === 'darwin') {
-        spawn('afplay', [audioFilePath], { stdio: 'ignore' });
+        await new Promise<void>((resolve, reject) => {
+          const proc = spawn('afplay', [audioFilePath], { stdio: 'ignore' });
+          proc.on('error', reject);
+          proc.on('close', () => resolve());
+        });
       } else if (system === 'win32') {
         spawn('cmd', ['/c', 'start', '', audioFilePath], { stdio: 'ignore' });
       } else {
         console.error('No audio player found for playback');
       }
 
-      // 一時ファイルの遅延削除（再生完了を待つ）
-      setTimeout(() => {
-        try {
-          fs.unlinkSync(audioFilePath);
-        } catch {}
-      }, 30000); // 30秒後に削除
+      // 一時ファイルの削除
+      try {
+        fs.unlinkSync(audioFilePath);
+      } catch {}
 
       return;
     }
@@ -220,6 +432,11 @@ export class AivisSpeechService {
     stream.on('error', (error: any) => {
       console.error('Stream error:', error);
       playerProcess.kill();
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      playerProcess.on('close', () => resolve());
+      playerProcess.on('error', reject);
     });
   }
 
