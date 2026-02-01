@@ -96,16 +96,16 @@ export class MCPService {
    * MCPサーバーを起動する
    */
   async start(): Promise<void> {
-    console.log('Starting MCP Server with stdio transport...');
+    console.error('Starting MCP Server with stdio transport...');
 
     try {
       // 標準入出力トランスポートを作成して接続
       const transport = new StdioServerTransport();
       await this.mcpServer.connect(transport);
 
-      console.log('MCP Server started successfully');
-      console.log(`Tool registered: ${MCP_MODEL_ID}`);
-      console.log('Waiting for requests...');
+      console.error('MCP Server started successfully');
+      console.error(`Tool registered: ${MCP_MODEL_ID}`);
+      console.error('Waiting for requests...');
     } catch (error) {
       console.error('Error starting MCP server:', error);
       throw error;
