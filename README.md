@@ -110,6 +110,9 @@ AIVIS_API_URL=https://api.aivis-project.com/v1  # APIエンドポイント（通
 REDIS_URL=redis://127.0.0.1:6379  # Redis接続先（通常は変更不要）
 ```
 
+> [!TIP]
+> `.env`ファイルを編集すると自動的に変更が検知され、次のリクエストから新しい設定が反映されます。Claude Desktopの再起動は不要です。
+
 ## Claude Codeへの登録
 
 ```bash

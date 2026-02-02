@@ -27,6 +27,7 @@
     "@types/cors": "^2.8.17",
     "@types/uuid": "^10.0.0",
     "axios": "^1.8.3",
+    "chokidar": "^5.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^5.0.1",
@@ -35,6 +36,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/chokidar": "^1.7.5",
     "@types/express": "^5.0.0",
     "@types/jest": "^29.5.14",
     "@types/node": "^22.13.10",

@@ -6,43 +6,71 @@ import { platform } from 'os';
 import dotenv from 'dotenv';
 import { createClient, type RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
+import chokidar from 'chokidar';
 
 // .envファイルを絶対パスで読み込む
 const envPath = path.join(__dirname, '../../.env');
 dotenv.config({ path: envPath });
 
+// .envファイルを監視して自動リロード
+const watcher = chokidar.watch(envPath, {
+  ignoreInitial: true
+});
+
+watcher.on('change', () => {
+  dotenv.config({ path: envPath, override: true });
+  console.error('[env] .env file reloaded');
+});
+
 /**
  * Aivis Cloud APIとの通信を行うサービスクラス
  */
 export class AivisSpeechService {
-  private baseUrl: string;
-  private apiKey: string;
-  private defaultModelUuid: string;
-  private defaultOutputFormat: string;
   private redisClient: RedisClientType;
   private redisWorkerClient: RedisClientType;
-  private redisUrl: string;
-  private queueKey: string;
-  private workerLockKey: string;
   private workerId: string;
   private workerHeartbeat?: NodeJS.Timeout;
   private workerActive: boolean;
-  private debugEnabled: boolean;
+
+  // 環境変数から動的に取得するプロパティ
+  private get baseUrl(): string {
+    return process.env.AIVIS_API_URL || 'https://api.aivis-project.com/v1';
+  }
+
+  private get apiKey(): string {
+    return process.env.AIVIS_API_KEY || '';
+  }
+
+  private get defaultModelUuid(): string {
+    return process.env.AIVIS_MODEL_UUID || 'a59cb814-0083-4369-8542-f51a29e72af7';
+  }
+
+  private get defaultOutputFormat(): string {
+    return 'mp3'; // mp3固定
+  }
+
+  private get redisUrl(): string {
+    return process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+  }
+
+  private get queueKey(): string {
+    return process.env.AIVIS_QUEUE_KEY || 'aivis-mcp:queue';
+  }
+
+  private get workerLockKey(): string {
+    return process.env.AIVIS_WORKER_LOCK_KEY || 'aivis-mcp:worker-lock';
+  }
+
+  private get debugEnabled(): boolean {
+    return process.env.AIVIS_DEBUG === '1';
+  }
 
   /**
    * コンストラクタ
    */
   constructor() {
-    this.baseUrl = process.env.AIVIS_API_URL || 'https://api.aivis-project.com/v1';
-    this.apiKey = process.env.AIVIS_API_KEY || '';
-    this.defaultModelUuid = process.env.AIVIS_MODEL_UUID || 'a59cb814-0083-4369-8542-f51a29e72af7';
-    this.defaultOutputFormat = 'mp3'; // mp3固定
-    this.redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
-    this.queueKey = process.env.AIVIS_QUEUE_KEY || 'aivis-mcp:queue';
-    this.workerLockKey = process.env.AIVIS_WORKER_LOCK_KEY || 'aivis-mcp:worker-lock';
     this.workerId = uuidv4();
     this.workerActive = false;
-    this.debugEnabled = process.env.AIVIS_DEBUG === '1';
     this.redisClient = createClient({ url: this.redisUrl });
     this.redisWorkerClient = createClient({ url: this.redisUrl });
 

@@ -3,11 +3,22 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import dotenv from 'dotenv';
 import path from 'path';
+import chokidar from 'chokidar';
 import aivisSpeechService from './aivis-speech-service';
 
 // .envファイルを絶対パスで読み込む
 const envPath = path.join(__dirname, '../../.env');
 dotenv.config({ path: envPath });
+
+// .envファイルを監視して自動リロード
+const watcher = chokidar.watch(envPath, {
+  ignoreInitial: true
+});
+
+watcher.on('change', () => {
+  dotenv.config({ path: envPath, override: true });
+  console.error('[env] .env file reloaded');
+});
 
 // MCPモデル設定
 const MCP_MODEL_ID = 'aivis-speech';
@@ -30,7 +41,7 @@ export class MCPService {
       version: '1.0.0',
       description: 'Aivis 音声合成/再生ツール',
       capabilities: {
-        tools: true
+        tools: {}
       }
     });
 
@@ -101,17 +112,11 @@ export class MCPService {
    * MCPサーバーを起動する
    */
   async start(): Promise<void> {
-    console.error('Starting MCP Server with stdio transport...');
-
     try {
       this.startWorkerProcess();
       // 標準入出力トランスポートを作成して接続
       const transport = new StdioServerTransport();
       await this.mcpServer.connect(transport);
-
-      console.error('MCP Server started successfully');
-      console.error(`Tool registered: ${MCP_MODEL_ID}`);
-      console.error('Waiting for requests...');
     } catch (error) {
       console.error('Error starting MCP server:', error);
       throw error;
