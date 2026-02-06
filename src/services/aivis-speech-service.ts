@@ -61,6 +61,10 @@ export class AivisSpeechService {
     return process.env.AIVIS_WORKER_LOCK_KEY || 'aivis-mcp:worker-lock';
   }
 
+  private get playLockKey(): string {
+    return 'aivis-mcp:play-lock';
+  }
+
   private get debugEnabled(): boolean {
     return process.env.AIVIS_DEBUG === '1';
   }
@@ -191,6 +195,8 @@ export class AivisSpeechService {
       if (this.debugEnabled) {
         console.error('[worker] lock not acquired, exiting', { instance: this.workerId });
       }
+      await this.cleanup();
+      process.exit(0);
       return;
     }
 
@@ -244,6 +250,30 @@ export class AivisSpeechService {
     this.workerActive = false;
   }
 
+  private async acquirePlayLock(): Promise<void> {
+    while (true) {
+      const acquired = await this.redisClient.set(this.playLockKey, this.workerId, { NX: true, PX: 120000 });
+      if (acquired) return;
+      await this.sleep(100);
+    }
+  }
+
+  private async releasePlayLock(): Promise<void> {
+    try {
+      await this.redisClient.del(this.playLockKey);
+    } catch {}
+  }
+
+  private async cleanup(): Promise<void> {
+    try {
+      if (this.redisClient.isOpen) await this.redisClient.disconnect();
+    } catch {}
+    try {
+      if (this.redisWorkerClient.isOpen) await this.redisWorkerClient.disconnect();
+    } catch {}
+    watcher.close();
+  }
+
   private async startWorker(): Promise<void> {
     if (this.workerActive) {
       return;
@@ -260,12 +290,17 @@ export class AivisSpeechService {
           console.error('[queue] dequeue', { instance: this.workerId });
         }
         const payload = JSON.parse(result.element);
-        if (this.debugEnabled) {
-          console.error('[synthesize] start', { instance: this.workerId });
-        }
-        await this.synthesizeAndPlay(payload);
-        if (this.debugEnabled) {
-          console.error('[synthesize] done', { instance: this.workerId });
+        await this.acquirePlayLock();
+        try {
+          if (this.debugEnabled) {
+            console.error('[synthesize] start', { instance: this.workerId });
+          }
+          await this.synthesizeAndPlay(payload);
+          if (this.debugEnabled) {
+            console.error('[synthesize] done', { instance: this.workerId });
+          }
+        } finally {
+          await this.releasePlayLock();
         }
       } catch (error) {
         console.error('Queue worker error:', error);
@@ -284,7 +319,7 @@ export class AivisSpeechService {
    * @param params 音声合成パラメータ
    * @returns void
    */
-  private async synthesizeAndPlay(params: any): Promise<void> {
+  async synthesizeAndPlay(params: any): Promise<void> {
     try {
       if (!this.apiKey) {
         console.error('APIキーが設定されていません');

@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "dist/index.js",
   "bin": {
-    "aivis-mcp": "./dist/index.js"
+    "aivis-mcp": "./dist/index.js",
+    "aivis": "./dist/cli.js"
   },
   "scripts": {
     "start": "node dist/index.js",
