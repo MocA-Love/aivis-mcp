@@ -33,11 +33,8 @@ https://github.com/user-attachments/assets/c42722bd-8f2f-4543-bdc6-71668db3751d
 git clone https://github.com/MocA-Love/aivis-mcp.git
 cd aivis-mcp
 
-# 依存関係のインストール
+# 依存関係のインストール（自動でビルド＋aivisコマンドのグローバル登録も行われます）
 npm install
-
-# ビルド
-npm run build
 
 # 環境変数の設定
 cp .env.example .env
@@ -157,11 +154,9 @@ IDEでは、`~/.gemini/antigravity/mcp_config.json`に以下のように設定�
 ## CLIコマンドとして使う
 
 MCPサーバーとしてだけでなく、ターミナルから直接音声合成を実行できます。
+`npm install` 時に自動で `aivis` コマンドがグローバル登録されます。
 
 ```bash
-# グローバルにコマンドを登録
-npm link
-
 # 基本的な使い方
 aivis "こんにちは"
 
@@ -170,47 +165,26 @@ aivis "こんにちは" --model your-model-uuid
 
 # 待機時間を指定（ミリ秒）
 aivis "こんにちは" --wait 1000
+
+# ヘルスチェック（Redis・ワーカー・プレイヤー・プロセス多重起動等の状態確認）
+aivis --health
+
+# 再起動（全プロセス停止→Redis初期化→ワーカー再起動）
+aivis --reboot
 ```
 
-MCP経由の再生と排他制御されているため、同時に音声が重なることはありません。
+CLIはMCPと同じRedisキュー経由で再生されるため、即座にコマンドが返ります。
+MCP経由の再生とも排他制御されており、同時に音声が重なることはありません。
+ワーカーが起動していない場合は自動的に起動します。
 
-## MCPツールとしての使い方
+`--reboot` はビルド後に最新のコードでワーカーを立ち上げ直したい時に使います。
+MCPサーバーはクライアント（Claude Desktop等）が自動で再起動します。
 
-```
-「aivis mcpで"こんにちは"と言って」
-```
-
-### パラメータ指定例
-
-```json
-{
-  "text": "こんにちは",
-  "model_uuid": "your-model-uuid"
-}
-```
 
 ## カスタムコマンド
 
 Claude
 Codeでカスタムコマンドとしてaivis.mdのように登録することで簡単に音声で報告してくれるようにできます
-
-## 音声パラメータのカスタマイズ
-
-音声合成のパラメータは環境変数で設定します。`.env`ファイルで以下の値をカスタマイズできます：
-
-| 環境変数                         | 説明                     | 範囲/デフォルト値          |
-| -------------------------------- | ------------------------ | -------------------------- |
-| AIVIS_MODEL_UUID                 | モデルUUID               | -                          |
-| AIVIS_STYLE_ID                   | スタイルID               | 0-31                       |
-| AIVIS_STYLE_NAME                 | スタイル名               | -                          |
-| AIVIS_SPEAKING_RATE              | 話速                     | 0.5-2.0 (デフォルト: 1.0)  |
-| AIVIS_EMOTIONAL_INTENSITY        | 感情表現の強さ           | 0.0-2.0 (デフォルト: 1.0)  |
-| AIVIS_TEMPO_DYNAMICS             | テンポの緩急             | 0.0-2.0 (デフォルト: 1.0)  |
-| AIVIS_PITCH                      | ピッチ                   | -1.0-1.0 (デフォルト: 0.0) |
-| AIVIS_VOLUME                     | 音量                     | 0.0-2.0 (デフォルト: 1.0)  |
-| AIVIS_LEADING_SILENCE_SECONDS    | 音声先頭の無音時間（秒） | 0.0- (デフォルト: 0)       |
-| AIVIS_TRAILING_SILENCE_SECONDS   | 音声末尾の無音時間（秒） | 0.0- (デフォルト: 0)       |
-| AIVIS_LINE_BREAK_SILENCE_SECONDS | 改行時の無音時間（秒）   | 0.0- (デフォルト: 0)       |
 
 ## アーキテクチャ
 
@@ -229,18 +203,25 @@ Codeでカスタムコマンドとしてaivis.mdのように登録すること�
 │ (mcp-service.ts)│     │  (cli.ts)       │
 └────────┬────────┘     └───────┬─────────┘
          │                      │
-┌────────▼────────────┐         │
-│  Worker Process     │         │
-│ (aivis-speech-svc)  │         │
-└──────┬──────────────┘         │
-       │    ┌───────────┐       │
-       └───▶│   Redis   │◀─────┘
-            │ play-lock │  排他制御
-            └─────┬─────┘
-                  │
-          ┌───────▼───────┐     ┌──────────┐
-          │ Aivis Cloud   │     │ ffplay/  │
-          │     API       │────▶│   mpv    │
-          └───────────────┘     └──────────┘
-              音声生成           ストリーミング再生
+         │    ┌───────────┐     │
+         └───▶│   Redis   │◀───┘
+              │   Queue   │  両方ともキューにエンキュー
+              └─────┬─────┘
+                    │ dequeue
+           ┌────────▼──────────┐
+           │  Worker Process   │
+           │ (aivis-speech-svc)│
+           │  play-lock で     │
+           │  排他制御         │
+           └────────┬──────────┘
+                    │
+            ┌───────▼───────┐     ┌──────────┐
+            │ Aivis Cloud   │     │ ffplay/  │
+            │     API       │────▶│   mpv    │
+            └───────────────┘     └──────────┘
+                音声生成           ストリーミング再生
 ```
+
+## 変更履歴
+
+[CHANGELOG.md](./CHANGELOG.md) を参照してください。

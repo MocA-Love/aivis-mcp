@@ -1,6 +1,6 @@
 {
   "name": "aivis-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "dist/index.js",
   "bin": {
     "aivis-mcp": "./dist/index.js",
@@ -12,7 +12,7 @@
     "build": "tsc",
     "test": "jest",
     "test:watch": "jest --watch",
-    "prepare": "npm run build"
+    "prepare": "npm run build && ([ \"$AIVIS_SKIP_LINK\" = \"1\" ] || AIVIS_SKIP_LINK=1 npm link 2>/dev/null || true)"
   },
   "keywords": [
     "aivis",

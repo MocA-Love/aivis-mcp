@@ -4,12 +4,11 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { createClient, type RedisClientType } from 'redis';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
+import { platform } from 'os';
 
 const envPath = path.join(__dirname, '../.env');
 dotenv.config({ path: envPath });
-
-import { AivisSpeechService } from './services/aivis-speech-service';
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -71,18 +70,182 @@ async function connectRedis(redisUrl: string): Promise<RedisClientType> {
   process.exit(1);
 }
 
-const PLAY_LOCK_KEY = 'aivis-mcp:play-lock';
+const WORKER_LOCK_KEY = process.env.AIVIS_WORKER_LOCK_KEY || 'aivis-mcp:worker-lock';
+const QUEUE_KEY = process.env.AIVIS_QUEUE_KEY || 'aivis-mcp:queue';
 
-async function acquirePlayLock(client: RedisClientType): Promise<void> {
-  while (true) {
-    const acquired = await client.set(PLAY_LOCK_KEY, '1', { NX: true, PX: 120000 });
-    if (acquired) return;
-    await sleep(100);
+function spawnWorker(): void {
+  const indexPath = path.join(__dirname, 'index.js');
+  const child = spawn(process.execPath, [indexPath, '--worker'], {
+    env: { ...process.env, AIVIS_WORKER_MODE: '1' },
+    stdio: 'ignore',
+    detached: true,
+  });
+  child.unref();
+}
+
+async function ensureWorkerRunning(client: RedisClientType): Promise<void> {
+  const workerLock = await client.get(WORKER_LOCK_KEY);
+  if (workerLock) return;
+  spawnWorker();
+  await sleep(300);
+}
+
+interface AivisProcess {
+  pid: string;
+  cmd: string;
+  isWorker: boolean;
+}
+
+function getAivisProcesses(): AivisProcess[] {
+  const myPid = process.pid.toString();
+  try {
+    const output = execSync('ps aux', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const lines = output.split('\n');
+    const results: AivisProcess[] = [];
+    for (const line of lines) {
+      if (!line.includes('aivis-mcp/dist/index.js')) continue;
+      if (line.includes('ps aux')) continue;
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 2) continue;
+      const pid = parts[1];
+      if (pid === myPid) continue;
+      const cmd = parts.slice(10).join(' ');
+      const isWorker = line.includes('--worker');
+      results.push({ pid, cmd, isWorker });
+    }
+    return results;
+  } catch {
+    return [];
   }
 }
 
-async function releasePlayLock(client: RedisClientType): Promise<void> {
-  await client.del(PLAY_LOCK_KEY);
+async function healthCheck(): Promise<void> {
+  const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+
+  console.log('=== aivis health check ===');
+  console.log('');
+
+  // API Key
+  const apiKey = process.env.AIVIS_API_KEY;
+  console.log(`API Key:       ${apiKey ? 'OK' : 'NG (未設定)'}`);
+
+  // Redis
+  let client: RedisClientType | null = null;
+  try {
+    client = createClient({ url: redisUrl }) as RedisClientType;
+    await client.connect();
+    await client.ping();
+    console.log(`Redis:         OK (${redisUrl})`);
+
+    // Worker
+    const workerLock = await client.get(WORKER_LOCK_KEY);
+    console.log(`Worker:        ${workerLock ? 'OK' : 'NG (停止中)'}`);
+
+    // Queue
+    const queueLen = await client.lLen(QUEUE_KEY);
+    console.log(`Queue:         ${queueLen} 件`);
+
+    // Play lock
+    const playLock = await client.get('aivis-mcp:play-lock');
+    console.log(`Play Lock:     ${playLock ? '使用中' : '空き'}`);
+
+    await client.disconnect();
+  } catch {
+    console.log(`Redis:         NG (接続失敗: ${redisUrl})`);
+    if (client) await client.disconnect().catch(() => {});
+  }
+
+  // Processes
+  const procs = getAivisProcesses();
+  const workers = procs.filter(p => p.isWorker);
+  const mcpServers = procs.filter(p => !p.isWorker);
+  console.log(`Processes:     ${procs.length} 件`);
+  if (workers.length > 1) {
+    console.log(`  Workers:     ${workers.length} (多重起動)`);
+  } else {
+    console.log(`  Workers:     ${workers.length}`);
+  }
+  console.log(`  MCP Servers: ${mcpServers.length}`);
+  for (const p of procs) {
+    console.log(`  PID ${p.pid}: ${p.isWorker ? '[worker]' : '[mcp]'} ${p.cmd}`);
+  }
+
+  // Audio player
+  const system = platform();
+  let players: string[] = [];
+  if (system === 'darwin') {
+    players = ['ffplay', 'mpv', 'afplay'];
+  } else if (system === 'linux') {
+    players = ['ffplay', 'mpv', 'mplayer', 'play'];
+  } else if (system === 'win32') {
+    players = ['ffplay.exe', 'mpv.exe'];
+  }
+
+  const available: string[] = [];
+  for (const player of players) {
+    try {
+      const checkCmd = system === 'win32' ? 'where' : 'which';
+      const result = spawn(checkCmd, [player], { stdio: 'pipe' });
+      await new Promise<void>((resolve) => {
+        result.on('exit', (code) => {
+          if (code === 0) available.push(player);
+          resolve();
+        });
+      });
+    } catch {}
+  }
+  console.log(`Audio Player:  ${available.length > 0 ? `OK (${available.join(', ')})` : 'NG (未検出)'}`);
+
+  // Model
+  const modelUuid = process.env.AIVIS_MODEL_UUID;
+  console.log(`Model UUID:    ${modelUuid || 'デフォルト'}`);
+}
+
+async function reboot(): Promise<void> {
+  console.log('aivis reboot...');
+
+  // 1. 既存プロセスを停止
+  const procs = getAivisProcesses();
+  const workers = procs.filter(p => p.isWorker);
+  const mcpServers = procs.filter(p => !p.isWorker);
+
+  if (workers.length > 0) {
+    console.log(`Workers: ${workers.length} 件を停止`);
+    for (const p of workers) {
+      try { process.kill(parseInt(p.pid, 10), 'SIGTERM'); } catch {}
+    }
+  }
+  if (mcpServers.length > 0) {
+    console.log(`MCP Servers: ${mcpServers.length} 件を停止（クライアントが自動再起動します）`);
+    for (const p of mcpServers) {
+      try { process.kill(parseInt(p.pid, 10), 'SIGTERM'); } catch {}
+    }
+  }
+  if (procs.length > 0) {
+    await sleep(500);
+  }
+
+  // 2. Redisのaivis関連キーをクリア
+  const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+  try {
+    const client = await connectRedis(redisUrl);
+    const keys = await client.keys('aivis-mcp:*');
+    if (keys.length > 0) {
+      await client.del(keys);
+      console.log(`Redis: ${keys.length} 件のキーを削除`);
+    } else {
+      console.log('Redis: クリア済み');
+    }
+    await client.disconnect();
+  } catch {
+    console.log('Redis: 接続失敗（スキップ）');
+  }
+
+  // 3. 新しいワーカーを起動
+  spawnWorker();
+  await sleep(500);
+  console.log('新しいワーカーを起動しました');
+  console.log('reboot 完了');
 }
 
 async function main() {
@@ -90,6 +253,18 @@ async function main() {
 
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     console.log('Usage: aivis <text> [--model <model_uuid>] [--wait <ms>]');
+    console.log('       aivis --health');
+    console.log('       aivis --reboot');
+    process.exit(0);
+  }
+
+  if (args[0] === '--health') {
+    await healthCheck();
+    process.exit(0);
+  }
+
+  if (args[0] === '--reboot') {
+    await reboot();
     process.exit(0);
   }
 
@@ -147,17 +322,13 @@ async function main() {
   const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
   const client = await connectRedis(redisUrl);
 
-  // ロック取得（他のCLIプロセスの再生完了を待つ）
-  await acquirePlayLock(client);
+  // ワーカーが動いていなければ起動
+  await ensureWorkerRunning(client);
 
-  try {
-    const service = new AivisSpeechService();
-    await service.synthesizeAndPlay(params);
-  } finally {
-    await releasePlayLock(client);
-    await client.disconnect();
-  }
+  // キューにエンキュー（即座に返す）
+  await client.rPush(QUEUE_KEY, JSON.stringify(params));
 
+  await client.disconnect();
   process.exit(0);
 }
 

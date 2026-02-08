@@ -140,7 +140,7 @@ export class MCPService {
 
     const child = require('child_process').spawn(
       process.execPath,
-      [process.argv[1]],
+      [process.argv[1], '--worker'],
       { env, stdio: 'ignore', detached: true }
     );
     child.unref();
