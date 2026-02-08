@@ -6,6 +6,7 @@ import { AivisSpeechService } from './services/aivis-speech-service.js';
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { runHealth, runReboot } from './commands.js';
 import { runDoctor, checkDependencies } from './doctor.js';
+import { runInit } from './settings.js';
 
 function printHelp(): void {
   console.log(`aivis-mcp v${version}`);
@@ -15,6 +16,7 @@ function printHelp(): void {
   console.log('  aivis-mcp <text> [options]         テキストを音声合成');
   console.log('  aivis-mcp --health                 ヘルスチェック');
   console.log('  aivis-mcp --reboot                 全プロセス再起動');
+  console.log('  aivis-mcp --init                   初期設定（APIキー等を保存）');
   console.log('  aivis-mcp --doctor                 依存ツール診断');
   console.log('  aivis-mcp --version                バージョン表示');
   console.log('');
@@ -61,6 +63,12 @@ async function main() {
   // --help
   if (values.help) {
     printHelp();
+    process.exit(0);
+  }
+
+  // --init
+  if (values.init) {
+    await runInit();
     process.exit(0);
   }
 

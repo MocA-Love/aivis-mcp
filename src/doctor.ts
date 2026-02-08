@@ -2,6 +2,7 @@ import { spawn, execSync, spawnSync } from 'child_process';
 import * as readline from 'node:readline';
 import { platform } from 'os';
 import type { AppConfig } from './config.js';
+import { getConfigPath } from './settings.js';
 
 const system = platform();
 
@@ -159,8 +160,10 @@ export async function runDoctor(config: AppConfig): Promise<void> {
     okCount++;
   } else {
     console.log('  NG  未設定');
+    console.log('      npx aivis-mcp --init で設定するか、');
     console.log('      環境変数 AIVIS_API_KEY または --api-key で指定してください');
     console.log('      APIキーの取得: https://hub.aivis-project.com/cloud-api/api-keys');
+    console.log(`      設定ファイル: ${getConfigPath()}`);
   }
   console.log('');
 

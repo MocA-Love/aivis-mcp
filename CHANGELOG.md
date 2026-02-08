@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.1.0] - 2026-02-09
+
+### `--init` コマンド追加
+
+CLIから初期設定（APIキー、モデルUUID）を `~/.config/aivis-mcp/config.json` に保存できるようになりました。
+
+```bash
+npx aivis-mcp --init
+```
+
+- 設定の優先順位: CLI引数 > 環境変数 > config file > デフォルト値
+- MCP経由でもCLI経由でも同じ設定ファイルを参照
+
 ## [2.0.0] - 2026-02-09
 
 ### npx対応・npm公開

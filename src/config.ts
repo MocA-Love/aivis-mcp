@@ -1,5 +1,6 @@
 import { parseArgs } from 'node:util';
 import { createRequire } from 'module';
+import { loadSettings } from './settings.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -34,6 +35,7 @@ export interface ParsedArgs {
 export const cliOptions = {
   help:                  { type: 'boolean' as const, short: 'h', default: false },
   version:               { type: 'boolean' as const, short: 'v', default: false },
+  init:                  { type: 'boolean' as const, default: false },
   doctor:                { type: 'boolean' as const, default: false },
   health:                { type: 'boolean' as const, default: false },
   reboot:                { type: 'boolean' as const, default: false },
@@ -81,18 +83,22 @@ function optString(cliVal: string | boolean | undefined, envKey: string): string
 }
 
 export function resolveConfig(values: Record<string, string | boolean | undefined>): AppConfig {
+  const settings = loadSettings();
   return {
     apiKey:
       (typeof values['api-key'] === 'string' ? values['api-key'] : undefined)
       ?? process.env.AIVIS_API_KEY
+      ?? settings.apiKey
       ?? '',
     apiUrl:
       (typeof values['api-url'] === 'string' ? values['api-url'] : undefined)
       ?? process.env.AIVIS_API_URL
+      ?? settings.apiUrl
       ?? 'https://api.aivis-project.com/v1',
     modelUuid:
       (typeof values.model === 'string' ? values.model : undefined)
       ?? process.env.AIVIS_MODEL_UUID
+      ?? settings.modelUuid
       ?? 'a59cb814-0083-4369-8542-f51a29e72af7',
     styleName: optString(values['style-name'], 'AIVIS_STYLE_NAME'),
     styleId: optNumber(values['style-id'], 'AIVIS_STYLE_ID'),
@@ -107,6 +113,7 @@ export function resolveConfig(values: Record<string, string | boolean | undefine
     redisUrl:
       (typeof values['redis-url'] === 'string' ? values['redis-url'] : undefined)
       ?? process.env.REDIS_URL
+      ?? settings.redisUrl
       ?? 'redis://127.0.0.1:6379',
     debug: values.debug === true || process.env.AIVIS_DEBUG === '1',
     queueKey: 'aivis-mcp:queue',

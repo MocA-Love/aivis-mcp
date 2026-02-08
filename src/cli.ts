@@ -4,6 +4,7 @@ import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './co
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { runHealth, runReboot } from './commands.js';
 import { runDoctor } from './doctor.js';
+import { runInit } from './settings.js';
 
 export async function runCli(config: ReturnType<typeof resolveConfig>, text: string, waitMs?: number): Promise<void> {
   if (!text) {
@@ -26,6 +27,7 @@ function printHelp(): void {
   console.log('  aivis <text> [options]            テキストを音声合成');
   console.log('  aivis --health                    ヘルスチェック');
   console.log('  aivis --reboot                    全プロセス再起動');
+  console.log('  aivis --init                      初期設定（APIキー等を保存）');
   console.log('  aivis --doctor                    依存ツール診断');
   console.log('  aivis --version                   バージョン表示');
   console.log('');
@@ -50,6 +52,11 @@ async function main() {
 
   if (values.version) {
     console.log(`aivis-mcp v${version}`);
+    process.exit(0);
+  }
+
+  if (values.init) {
+    await runInit();
     process.exit(0);
   }
 

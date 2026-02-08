@@ -30,7 +30,16 @@ https://github.com/user-attachments/assets/c42722bd-8f2f-4543-bdc6-71668db3751d
 
 ## セットアップ
 
-### 1. 依存ツールの確認
+### 1. 初期設定
+
+```bash
+npx aivis-mcp --init
+```
+
+APIキー等を `~/.config/aivis-mcp/config.json` に保存します。
+一度設定すれば、CLI/MCPどちらでも自動で読み込まれます。
+
+### 2. 依存ツールの確認
 
 ```bash
 npx aivis-mcp --doctor
@@ -38,7 +47,7 @@ npx aivis-mcp --doctor
 
 Redis や FFmpeg が未インストールの場合、対話的にインストールできます。
 
-### 2. MCPサーバーの登録
+### 3. MCPサーバーの登録
 
 #### Claude Code
 
