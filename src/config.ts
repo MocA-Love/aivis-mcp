@@ -99,7 +99,7 @@ export function resolveConfig(values: Record<string, string | boolean | undefine
       (typeof values.model === 'string' ? values.model : undefined)
       ?? process.env.AIVIS_MODEL_UUID
       ?? settings.modelUuid
-      ?? 'a59cb814-0083-4369-8542-f51a29e72af7',
+      ?? 'a670e6b8-0852-45b2-8704-1bc9862f2fe6',
     styleName: optString(values['style-name'], 'AIVIS_STYLE_NAME'),
     styleId: optNumber(values['style-id'], 'AIVIS_STYLE_ID'),
     speakingRate: optNumber(values.rate, 'AIVIS_SPEAKING_RATE'),
