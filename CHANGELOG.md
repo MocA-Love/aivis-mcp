@@ -1,5 +1,73 @@
 # Changelog
 
+## [2.0.0] - 2026-02-09
+
+### npx対応・npm公開
+
+`npx -y aivis-mcp` でインストール不要で即実行できるようになりました。
+
+```json
+{
+  "mcpServers": {
+    "aivis": {
+      "command": "npx",
+      "args": ["-y", "aivis-mcp"],
+      "env": { "AIVIS_API_KEY": "your_key" }
+    }
+  }
+}
+```
+
+### 環境変数の大幅削減
+
+必須の環境変数は `AIVIS_API_KEY` のみになりました。
+音声パラメータはすべてCLI引数で設定可能です。
+
+- `--model`, `--rate`, `--pitch`, `--volume` 等のCLI引数を追加
+- CLI引数 > 環境変数 > デフォルト値 の優先順位で適用
+- `.env` ファイルとホットリロード機能を廃止
+
+### `--doctor` コマンド追加
+
+依存ツール（Redis、FFmpeg）の診断と対話的なインストール補助を追加しました。
+
+```
+$ npx aivis-mcp --doctor
+
+=== aivis-mcp doctor ===
+
+[1/4] Node.js
+  OK  v22.12.0 (>= 18.x)
+
+[2/4] AIVIS_API_KEY
+  OK  設定済み
+
+[3/4] Redis
+  NG  redis-server が見つかりません
+      インストールしますか？ (brew install redis) [Y/n]
+
+[4/4] FFmpeg (ffplay)
+  OK  ffplay が見つかりました
+```
+
+MCPサーバー起動時にも依存不足をstderrで警告します。
+
+### 不要依存パッケージの除去
+
+以下のパッケージを削除しました：
+
+- `dotenv` - CLI引数 + 環境変数で完結
+- `chokidar` - .envホットリロード廃止
+- `express`, `cors` - 未使用
+
+### コードの構造改善
+
+- `src/config.ts` - 設定の一元管理（AppConfig型、resolveConfig）
+- `src/doctor.ts` - 依存診断コマンド
+- `src/commands.ts` - health/rebootコマンドの切り出し
+- `src/services/redis-service.ts` - Redis関連ロジックの共通化
+- シングルトンパターンを廃止し、依存注入（AppConfig）に変更
+
 ## [1.2.0] - 2025-02-09
 
 ### ESM移行
@@ -48,41 +116,9 @@ CLI側の安全でない play-lock 実装を廃止しました。
 
 環境の状態を一覧で確認できるヘルスチェックコマンドを追加しました。
 
-```
-=== aivis health check ===
-
-API Key:       OK
-Redis:         OK (redis://127.0.0.1:6379)
-Worker:        OK
-Queue:         0 件
-Play Lock:     空き
-Processes:     2 件
-  Workers:     1
-  MCP Servers: 1
-Audio Player:  OK (ffplay, afplay)
-Model UUID:    デフォルト
-```
-
-確認項目:
-- API Key の設定有無
-- Redis の接続状態
-- ワーカープロセスの稼働状況
-- キューの滞留件数
-- play-lock の使用状態
-- プロセスの多重起動検出（ワーカー / MCP サーバー を区別して表示）
-- 音声プレイヤーの検出状況
-- 使用中のモデル UUID
-
 ### `aivis --reboot` コマンド追加
 
 全プロセスの停止・Redis初期化・ワーカー再起動を一括で行うコマンドを追加しました。
-ビルド後に最新コードへ切り替えたい時や、多重起動を解消したい時に使用します。
-
-処理内容:
-1. 既存のワーカープロセスを SIGTERM で停止
-2. MCP サーバープロセスを停止（クライアントが自動で再起動）
-3. Redis の `aivis-mcp:*` キーを全削除
-4. 新しいワーカーを起動
 
 ### `npm install` 時の自動セットアップ
 

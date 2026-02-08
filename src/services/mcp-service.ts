@@ -1,46 +1,28 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import dotenv from 'dotenv';
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
-import chokidar from 'chokidar';
-import aivisSpeechService from './aivis-speech-service.js';
+import type { AppConfig } from '../config.js';
+import { AivisSpeechService } from './aivis-speech-service.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// .envファイルを絶対パスで読み込む
-const envPath = path.join(__dirname, '../../.env');
-dotenv.config({ path: envPath });
-
-// .envファイルを監視して自動リロード
-const watcher = chokidar.watch(envPath, {
-  ignoreInitial: true
-});
-
-watcher.on('change', () => {
-  dotenv.config({ path: envPath, override: true });
-  console.error('[env] .env file reloaded');
-});
-
-// MCPモデル設定
 const MCP_MODEL_ID = 'aivis-speech';
 const MCP_MODEL_NAME = 'Aivis Speech';
 
-/**
- * MCPサービスクラス
- */
 export class MCPService {
   private mcpServer: McpServer;
+  private speechService: AivisSpeechService;
+  private config: AppConfig;
   private workerProcessStarted: boolean;
 
-  /**
-   * コンストラクタ
-   */
-  constructor() {
-    // MCPサーバーの初期化
+  constructor(config: AppConfig) {
+    this.config = config;
+    this.speechService = new AivisSpeechService(config);
+
     this.mcpServer = new McpServer({
       name: MCP_MODEL_NAME,
       version: '1.0.0',
@@ -52,47 +34,36 @@ export class MCPService {
 
     this.workerProcessStarted = false;
 
-    // 音声合成ツールの登録
     this.mcpServer.tool(
       MCP_MODEL_ID,
       {
         text: z.string().describe('音声合成するテキスト'),
-        model_uuid: z.string().optional().describe('音声合成モデルのUUID（未指定時は環境変数）'),
+        model_uuid: z.string().optional().describe('音声合成モデルのUUID（未指定時はデフォルト）'),
         wait_ms: z.number().int().min(0).max(60000).optional().describe('API呼び出し前の待機時間（ミリ秒、最大60000）')
       },
       async (params) => {
         try {
-          // 環境変数からデフォルト値を取得
-          const getEnvNumber = (key: string, defaultValue?: number) => {
-            const value = process.env[key];
-            return value ? parseFloat(value) : defaultValue;
-          };
-
-          // Aivis Cloud APIリクエストの作成（環境変数から設定を取得）
           const synthesisRequest = {
             text: params.text,
             wait_ms: params.wait_ms,
-            model_uuid: params.model_uuid ?? process.env.AIVIS_MODEL_UUID,
-            style_id: getEnvNumber('AIVIS_STYLE_ID'),
-            style_name: process.env.AIVIS_STYLE_NAME,
-            speaking_rate: getEnvNumber('AIVIS_SPEAKING_RATE'),
-            emotional_intensity: getEnvNumber('AIVIS_EMOTIONAL_INTENSITY'),
-            tempo_dynamics: getEnvNumber('AIVIS_TEMPO_DYNAMICS'),
-            pitch: getEnvNumber('AIVIS_PITCH'),
-            volume: getEnvNumber('AIVIS_VOLUME'),
-            leading_silence_seconds: getEnvNumber('AIVIS_LEADING_SILENCE_SECONDS'),
-            trailing_silence_seconds: getEnvNumber('AIVIS_TRAILING_SILENCE_SECONDS'),
-            line_break_silence_seconds: getEnvNumber('AIVIS_LINE_BREAK_SILENCE_SECONDS')
+            model_uuid: params.model_uuid ?? this.config.modelUuid,
+            style_id: this.config.styleId,
+            style_name: this.config.styleName,
+            speaking_rate: this.config.speakingRate,
+            emotional_intensity: this.config.emotionalIntensity,
+            tempo_dynamics: this.config.tempoDynamics,
+            pitch: this.config.pitch,
+            volume: this.config.volume,
+            leading_silence_seconds: this.config.leadingSilenceSeconds,
+            trailing_silence_seconds: this.config.trailingSilenceSeconds,
+            line_break_silence_seconds: this.config.lineBreakSilenceSeconds
           };
 
-          // バックグラウンドで音声合成を実行（awaitしない）
-          aivisSpeechService.synthesizeInBackground(synthesisRequest)
+          this.speechService.synthesizeInBackground(synthesisRequest)
             .catch((error: unknown) => {
-              // バックグラウンドエラーは標準エラー出力にログを出すのみ
               console.error('Background synthesis error:', error);
             });
 
-          // 即座にOKレスポンスを返す
           return {
             content: [
               {
@@ -113,13 +84,9 @@ export class MCPService {
     );
   }
 
-  /**
-   * MCPサーバーを起動する
-   */
   async start(): Promise<void> {
     try {
       this.startWorkerProcess();
-      // 標準入出力トランスポートを作成して接続
       const transport = new StdioServerTransport();
       await this.mcpServer.connect(transport);
     } catch (error) {
@@ -129,7 +96,7 @@ export class MCPService {
   }
 
   async runWorker(): Promise<void> {
-    await aivisSpeechService.runWorkerLoop();
+    await this.speechService.runWorkerLoop();
   }
 
   private startWorkerProcess(): void {
@@ -138,19 +105,17 @@ export class MCPService {
     }
     this.workerProcessStarted = true;
 
-    const env = {
-      ...process.env,
-      AIVIS_WORKER_MODE: '1'
-    };
+    const indexPath = path.join(__dirname, '../index.js');
 
     const child = spawn(
       process.execPath,
-      [process.argv[1], '--worker'],
-      { env, stdio: 'ignore', detached: true }
+      [indexPath, '--worker'],
+      {
+        env: { ...process.env, AIVIS_WORKER_MODE: '1' },
+        stdio: 'ignore',
+        detached: true
+      }
     );
     child.unref();
   }
 }
-
-// シングルトンインスタンスをエクスポート
-export default new MCPService();
