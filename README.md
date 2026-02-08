@@ -1,6 +1,6 @@
 # Aivis Cloud MCP サーバー
 
-Aivis Cloud APIを使用したMCPサーバー 音声合成機能を利用できるようにします。
+[Aivis Cloud API](https://hub.aivis-project.com/)を使用したMCPサーバー 音声合成機能を利用できるようにします。
 音声合成と再生はバックグラウンドで行うよう工夫してるので開発効率の邪魔をしません。
 
 # デモ
@@ -10,7 +10,7 @@ https://github.com/user-attachments/assets/c42722bd-8f2f-4543-bdc6-71668db3751d
 ## 特徴
 
 - **即座にレスポンス**:
-  バックグラウンドで音声生成・再生を行い、即座に`OK (R:xxxxms)`を返します
+  バックグラウンドで音声生成・再生を行い、即座に`OK`を返します
 - **ストリーミング再生**: 音声データを受信しながらリアルタイムで再生
 - **キューで順次再生**:
   Redisキューで順番に再生し、複数プロセス/複数同時呼び出しでも音声の重なりを防止
@@ -46,9 +46,18 @@ Redis や FFmpeg が未インストールの場合、対話的にインストー
 claude mcp add aivis -s user -e AIVIS_API_KEY=your_api_key -- npx -y aivis-mcp
 ```
 
-#### Claude Desktop / Cursor / その他のMCPクライアント
+#### Codex
 
-`claude_desktop_config.json` に以下を追加：
+```bash
+codex mcp add aivis -- npx -y aivis-mcp
+```
+
+<details>
+<summary>Claude Desktop / Cursor / Antigravity IDE / その他（JSON設定）</summary>
+
+**Claude Desktop / Cursor / Antigravity IDE**
+
+各クライアントのMCP設定ファイルに追加：
 
 ```json
 {
@@ -64,7 +73,7 @@ claude mcp add aivis -s user -e AIVIS_API_KEY=your_api_key -- npx -y aivis-mcp
 }
 ```
 
-#### モデルや音声パラメータを指定する場合
+モデルや音声パラメータを指定する場合：
 
 ```json
 {
@@ -80,29 +89,7 @@ claude mcp add aivis -s user -e AIVIS_API_KEY=your_api_key -- npx -y aivis-mcp
 }
 ```
 
-#### Codex
-
-```bash
-codex mcp add aivis -- npx -y aivis-mcp
-```
-
-#### Antigravity IDE
-
-`~/.gemini/antigravity/mcp_config.json` に以下を追加：
-
-```json
-{
-  "mcpServers": {
-    "aivis": {
-      "command": "npx",
-      "args": ["-y", "aivis-mcp"],
-      "env": {
-        "AIVIS_API_KEY": "your_api_key_here"
-      }
-    }
-  }
-}
-```
+</details>
 
 ## CLI引数
 
@@ -224,10 +211,9 @@ sudo dnf install ffmpeg
 
 </details>
 
-## カスタムコマンド
+## 使用例
 
-Claude
-Codeでカスタムコマンドとして[aivis.md](./aivis.md)のように登録することで簡単に音声で報告してくれるようにできます
+カスタムコマンドとして[aivis.md](./aivis.md)のように登録することで簡単に音声で報告してくれるようにできます
 
 ## アーキテクチャ
 
@@ -263,42 +249,6 @@ Codeでカスタムコマンドとして[aivis.md](./aivis.md)のように登録
             │     API       │────▶│   mpv    │
             └───────────────┘     └──────────┘
                 音声生成           ストリーミング再生
-```
-
-## v1.x からの移行
-
-### インストール方法
-
-```bash
-# v1.x: git clone + npm install
-git clone https://github.com/MocA-Love/aivis-mcp.git && cd aivis-mcp && npm install
-
-# v2.0: npxで即実行
-npx -y aivis-mcp
-```
-
-### 設定方法
-
-`.env` ファイルは不要になりました。すべての設定はCLI引数または環境変数で渡します。
-
-```bash
-# v1.x: .envファイル
-AIVIS_SPEAKING_RATE=1.2
-
-# v2.0: CLI引数
-npx aivis-mcp --rate 1.2
-
-# v2.0: 環境変数（claude_desktop_config.jsonのenvセクション）も引き続き使用可能
-```
-
-### MCPサーバー登録
-
-```bash
-# v1.x
-claude mcp add aivis -s user -- node /full/path/to/aivis-mcp/dist/index.js
-
-# v2.0
-claude mcp add aivis -s user -e AIVIS_API_KEY=your_key -- npx -y aivis-mcp
 ```
 
 ## 変更履歴
