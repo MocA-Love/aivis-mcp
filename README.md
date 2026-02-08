@@ -41,7 +41,8 @@ cp .env.example .env
 # .envファイルを編集してAPIキーを設定
 ```
 
-## Redisのインストール
+<details>
+<summary>Redisのインストール</summary>
 
 ### macOS
 
@@ -68,7 +69,10 @@ sudo apt install redis-server
 sudo dnf install redis
 ```
 
-## FFmpegのインストール
+</details>
+
+<details>
+<summary>FFmpegのインストール</summary>
 
 ### macOS
 
@@ -95,6 +99,8 @@ sudo dnf install ffmpeg
 
 > [!NOTE]
 > ffplayがインストールされていない場合、一時ファイル経由での再生となり遅延が発生。
+
+</details>
 
 ## 環境設定
 
@@ -184,7 +190,7 @@ MCPサーバーはクライアント（Claude Desktop等）が自動で再起動
 ## カスタムコマンド
 
 Claude
-Codeでカスタムコマンドとしてaivis.mdのように登録することで簡単に音声で報告してくれるようにできます
+Codeでカスタムコマンドとして[aivis.md](./aivis.md)のように登録することで簡単に音声で報告してくれるようにできます
 
 ## アーキテクチャ
 
