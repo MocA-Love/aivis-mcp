@@ -28,6 +28,9 @@ coverage/
 # Optional eslint cache
 .eslintcache
 
+# Temp files
+temp/
+
 # OS specific files
 .DS_Store
 Thumbs.db
