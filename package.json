@@ -1,6 +1,6 @@
 {
   "name": "aivis-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "main": "dist/index.js",
   "bin": {
     "aivis-mcp": "./dist/index.js",
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node dist/index.js",
-    "dev": "nodemon --exec ts-node src/index.ts",
+    "dev": "nodemon --exec ts-node --esm src/index.ts",
     "build": "tsc",
     "test": "jest",
     "test:watch": "jest --watch",
@@ -22,6 +22,10 @@
   ],
   "author": "",
   "license": "ISC",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "description": "AivisSpeech MCP Server",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.7.0",
@@ -37,7 +41,6 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
-    "@types/chokidar": "^1.7.5",
     "@types/express": "^5.0.0",
     "@types/jest": "^29.5.14",
     "@types/node": "^22.13.10",

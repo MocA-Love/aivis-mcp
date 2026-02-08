@@ -2,9 +2,14 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import dotenv from 'dotenv';
-import path from 'path';
+import path, { dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
 import chokidar from 'chokidar';
-import aivisSpeechService from './aivis-speech-service';
+import aivisSpeechService from './aivis-speech-service.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // .envファイルを絶対パスで読み込む
 const envPath = path.join(__dirname, '../../.env');
@@ -138,7 +143,7 @@ export class MCPService {
       AIVIS_WORKER_MODE: '1'
     };
 
-    const child = require('child_process').spawn(
+    const child = spawn(
       process.execPath,
       [process.argv[1], '--worker'],
       { env, stdio: 'ignore', detached: true }

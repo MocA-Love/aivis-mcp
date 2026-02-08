@@ -1,12 +1,16 @@
 import axios from 'axios';
 import fs from 'fs';
-import path from 'path';
+import path, { dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import { platform } from 'os';
 import dotenv from 'dotenv';
 import { createClient, type RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
 import chokidar from 'chokidar';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // .envファイルを絶対パスで読み込む
 const envPath = path.join(__dirname, '../../.env');

@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.2.0] - 2025-02-09
+
+### ESM移行
+
+CommonJS から ESM (ECMAScript Modules) に移行しました。
+Node.js 22.12 未満で chokidar v5 の `require()` が `ERR_REQUIRE_ESM` で失敗する問題を解消しています。
+
+- `package.json` に `"type": "module"` を追加
+- TypeScript のモジュール設定を `NodeNext` に変更
+- `__dirname` を `import.meta.url` ベースに置換
+- 不要になった `@types/chokidar` を削除
+
+### `aivis --version` コマンド追加
+
+バージョン情報を確認できるようになりました。
+
+```
+$ aivis --version
+aivis-mcp v1.2.0
+```
+
+### Node.js バージョン要件の明示
+
+`package.json` に `engines` フィールドを追加し、Node.js 18 以上を明示しました。
+
 ## [1.1.0] - 2025-02-08
 
 ### CLIの即時返却対応

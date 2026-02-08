@@ -1,11 +1,18 @@
 #!/usr/bin/env node
 
-import path from 'path';
+import path, { dirname } from 'path';
+import { fileURLToPath } from 'url';
 import fs from 'fs';
+import { createRequire } from 'module';
 import dotenv from 'dotenv';
 import { createClient, type RedisClientType } from 'redis';
 import { spawn, execSync } from 'child_process';
 import { platform } from 'os';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const require = createRequire(import.meta.url);
+const { version } = require('../package.json');
 
 const envPath = path.join(__dirname, '../.env');
 dotenv.config({ path: envPath });
@@ -251,10 +258,16 @@ async function reboot(): Promise<void> {
 async function main() {
   const args = process.argv.slice(2);
 
+  if (args[0] === '--version' || args[0] === '-v') {
+    console.log(`aivis-mcp v${version}`);
+    process.exit(0);
+  }
+
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     console.log('Usage: aivis <text> [--model <model_uuid>] [--wait <ms>]');
     console.log('       aivis --health');
     console.log('       aivis --reboot');
+    console.log('       aivis --version');
     process.exit(0);
   }
 

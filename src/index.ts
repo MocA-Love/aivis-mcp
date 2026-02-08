@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import mcpService from './services/mcp-service';
+import mcpService from './services/mcp-service.js';
 
 /**
  * アプリケーションのメイン関数
