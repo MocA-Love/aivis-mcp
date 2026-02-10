@@ -52,7 +52,7 @@ Redis や FFmpeg が未インストールの場合、対話的にインストー
 #### Claude Code
 
 ```bash
-claude mcp add aivis -s user -e AIVIS_API_KEY=your_api_key -- npx -y aivis-mcp
+claude mcp add aivis -s user -- npx -y aivis-mcp
 ```
 
 #### Codex
