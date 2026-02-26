@@ -4,6 +4,7 @@ import { z } from 'zod';
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
+import { v4 as uuidv4 } from 'uuid';
 import type { AppConfig } from '../config.js';
 import { AivisSpeechService } from './aivis-speech-service.js';
 
@@ -39,7 +40,8 @@ export class MCPService {
       {
         text: z.string().describe('音声合成するテキスト'),
         model_uuid: z.string().optional().describe('音声合成モデルのUUID（未指定時はデフォルト）'),
-        wait_ms: z.number().int().min(0).max(60000).optional().describe('API呼び出し前の待機時間（ミリ秒、最大60000）')
+        wait_ms: z.number().int().min(0).max(60000).optional().describe('API呼び出し前の待機時間（ミリ秒、最大60000）'),
+        sync: z.boolean().optional().describe('trueの場合、音声再生完了まで待機してからレスポンスを返す（同期モード）')
       },
       async (params) => {
         try {
@@ -59,10 +61,19 @@ export class MCPService {
             line_break_silence_seconds: this.config.lineBreakSilenceSeconds
           };
 
-          this.speechService.synthesizeInBackground(synthesisRequest)
-            .catch((error: unknown) => {
-              console.error('Background synthesis error:', error);
-            });
+          const isSync = params.sync === true;
+          let requestId: string | undefined;
+
+          if (isSync) {
+            requestId = uuidv4();
+            (synthesisRequest as any)._requestId = requestId;
+          }
+
+          await this.speechService.synthesizeInBackground(synthesisRequest);
+
+          if (isSync && requestId) {
+            await this.speechService.waitForCompletion(requestId, 120);
+          }
 
           return {
             content: [

@@ -178,6 +178,26 @@ export class AivisSpeechService {
     } catch {}
   }
 
+  async waitForCompletion(requestId: string, timeoutSeconds: number): Promise<void> {
+    await this.ensureRedisReady();
+    const key = `aivis-mcp:done:${requestId}`;
+    try {
+      await this.redisClient.brPop(key, timeoutSeconds);
+    } catch (error) {
+      console.error('waitForCompletion error:', error);
+    }
+  }
+
+  private async notifyCompletion(requestId: string): Promise<void> {
+    try {
+      const key = `aivis-mcp:done:${requestId}`;
+      await this.redisClient.rPush(key, 'done');
+      await this.redisClient.expire(key, 10);
+    } catch (error) {
+      console.error('notifyCompletion error:', error);
+    }
+  }
+
   private async cleanup(): Promise<void> {
     try {
       if (this.redisClient.isOpen) await this.redisClient.disconnect();
@@ -211,6 +231,9 @@ export class AivisSpeechService {
           await this.synthesizeAndPlay(payload);
           if (this.config.debug) {
             console.error('[synthesize] done', { instance: this.workerId });
+          }
+          if (payload._requestId) {
+            await this.notifyCompletion(payload._requestId);
           }
         } finally {
           await this.releasePlayLock();
