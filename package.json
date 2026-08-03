@@ -5,8 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "aivis-mcp": "./dist/index.js",
-    "aivis": "./dist/cli.js"
+    "aivis-mcp": "dist/index.js",
+    "aivis": "dist/cli.js"
   },
   "files": [
     "dist",
