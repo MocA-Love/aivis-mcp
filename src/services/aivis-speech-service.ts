@@ -2,11 +2,20 @@ import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
+import http from 'http';
 import { platform } from 'os';
+import { PassThrough } from 'stream';
 import { createClient, type RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
 import type { AppConfig } from '../config.js';
 import { tryStartRedis } from './redis-service.js';
+
+interface ParaCodeVoiceTarget {
+  ticket: string;
+  port: number;
+  instanceId: string;
+  expiresAt: number;
+}
 
 /**
  * Aivis Cloud APIとの通信を行うサービスクラス
@@ -43,7 +52,11 @@ export class AivisSpeechService {
           wait_ms: params.wait_ms
         });
       }
-      await this.redisClient.rPush(this.config.queueKey, JSON.stringify(params));
+      // 再生workerはRedis全体で1つだけなので、そのprocess.envは要求元MCPと一致しない。
+      // 現在の要求元をenqueue時に確定し、短命なjob payloadとしてworkerへ引き渡す。
+      const voiceTarget = await this.captureParaCodeVoiceTarget();
+      const queuedParams = voiceTarget === undefined ? params : { ...params, _paraCodeVoiceTarget: voiceTarget };
+      await this.redisClient.rPush(this.config.queueKey, JSON.stringify(queuedParams));
     } catch (error) {
       console.error('Queue enqueue error:', error);
     }
@@ -298,11 +311,215 @@ export class AivisSpeechService {
         }
       );
 
-      await this.streamPlay(response.data);
+      // モバイル転送の data listener が元streamを flowing modeへ移しても、PCプレイヤーの
+      // 探索中に先頭チャンクを取りこぼさないよう、先に再生用PassThroughを接続する。
+      // PassThroughが未消費の間はbackpressureでAxios streamを止め、streamPlay接続後に再開する。
+      const playbackStream = new PassThrough();
+      response.data.pipe(playbackStream);
+      response.data.once('error', (error: unknown) => {
+        console.error('Stream error:', error);
+        playbackStream.end();
+      });
+      this.forwardStreamToParaCode(response.data, params._paraCodeVoiceTarget);
+      await this.streamPlay(playbackStream);
     } catch (error) {
       console.error('Error in synthesizeAndPlay:', error);
       this.logDetailedError(error);
     }
+  }
+
+  /** enqueue元MCPの認証済みlocalhost転送先を、workerの環境へ依存せず確定する。 */
+  private async captureParaCodeVoiceTarget(): Promise<ParaCodeVoiceTarget | undefined> {
+    const paneToken = process.env.PARA_CODE_TERMINAL_PANE_ID;
+    const portFile = process.env.PARA_CODE_MCP_PORT_FILE;
+    if (!paneToken || paneToken.length > 200 || !portFile) {
+      return undefined;
+    }
+
+    try {
+      const stat = fs.statSync(portFile);
+      if (!stat.isFile() || stat.size <= 0 || stat.size > 16 * 1024) {
+        return undefined;
+      }
+      const record = JSON.parse(fs.readFileSync(portFile, 'utf8')) as { port?: unknown; pid?: unknown; instanceId?: unknown };
+      if (typeof record.port !== 'number' || !Number.isInteger(record.port) || record.port < 1 || record.port > 65535
+        || typeof record.pid !== 'number' || !Number.isInteger(record.pid) || record.pid <= 0
+        || typeof record.instanceId !== 'string' || record.instanceId.length === 0 || record.instanceId.length > 200) {
+        return undefined;
+      }
+      try {
+        process.kill(record.pid, 0);
+      } catch {
+        return undefined;
+      }
+      return await this.requestParaCodeVoiceTicket(record.port, record.instanceId, paneToken);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private requestParaCodeVoiceTicket(port: number, expectedInstanceId: string, paneToken: string): Promise<ParaCodeVoiceTarget | undefined> {
+    return new Promise(resolve => {
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/paradis-mcp/mobile-voice-ticket',
+        method: 'POST',
+        headers: { Authorization: `Bearer ${paneToken}`, 'Content-Length': 0 },
+        // 任意のモバイル副経路でPC再生キューを待たせないよう、loopback発行は短時間で諦める。
+        timeout: 300,
+      }, response => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on('data', value => {
+          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+          size += chunk.byteLength;
+          if (size <= 16 * 1024) {
+            chunks.push(chunk);
+          }
+        });
+        response.once('end', () => {
+          if (response.statusCode !== 201 || size <= 0 || size > 16 * 1024) {
+            resolve(undefined);
+            return;
+          }
+          try {
+            const body = JSON.parse(Buffer.concat(chunks, size).toString('utf8')) as Partial<ParaCodeVoiceTarget>;
+            const target = { ...body, port };
+            if (target.instanceId !== expectedInstanceId || !this.isParaCodeVoiceTarget(target)) {
+              resolve(undefined);
+              return;
+            }
+            resolve(target);
+          } catch {
+            resolve(undefined);
+          }
+        });
+      });
+      request.once('timeout', () => { request.destroy(); resolve(undefined); });
+      request.once('error', () => resolve(undefined));
+      request.end();
+    });
+  }
+
+  /**
+   * AivisレスポンスをPCプレイヤーと同時に観測し、Para Codeから起動された時だけ
+   * 同じMP3をlocalhostへ送る。転送は完全な副経路で、失敗してもPC再生へ伝播しない。
+   */
+  private forwardStreamToParaCode(stream: NodeJS.ReadableStream, target: unknown): void {
+    if (!this.isParaCodeVoiceTarget(target)) {
+      return;
+    }
+
+    const maximumBytes = 8 * 1024 * 1024;
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let accepted = true;
+    stream.on('data', (value: Buffer | string) => {
+      if (!accepted) {
+        return;
+      }
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      total += chunk.byteLength;
+      if (total > maximumBytes) {
+        accepted = false;
+        chunks.length = 0;
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    });
+    stream.once('error', () => {
+      accepted = false;
+      chunks.length = 0;
+    });
+    stream.once('end', () => {
+      if (!accepted || total === 0) {
+        return;
+      }
+      const audio = Buffer.concat(chunks, total);
+      void this.postAudioToParaCode(target, audio);
+    });
+  }
+
+  private async postAudioToParaCode(target: ParaCodeVoiceTarget, audio: Buffer): Promise<void> {
+    if (!(await this.isCurrentParaCodeInstance(target))) {
+      return;
+    }
+    await new Promise<void>(resolve => {
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port: target.port,
+        path: '/paradis-mcp/mobile-voice',
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${target.ticket}`,
+          'Content-Type': 'audio/mpeg',
+          'Content-Length': audio.byteLength,
+        },
+        timeout: 3000,
+      }, response => { response.resume(); response.once('end', resolve); });
+      request.once('timeout', () => { request.destroy(); resolve(); });
+      request.once('error', () => resolve());
+      request.end(audio);
+    });
+  }
+
+  private isCurrentParaCodeInstance(target: ParaCodeVoiceTarget): Promise<boolean> {
+    if (target.expiresAt < Date.now()) {
+      return Promise.resolve(false);
+    }
+    return new Promise(resolve => {
+      const request = http.get({
+        hostname: '127.0.0.1',
+        port: target.port,
+        path: '/paradis-mcp/health',
+        timeout: 2000,
+      }, response => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on('data', value => {
+          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+          size += chunk.byteLength;
+          if (size <= 16 * 1024) {
+            chunks.push(chunk);
+          }
+        });
+        response.once('end', () => {
+          if (response.statusCode !== 200 || size <= 0 || size > 16 * 1024) {
+            resolve(false);
+            return;
+          }
+          try {
+            const body = JSON.parse(Buffer.concat(chunks, size).toString('utf8')) as { instanceId?: unknown };
+            resolve(body.instanceId === target.instanceId);
+          } catch {
+            resolve(false);
+          }
+        });
+      });
+      request.once('timeout', () => { request.destroy(); resolve(false); });
+      request.once('error', () => resolve(false));
+    });
+  }
+
+  private isParaCodeVoiceTarget(value: unknown): value is ParaCodeVoiceTarget {
+    if (typeof value !== 'object' || value === null) {
+      return false;
+    }
+    const target = value as Partial<ParaCodeVoiceTarget>;
+    return typeof target.ticket === 'string'
+      && target.ticket.length > 0
+      && target.ticket.length <= 200
+      && typeof target.port === 'number'
+      && Number.isInteger(target.port)
+      && target.port >= 1
+      && target.port <= 65535
+      && typeof target.instanceId === 'string'
+      && target.instanceId.length > 0
+      && target.instanceId.length <= 200
+      && typeof target.expiresAt === 'number'
+      && Number.isSafeInteger(target.expiresAt)
+      && target.expiresAt > Date.now();
   }
 
   private async streamPlay(stream: any): Promise<void> {
