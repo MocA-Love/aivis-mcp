@@ -38,9 +38,11 @@ export function isParaCodeVoiceTarget(value: unknown): value is ParaCodeVoiceTar
  * Para Code から起動されていない場合は undefined（PC再生だけが続く）。
  */
 export async function captureParaCodeVoiceTarget(): Promise<ParaCodeVoiceTarget | undefined> {
-  const paneToken = process.env.PARA_CODE_TERMINAL_PANE_ID;
+  // ターミナルのペインで動く場合はペイントークン、拡張機能ホスト経由（Codex等）で動く場合は
+  // 音声取込専用トークンが渡ってくる。どちらも Para Code のloopbackだけが受理する。
+  const token = process.env.PARA_CODE_TERMINAL_PANE_ID || process.env.PARA_CODE_VOICE_TOKEN;
   const portFile = process.env.PARA_CODE_MCP_PORT_FILE;
-  if (!paneToken || paneToken.length > 200 || !portFile) {
+  if (!token || token.length > 200 || !portFile) {
     return undefined;
   }
 
@@ -60,20 +62,20 @@ export async function captureParaCodeVoiceTarget(): Promise<ParaCodeVoiceTarget 
     } catch {
       return undefined;
     }
-    return await requestParaCodeVoiceTicket(record.port, record.instanceId, paneToken);
+    return await requestParaCodeVoiceTicket(record.port, record.instanceId, token);
   } catch {
     return undefined;
   }
 }
 
-function requestParaCodeVoiceTicket(port: number, expectedInstanceId: string, paneToken: string): Promise<ParaCodeVoiceTarget | undefined> {
+function requestParaCodeVoiceTicket(port: number, expectedInstanceId: string, authToken: string): Promise<ParaCodeVoiceTarget | undefined> {
   return new Promise(resolve => {
     const request = http.request({
       hostname: '127.0.0.1',
       port,
       path: '/paradis-mcp/mobile-voice-ticket',
       method: 'POST',
-      headers: { Authorization: `Bearer ${paneToken}`, 'Content-Length': 0 },
+      headers: { Authorization: `Bearer ${authToken}`, 'Content-Length': 0 },
       // 任意のモバイル副経路でPC再生キューを待たせないよう、loopback発行は短時間で諦める。
       timeout: 300,
     }, response => {
