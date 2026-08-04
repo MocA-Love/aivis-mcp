@@ -2,6 +2,7 @@
 
 import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './config.js';
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
+import { captureParaCodeVoiceTarget } from './services/para-code-voice.js';
 import { runHealth, runReboot } from './commands.js';
 import { runDoctor } from './doctor.js';
 import { runInit } from './settings.js';
@@ -16,7 +17,12 @@ export async function runCli(config: ReturnType<typeof resolveConfig>, text: str
   const client = await connectRedis(config.redisUrl);
 
   await ensureWorkerRunning(client, config);
-  await client.rPush(config.queueKey, JSON.stringify(params));
+  // 再生workerはRedis全体で1つだけなので、そのprocess.envは要求元と一致しない。
+  // MCP経由の発話と同じく、要求元のPara Codeをここで確定してjob payloadへ載せる
+  // （これが無いと `aivis` コマンド経由の発話だけモバイルへ届かない）。
+  const voiceTarget = await captureParaCodeVoiceTarget();
+  const queuedParams = voiceTarget === undefined ? params : { ...params, _paraCodeVoiceTarget: voiceTarget };
+  await client.rPush(config.queueKey, JSON.stringify(queuedParams));
   await client.disconnect();
 }
 
