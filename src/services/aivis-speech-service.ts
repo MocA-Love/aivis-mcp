@@ -9,6 +9,7 @@ import { createClient, type RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
 import type { AppConfig } from '../config.js';
 import { tryStartRedis } from './redis-service.js';
+import { isMuted } from './mute-service.js';
 import { captureParaCodeVoiceTarget, isParaCodeVoiceTarget, type ParaCodeVoiceTarget } from './para-code-voice.js';
 
 /**
@@ -230,6 +231,17 @@ export class AivisSpeechService {
           console.error('[queue] dequeue', { instance: this.workerId });
         }
         const payload = JSON.parse(result.element);
+        // ミュート中は合成も再生もせず捨てる。ただし --wait で待っている呼び出し元は
+        // ブロックしたままにしないよう完了通知だけは返す。
+        if (await isMuted(this.redisWorkerClient)) {
+          if (this.config.debug) {
+            console.error('[mute] skipped synthesis', { instance: this.workerId });
+          }
+          if (payload._requestId) {
+            await this.notifyCompletion(payload._requestId);
+          }
+          continue;
+        }
         await this.acquirePlayLock();
         try {
           if (this.config.debug) {

@@ -3,7 +3,7 @@
 import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './config.js';
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { captureParaCodeVoiceTarget } from './services/para-code-voice.js';
-import { runHealth, runReboot } from './commands.js';
+import { runHealth, runReboot, runMute, runUnmute, runMuteStatus } from './commands.js';
 import { runDoctor } from './doctor.js';
 import { runInit } from './settings.js';
 
@@ -33,6 +33,10 @@ function printHelp(): void {
   console.log('  aivis <text> [options]            テキストを音声合成');
   console.log('  aivis --health                    ヘルスチェック');
   console.log('  aivis --reboot                    全プロセス再起動');
+  console.log('  aivis --mute                      ミュート（自分で解除するまで）');
+  console.log('  aivis --mute --mute-for 30m       30分間ミュート');
+  console.log('  aivis --unmute                    ミュート解除');
+  console.log('  aivis --mute-status               ミュート状態を確認');
   console.log('  aivis --init                      初期設定（APIキー等を保存）');
   console.log('  aivis --doctor                    依存ツール診断');
   console.log('  aivis --version                   バージョン表示');
@@ -66,7 +70,8 @@ async function main() {
     process.exit(0);
   }
 
-  if (values.help || (positionals.length === 0 && !values.health && !values.reboot && !values.doctor)) {
+  if (values.help || (positionals.length === 0 && !values.health && !values.reboot && !values.doctor
+    && !values.mute && !values.unmute && !values['mute-status'])) {
     printHelp();
     process.exit(0);
   }
@@ -84,6 +89,21 @@ async function main() {
   if (values.reboot) {
     await runReboot(config);
     process.exit(0);
+  }
+
+  if (values.mute) {
+    await runMute(config, typeof values['mute-for'] === 'string' ? values['mute-for'] : undefined);
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+  }
+
+  if (values.unmute) {
+    await runUnmute(config);
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+  }
+
+  if (values['mute-status']) {
+    await runMuteStatus(config);
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
 
   const text = positionals.join(' ');

@@ -3,6 +3,7 @@ import { platform } from 'os';
 import { createClient, type RedisClientType } from 'redis';
 import type { AppConfig } from './config.js';
 import { connectRedis, spawnWorker } from './services/redis-service.js';
+import { parseMuteDuration, setMute, clearMute, getMuteStatus } from './services/mute-service.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -153,4 +154,80 @@ export async function runReboot(config: AppConfig): Promise<void> {
   await sleep(500);
   console.log('新しいワーカーを起動しました');
   console.log('reboot 完了');
+}
+
+/** 残り時間を「1時間30分」「45秒」のような日本語表記にする */
+function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return minutes > 0 ? `${hours}時間${minutes}分` : `${hours}時間`;
+  if (minutes > 0) return seconds > 0 ? `${minutes}分${seconds}秒` : `${minutes}分`;
+  return `${seconds}秒`;
+}
+
+export async function runMute(config: AppConfig, durationArg: string | undefined): Promise<void> {
+  let durationMs: number | undefined;
+  if (durationArg !== undefined && durationArg !== '') {
+    durationMs = parseMuteDuration(durationArg);
+    if (durationMs === undefined) {
+      console.error(`Error: 時間の指定を解釈できません: ${durationArg}（例: 30m, 1h, 90s, 5000ms）`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  let client: RedisClientType | null = null;
+  try {
+    client = createClient({ url: config.redisUrl }) as RedisClientType;
+    await client.connect();
+    await setMute(client, durationMs);
+    if (durationMs === undefined) {
+      console.log('ミュートしました（自分で解除するまで）');
+    } else {
+      console.log(`ミュートしました（${formatDuration(durationMs)}後に自動解除）`);
+    }
+    await client.disconnect();
+  } catch {
+    console.error(`Error: Redisに接続できません (${config.redisUrl})`);
+    process.exitCode = 1;
+    if (client) await client.disconnect().catch(() => {});
+  }
+}
+
+export async function runUnmute(config: AppConfig): Promise<void> {
+  let client: RedisClientType | null = null;
+  try {
+    client = createClient({ url: config.redisUrl }) as RedisClientType;
+    await client.connect();
+    await clearMute(client);
+    console.log('ミュートを解除しました');
+    await client.disconnect();
+  } catch {
+    console.error(`Error: Redisに接続できません (${config.redisUrl})`);
+    process.exitCode = 1;
+    if (client) await client.disconnect().catch(() => {});
+  }
+}
+
+export async function runMuteStatus(config: AppConfig): Promise<void> {
+  let client: RedisClientType | null = null;
+  try {
+    client = createClient({ url: config.redisUrl }) as RedisClientType;
+    await client.connect();
+    const status = await getMuteStatus(client);
+    if (!status.muted) {
+      console.log('ミュートされていません');
+    } else if (status.until === undefined) {
+      console.log('ミュート中（自分で解除するまで）');
+    } else {
+      console.log(`ミュート中（あと${formatDuration(status.until - Date.now())}で自動解除）`);
+    }
+    await client.disconnect();
+  } catch {
+    console.error(`Error: Redisに接続できません (${config.redisUrl})`);
+    process.exitCode = 1;
+    if (client) await client.disconnect().catch(() => {});
+  }
 }
