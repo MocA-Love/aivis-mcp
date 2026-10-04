@@ -3,6 +3,7 @@
 import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './config.js';
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { captureParaCodeVoiceTarget } from './services/para-code-voice.js';
+import { enqueueSynthesis } from './queue/enqueue.js';
 import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio } from './commands.js';
 import { runDoctor } from './doctor.js';
 import { runInit } from './settings.js';
@@ -22,7 +23,7 @@ export async function runCli(config: ReturnType<typeof resolveConfig>, text: str
   // （これが無いと `aivis` コマンド経由の発話だけモバイルへ届かない）。
   const voiceTarget = await captureParaCodeVoiceTarget();
   const queuedParams = voiceTarget === undefined ? params : { ...params, _paraCodeVoiceTarget: voiceTarget };
-  await client.rPush(config.queueKey, JSON.stringify(queuedParams));
+  await enqueueSynthesis(client, queuedParams);
   await client.disconnect();
 }
 

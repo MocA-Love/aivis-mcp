@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util';
 import { createRequire } from 'module';
-import { loadSettings, isTtsProvider, type TtsProvider } from './settings.js';
+import { loadSettingsWithMigration, isTtsProvider, type TtsProvider } from './settings.js';
+import { legacyElevenLabsVolumeToOffset } from './audio/gain-table.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -8,8 +9,6 @@ const { version } = require('../package.json');
 export { version };
 
 export const DEFAULT_ELEVENLABS_MODEL_ID = 'eleven_v4_turbo';
-// 実測で ElevenLabs(eleven_v4_turbo) は -11.5 LUFS 前後、Aivis は -24 LUFS 前後だったので、その差を再生時に詰める
-export const DEFAULT_ELEVENLABS_VOLUME_DB = -13;
 
 export interface AppConfig {
   provider: TtsProvider;
@@ -30,15 +29,20 @@ export interface AppConfig {
   elevenLabsApiUrl: string;
   elevenLabsVoiceId?: string;
   elevenLabsModelId: string;
-  elevenLabsVolumeDb: number;
+  /** ElevenLabs の声だけに足す上乗せ（dB）。2.4 の volume_db からの読み替えを含む */
+  elevenLabsVolumeOffsetDb: number;
+  /** すべての声に足す上乗せ（dB） */
+  volumeOffsetDb: number;
   redisUrl: string;
   debug: boolean;
   queueKey: string;
   workerLockKey: string;
 }
 
+export type ArgValue = string | boolean | string[] | undefined;
+
 export interface ParsedArgs {
-  values: Record<string, string | boolean | undefined>;
+  values: Record<string, ArgValue>;
   positionals: string[];
 }
 
@@ -55,6 +59,8 @@ export const cliOptions = {
   'mute-status':         { type: 'boolean' as const, default: false },
   worker:                { type: 'boolean' as const, default: false },
   'play-audio':          { type: 'boolean' as const, default: false },
+  ingest:                { type: 'boolean' as const, default: false },
+  'prelude-dir':         { type: 'string' as const, multiple: true as const },
   provider:              { type: 'string' as const },
   'voice-id':            { type: 'string' as const },
   'eleven-model':        { type: 'string' as const },
@@ -84,24 +90,24 @@ export function parseCliArgs(argv?: string[]): ParsedArgs {
     strict: false,
     args: argv,
   });
-  return { values: values as Record<string, string | boolean | undefined>, positionals };
+  return { values: values as Record<string, ArgValue>, positionals };
 }
 
-function optNumber(cliVal: string | boolean | undefined, envKey: string): number | undefined {
+function optNumber(cliVal: ArgValue, envKey: string): number | undefined {
   if (typeof cliVal === 'string' && cliVal !== '') return parseFloat(cliVal);
   const env = process.env[envKey];
   if (env !== undefined && env !== '') return parseFloat(env);
   return undefined;
 }
 
-function optString(cliVal: string | boolean | undefined, envKey: string): string | undefined {
+function optString(cliVal: ArgValue, envKey: string): string | undefined {
   if (typeof cliVal === 'string' && cliVal !== '') return cliVal;
   const env = process.env[envKey];
   if (env !== undefined && env !== '') return env;
   return undefined;
 }
 
-function resolveProvider(cliVal: string | boolean | undefined, settingsVal: TtsProvider | undefined): TtsProvider {
+function resolveProvider(cliVal: ArgValue, settingsVal: TtsProvider | undefined): TtsProvider {
   const candidate = optString(cliVal, 'TTS_PROVIDER');
   if (candidate !== undefined) {
     if (isTtsProvider(candidate)) return candidate;
@@ -114,8 +120,9 @@ function resolveProvider(cliVal: string | boolean | undefined, settingsVal: TtsP
  * 設定の解決順は CLI引数 > 環境変数 > ~/.config/aivis-mcp/config.json > デフォルト。
  * config.json はMCPツールから書き換わるので、発話ごとに呼び直して最新値を使う。
  */
-export function resolveConfig(values: Record<string, string | boolean | undefined>): AppConfig {
-  const settings = loadSettings();
+export function resolveConfig(values: Record<string, ArgValue>): AppConfig {
+  const settings = loadSettingsWithMigration();
+  const legacyEnvVolume = optNumber(undefined, 'ELEVENLABS_VOLUME_DB');
   return {
     provider: resolveProvider(values.provider, settings.provider),
     apiKey:
@@ -155,10 +162,15 @@ export function resolveConfig(values: Record<string, string | boolean | undefine
       optString(values['eleven-model'], 'ELEVENLABS_MODEL_ID')
       ?? settings.elevenlabs?.modelId
       ?? DEFAULT_ELEVENLABS_MODEL_ID,
-    elevenLabsVolumeDb:
-      optNumber(undefined, 'ELEVENLABS_VOLUME_DB')
-      ?? settings.elevenlabs?.volumeDb
-      ?? DEFAULT_ELEVENLABS_VOLUME_DB,
+    // 古い ELEVENLABS_VOLUME_DB は 2.4 の意味（-13 が既定の絶対値）なので、毎回上乗せへ読み替える
+    elevenLabsVolumeOffsetDb:
+      (legacyEnvVolume !== undefined && Number.isFinite(legacyEnvVolume) ? legacyElevenLabsVolumeToOffset(legacyEnvVolume) : undefined)
+      ?? settings.elevenlabs?.volumeOffsetDb
+      ?? 0,
+    volumeOffsetDb:
+      optNumber(undefined, 'AIVIS_VOLUME_OFFSET_DB')
+      ?? settings.volumeOffsetDb
+      ?? 0,
     redisUrl:
       (typeof values['redis-url'] === 'string' ? values['redis-url'] : undefined)
       ?? process.env.REDIS_URL

@@ -26,6 +26,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # 結合テストが使い捨ての redis-server を空いているポートで起こす（無ければその分は飛ばす）
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
       - name: Build
         run: npm run build
 

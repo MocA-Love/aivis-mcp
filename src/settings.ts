@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import * as readline from 'node:readline';
+import { migrateVolumeSettings } from './audio/gain-table.js';
 
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'aivis-mcp');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
@@ -18,7 +19,12 @@ export interface ElevenLabsSettings {
   apiKey?: string;
   voiceId?: string;
   modelId?: string;
+  /** 2.4 までの ElevenLabs の音量（絶対値、既定 -13）。2.4 が読むので残す */
   volumeDb?: number;
+  /** 2.5 からの ElevenLabs だけに足す上乗せ（dB、既定 0） */
+  volumeOffsetDb?: number;
+  /** volumeDb を volumeOffsetDb へ読み替え済みの印 */
+  volumeMigrated?: boolean;
 }
 
 export interface UserSettings {
@@ -27,6 +33,8 @@ export interface UserSettings {
   apiUrl?: string;
   modelUuid?: string;
   redisUrl?: string;
+  /** すべての声に足す上乗せ（dB、既定 0） */
+  volumeOffsetDb?: number;
   elevenlabs?: ElevenLabsSettings;
 }
 
@@ -37,6 +45,22 @@ export function loadSettings(): UserSettings {
   } catch {
     return {};
   }
+}
+
+/**
+ * 設定を読み、2.4 の `elevenlabs.volumeDb` を 1 回だけ 2.5 の上乗せへ読み替える（移行済みの印を残す）。
+ */
+export function loadSettingsWithMigration(): UserSettings {
+  const settings = loadSettings();
+  const migrated = migrateVolumeSettings(settings);
+  if (migrated.changed) {
+    try {
+      saveSettings(migrated.settings);
+    } catch {
+      // 書けなくても、今回の値は読み替えたものを使う
+    }
+  }
+  return migrated.settings;
 }
 
 export function saveSettings(settings: UserSettings): void {

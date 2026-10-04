@@ -5,6 +5,8 @@ import { MCPService } from './services/mcp-service.js';
 import { AivisSpeechService } from './services/aivis-speech-service.js';
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio } from './commands.js';
+import { runIngest } from './ingest/ingest.js';
+import { enqueueSynthesis } from './queue/enqueue.js';
 import { runDoctor, checkDependencies } from './doctor.js';
 import { runInit } from './settings.js';
 
@@ -21,6 +23,7 @@ function printHelp(): void {
   console.log('  aivis-mcp --unmute                 ミュート解除');
   console.log('  aivis-mcp --mute-status            ミュート状態を確認');
   console.log('  aivis-mcp --play-audio             標準入力のMP3をキューに積んで再生');
+  console.log('  aivis-mcp --ingest                 Para Code 用の取込口（標準入出力の枠。docs/ingest-protocol.md）');
   console.log('  aivis-mcp --init                   初期設定（APIキー等を保存）');
   console.log('  aivis-mcp --doctor                 依存ツール診断');
   console.log('  aivis-mcp --version                バージョン表示');
@@ -110,6 +113,13 @@ async function main() {
     process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
 
+  // --ingest（Para Code が起動する常駐の子）。標準出力は枠だけに使うので、ほかより先に分ける
+  if (values.ingest) {
+    const preludeDirs = Array.isArray(values['prelude-dir']) ? values['prelude-dir'] : [];
+    await runIngest(config, preludeDirs);
+    return;
+  }
+
   if (values['play-audio']) {
     await runPlayAudio(config);
     process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
@@ -134,7 +144,7 @@ async function main() {
     const params = buildSynthesisParams(config, text, waitMs);
     const client = await connectRedis(config.redisUrl);
     await ensureWorkerRunning(client, config);
-    await client.rPush(config.queueKey, JSON.stringify(params));
+    await enqueueSynthesis(client, params);
     await client.disconnect();
     process.exit(0);
   }
