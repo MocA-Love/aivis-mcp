@@ -29,7 +29,18 @@ export interface ParaCodeForward {
   readonly settled: Promise<void>;
 }
 
+/** 音量の表の鍵を Para Code へ知らせるヘッダー（英数・`:`・`_`・`-`・`.`、200 文字まで）。 */
+export const GAIN_KEY_HEADER = 'X-Para-Gain-Key';
+const GAIN_KEY_PATTERN = /^[A-Za-z0-9:_.-]{1,200}$/;
+
+/** ヘッダーとして安全な鍵だけ返す（それ以外は付けない）。 */
+export function safeGainKeyHeader(gainKey: string | undefined): string | undefined {
+  return gainKey !== undefined && GAIN_KEY_PATTERN.test(gainKey) ? gainKey : undefined;
+}
+
 export interface ForwardOptions {
+  /** 音量の表の鍵（provider:voice:model）。安全な文字だけなら `X-Para-Gain-Key` で送る */
+  readonly gainKey?: string;
   readonly maxBytes?: number;
   readonly idleTimeoutMs?: number;
   readonly hostname?: string;
@@ -43,6 +54,11 @@ async function defaultIsCurrentInstance(target: ParaCodeVoiceTarget): Promise<bo
   }
   const instanceId = await requestParaCodeInstanceId(target.port, 2000);
   return instanceId === target.instanceId;
+}
+
+function gainKeyHeaders(gainKey: string | undefined): Record<string, string> {
+  const value = safeGainKeyHeader(gainKey);
+  return value === undefined ? {} : { [GAIN_KEY_HEADER]: value };
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -143,6 +159,7 @@ class ChunkedForward implements ParaCodeForward {
       headers: {
         Authorization: `Bearer ${this.target.ticket}`,
         'Content-Type': 'audio/mpeg',
+        ...gainKeyHeaders(this.options.gainKey),
         'Transfer-Encoding': 'chunked',
       },
     });
@@ -259,6 +276,7 @@ class BufferedForward implements ParaCodeForward {
         headers: {
           Authorization: `Bearer ${this.target.ticket}`,
           'Content-Type': 'audio/mpeg',
+        ...gainKeyHeaders(this.options.gainKey),
           'Content-Length': audio.byteLength,
         },
         // 手元で鳴らすときは、Para Code が手元の列へ積み終えるまで応答を待つ。SSH を運ばれる時間も見込む

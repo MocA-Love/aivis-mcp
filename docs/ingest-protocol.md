@@ -187,6 +187,10 @@ worker は 1 発話ごとに次で打ち切ります。列で待つ時間は数�
 | `aivis-mcp:worker-lock` / `aivis-mcp:worker-version` | worker の lock と版 |
 | `aivis-mcp:play-lock` | 再生の lock（期限 10 秒、鳴らしている間 3 秒ごとに延長。worker が止められたらすぐ消す） |
 
+## 接続先から Para Code への送り出し（参考）
+
+SSH 先などの aivis-mcp が Para Code の `/paradis-mcp/mobile-voice` へ合成した声を送るとき、リクエストヘッダー `X-Para-Gain-Key: <provider>:<voice>:<model>` を付けます。値は音量の表の鍵と同じ形（Aivis は `aivis:<model_uuid>:default`、ElevenLabs は `elevenlabs:<voice_id>:<model_id>`）で、英数・`:`・`_`・`-`・`.` だけの 200 文字までのときだけ付けます（それ以外の文字を含む鍵は付けません）。`stream-v1` の chunked 送信でも、旧方式（Content-Length 付き）でも付けます。
+
 ## 移行中の制約
 
 - 2.4 までの `aivis` CLI・MCP・`--play-audio` は、古い列 `aivis-mcp:queue` に RPUSH で積みます。worker は BRPOP で右から取り出すので、2.4 から積まれた発話同士は後から積んだものが先に鳴ることがあります（2.5 から積む分は LPUSH なので積んだ順）。古い列は 2.5 の列（high → normal）より後に読みます。すべて 2.5 に更新すると解消します

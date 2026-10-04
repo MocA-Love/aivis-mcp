@@ -149,4 +149,20 @@ describe('Para Code への送り出し', () => {
       expect(await forward.decision).toBe('local');
     });
   });
+
+  test('音量の表の鍵を X-Para-Gain-Key で送る（安全な文字だけ）', async () => {
+    await withServer((request, response, received) => {
+      response.writeHead(200, { 'X-Para-Local-Playback': 'accepted' });
+      collect(request, received, () => response.end());
+    }, async (port, received) => {
+      for (const [gainKey, ingress] of [['aivis:a670e6b8-0852-45b2-8704-1bc9862f2fe6:default', 'stream-v1'], ['elevenlabs:voice:eleven_v3', undefined], ['bad key\r\nX: y', 'stream-v1']] as const) {
+        const forward = startParaCodeForward(target(port, { ingress, localPlayback: true }), { isCurrentInstance: current, gainKey });
+        forward.push(Buffer.from([1]));
+        forward.end();
+        await forward.settled;
+      }
+      expect(received.map(entry => entry.headers['x-para-gain-key'])).toEqual(['aivis:a670e6b8-0852-45b2-8704-1bc9862f2fe6:default', 'elevenlabs:voice:eleven_v3', undefined]);
+    });
+  });
 });
+

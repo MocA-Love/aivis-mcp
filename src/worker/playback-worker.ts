@@ -600,7 +600,7 @@ export class PlaybackWorker {
     await writer.open();
     const target = params._paraCodeVoiceTarget;
     const forward: ParaCodeForward | undefined = job.source === 'agent' && isParaCodeVoiceTarget(target)
-      ? startParaCodeForward(target)
+      ? startParaCodeForward(target, { gainKey })
       : undefined;
 
     let overflow = false;
