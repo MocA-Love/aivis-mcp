@@ -15,6 +15,11 @@ export interface ParaCodeVoiceTarget {
    * true のときはworkerがこの機械で鳴らさず、Para Code へ渡せなかった時だけ自分で鳴らす。
    */
   localPlayback?: boolean;
+  /**
+   * 新しい Para Code が名乗る取込の形式。`stream-v1` なら合成しながら chunked で送り、応答のヘッダー
+   * `X-Para-Local-Playback: accepted` で鳴らし方を決める。無ければ全部受け取ってから送る。
+   */
+  ingress?: string;
 }
 
 /** 手元のloopbackでの発行待ち。モバイル副経路でPC再生キューを待たせないよう短くする。 */
@@ -40,7 +45,8 @@ export function isParaCodeVoiceTarget(value: unknown): value is ParaCodeVoiceTar
     && typeof target.expiresAt === 'number'
     && Number.isSafeInteger(target.expiresAt)
     && target.expiresAt > Date.now()
-    && (target.localPlayback === undefined || typeof target.localPlayback === 'boolean');
+    && (target.localPlayback === undefined || typeof target.localPlayback === 'boolean')
+    && (target.ingress === undefined || (typeof target.ingress === 'string' && target.ingress.length <= 32));
 }
 
 /**

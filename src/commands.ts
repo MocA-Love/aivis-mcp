@@ -4,6 +4,10 @@ import { createClient, type RedisClientType } from 'redis';
 import { version, type AppConfig } from './config.js';
 import { connectRedis, ensureWorkerRunning, spawnWorker, WORKER_VERSION_KEY } from './services/redis-service.js';
 import { parseMuteDuration, setMute, clearMute, getMuteStatus } from './services/mute-service.js';
+import { enqueueLegacy } from './queue/enqueue.js';
+import { HIGH_QUEUE_KEY, HOLD_PREFIX, NORMAL_QUEUE_KEY } from './queue/keys.js';
+import { detectPlayerKind, hasFfmpeg } from './audio/player.js';
+import { gainFilePath } from './audio/gain-table.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -24,6 +28,8 @@ function getAivisProcesses(): AivisProcess[] {
     for (const line of lines) {
       if (!line.includes('aivis-mcp') || !line.includes('dist/index.js')) continue;
       if (line.includes('ps aux')) continue;
+      // --ingest は Para Code が持つ常駐の子。止めると Para Code の読み上げが止まるので対象にしない
+      if (line.includes('--ingest')) continue;
       const parts = line.trim().split(/\s+/);
       if (parts.length < 2) continue;
       const pid = parts[1];
@@ -54,10 +60,22 @@ export async function runHealth(config: AppConfig): Promise<void> {
     console.log(`Redis:         OK (${config.redisUrl})`);
 
     const workerLock = await client.get(config.workerLockKey);
-    console.log(`Worker:        ${workerLock ? 'OK' : 'NG (停止中)'}`);
+    const workerVersion = await client.get(WORKER_VERSION_KEY);
+    console.log(`Worker:        ${workerLock ? `OK (v${workerVersion ?? '不明'})` : 'NG (停止中)'}`);
+    if (workerLock && workerVersion !== version) {
+      console.log(`               この aivis-mcp は v${version} です。aivis-mcp --reboot で起動し直してください`);
+    }
 
-    const queueLen = await client.lLen(config.queueKey);
-    console.log(`Queue:         ${queueLen} 件`);
+    const [highLen, normalLen, legacyLen] = await Promise.all([
+      client.lLen(HIGH_QUEUE_KEY), client.lLen(NORMAL_QUEUE_KEY), client.lLen(config.queueKey),
+    ]);
+    console.log(`Queue:         high ${highLen} 件 / normal ${normalLen} 件 / 旧 ${legacyLen} 件`);
+
+    let holds = 0;
+    for await (const key of client.scanIterator({ MATCH: `${HOLD_PREFIX}*`, COUNT: 100 })) {
+      if (key) holds++;
+    }
+    console.log(`Hold:          ${holds > 0 ? `${holds} 件（音声入力中のため止めています）` : 'なし'}`);
 
     const playLock = await client.get('aivis-mcp:play-lock');
     console.log(`Play Lock:     ${playLock ? '使用中' : '空き'}`);
@@ -108,6 +126,12 @@ export async function runHealth(config: AppConfig): Promise<void> {
     } catch {}
   }
   console.log(`Audio Player:  ${available.length > 0 ? `OK (${available.join(', ')})` : 'NG (未検出)'}`);
+  const kind = detectPlayerKind();
+  if (kind === 'afplay' || kind === 'none') {
+    console.log('               ffmpeg (ffplay) が無いため、全部受け取ってから鳴らします。音量の自動調整も一部しか効きません');
+  }
+  console.log(`Loudness:      ${hasFfmpeg() ? 'OK (ffmpeg)' : 'NG (ffmpeg が無いため音量を覚え直せません)'}`);
+  console.log(`Gain Table:    ${gainFilePath()}`);
 
   // Model
   console.log(`Model UUID:    ${config.modelUuid}`);
@@ -284,7 +308,7 @@ export async function runPlayAudio(config: AppConfig): Promise<void> {
       process.exitCode = 3;
       return;
     }
-    await client.rPush(config.queueKey, JSON.stringify({ _audioBase64: Buffer.concat(chunks, total).toString('base64') }));
+    await enqueueLegacy(client, { _audioBase64: Buffer.concat(chunks, total).toString('base64') });
     // 積めた印。呼び出し側は終了コードではなくこれで判断する（この後に止められても積んだ事実は変わらない）
     process.stdout.write('queued\n');
   } finally {

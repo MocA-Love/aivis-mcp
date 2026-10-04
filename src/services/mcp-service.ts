@@ -1,14 +1,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import path, { dirname } from 'path';
-import { fileURLToPath } from 'url';
-import { spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
 import { buildSynthesisParams, type AppConfig } from '../config.js';
 import { getConfigPath, updateSettings, TTS_PROVIDERS, type TtsProvider } from '../settings.js';
 import { AivisSpeechService } from './aivis-speech-service.js';
+import { spawnWorker } from './redis-service.js';
 import {
   describeElevenLabsError,
   elevenLabsErrorCode,
@@ -16,9 +14,6 @@ import {
   listElevenLabsModels,
   listElevenLabsVoices,
 } from './elevenlabs-client.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 const MCP_MODEL_ID = 'aivis-speech';
 const MCP_MODEL_NAME = 'Aivis Speech';
@@ -163,7 +158,8 @@ export class MCPService {
         elevenlabs_api_key: z.string().min(1).optional().describe('ElevenLabs のAPIキー'),
         elevenlabs_voice_id: z.string().min(1).optional().describe('ElevenLabs の voice_id'),
         elevenlabs_model_id: z.string().min(1).optional().describe('ElevenLabs の model_id（例: eleven_v4_turbo）'),
-        elevenlabs_volume_db: z.number().min(-40).max(10).optional().describe('ElevenLabs の再生音量の補正（dB、デフォルト-13）。うるさい・小さいと言われたら調整する')
+        volume_offset_db: z.number().min(-30).max(8).optional().describe('すべての声に足す音量の上乗せ（dB、デフォルト0）。声は自動で同じ大きさに揃えるので、全体がうるさい・小さいと言われたときだけ使う'),
+        elevenlabs_volume_db: z.number().min(-30).max(8).optional().describe('ElevenLabs の声だけに足す音量の上乗せ（dB、デフォルト0）。2.4 までの -13 基準の値は自動で読み替え済み')
       },
       async (params) => {
         try {
@@ -251,8 +247,9 @@ export class MCPService {
         api_key: maskSecret(config.elevenLabsApiKey),
         voice_id: config.elevenLabsVoiceId ?? null,
         model_id: config.elevenLabsModelId,
-        volume_db: config.elevenLabsVolumeDb,
+        volume_offset_db: config.elevenLabsVolumeOffsetDb,
       },
+      volume_offset_db: config.volumeOffsetDb,
       config_path: getConfigPath(),
     };
   }
@@ -265,6 +262,7 @@ export class MCPService {
     elevenlabs_voice_id?: string;
     elevenlabs_model_id?: string;
     elevenlabs_volume_db?: number;
+    volume_offset_db?: number;
   }) {
     const current = this.loadConfig();
     const candidate: AppConfig = {
@@ -275,7 +273,8 @@ export class MCPService {
       elevenLabsApiKey: params.elevenlabs_api_key ?? current.elevenLabsApiKey,
       elevenLabsVoiceId: params.elevenlabs_voice_id ?? current.elevenLabsVoiceId,
       elevenLabsModelId: params.elevenlabs_model_id ?? current.elevenLabsModelId,
-      elevenLabsVolumeDb: params.elevenlabs_volume_db ?? current.elevenLabsVolumeDb,
+      elevenLabsVolumeOffsetDb: params.elevenlabs_volume_db ?? current.elevenLabsVolumeOffsetDb,
+      volumeOffsetDb: params.volume_offset_db ?? current.volumeOffsetDb,
     };
     const warnings: string[] = [];
 
@@ -329,11 +328,14 @@ export class MCPService {
       provider: params.provider,
       apiKey: params.aivis_api_key,
       modelUuid: params.aivis_model_uuid,
+      volumeOffsetDb: params.volume_offset_db,
       elevenlabs: {
         apiKey: params.elevenlabs_api_key,
         voiceId: params.elevenlabs_voice_id,
         modelId: params.elevenlabs_model_id,
-        volumeDb: params.elevenlabs_volume_db,
+        volumeOffsetDb: params.elevenlabs_volume_db,
+        // 2.5 の値として保存したので、2.4 の値からの読み替えはもうしない
+        volumeMigrated: params.elevenlabs_volume_db !== undefined ? true : undefined,
       },
     });
 
@@ -346,7 +348,8 @@ export class MCPService {
     if (effective.elevenLabsApiKey !== candidate.elevenLabsApiKey) overridden.push('elevenlabs_api_key (ELEVENLABS_API_KEY)');
     if (effective.elevenLabsVoiceId !== candidate.elevenLabsVoiceId) overridden.push('elevenlabs_voice_id (ELEVENLABS_VOICE_ID / --voice-id)');
     if (effective.elevenLabsModelId !== candidate.elevenLabsModelId) overridden.push('elevenlabs_model_id (ELEVENLABS_MODEL_ID / --eleven-model)');
-    if (effective.elevenLabsVolumeDb !== candidate.elevenLabsVolumeDb) overridden.push('elevenlabs_volume_db (ELEVENLABS_VOLUME_DB)');
+    if (effective.elevenLabsVolumeOffsetDb !== candidate.elevenLabsVolumeOffsetDb) overridden.push('elevenlabs_volume_db (ELEVENLABS_VOLUME_DB)');
+    if (effective.volumeOffsetDb !== candidate.volumeOffsetDb) overridden.push('volume_offset_db (AIVIS_VOLUME_OFFSET_DB)');
     if (overridden.length > 0) {
       warnings.push(`環境変数またはCLI引数が優先されるため、次の項目は保存した値が使われません: ${overridden.join(', ')}`);
     }
@@ -375,17 +378,7 @@ export class MCPService {
     }
     this.workerProcessStarted = true;
 
-    const indexPath = path.join(__dirname, '../index.js');
-
-    const child = spawn(
-      process.execPath,
-      [indexPath, '--worker'],
-      {
-        env: { ...process.env, AIVIS_WORKER_MODE: '1' },
-        stdio: 'ignore',
-        detached: true
-      }
-    );
-    child.unref();
+    // 起きた worker は、古い版の worker が動いていれば lock を引き取り、同じ版が動いていれば終わる
+    spawnWorker(this.config);
   }
 }

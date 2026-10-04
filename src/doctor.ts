@@ -207,14 +207,20 @@ export async function runDoctor(config: AppConfig): Promise<void> {
     if (hasMpv) {
       console.log('  OK  ffplay は見つかりませんが、mpv が利用可能です');
       okCount++;
+      if (!(await commandExists('ffmpeg'))) {
+        console.log('      ffmpeg が無いため、声ごとの音量を覚え直せません。ffmpeg のインストールを勧めます');
+        await tryInstall('ffmpeg');
+      }
     } else {
       console.log('  NG  ffplay が見つかりません');
       if (system === 'darwin') {
         const hasAfplay = await commandExists('afplay');
         if (hasAfplay) {
-          console.log('      代替: afplay が利用可能（macOS標準、ストリーミング非対応）');
+          console.log('      代替: afplay が利用可能（macOS標準）。ただし全部受け取ってから鳴らすので鳴り始めが遅れ、');
+          console.log('      音量は下げる方向にしか揃えられず、声ごとの音量の覚え直しもできません');
         }
       }
+      console.log('      ffmpeg（ffplay）を入れると、届きながら鳴らし、どの声も同じ大きさ（-20 LUFS）に揃えます');
       await tryInstall('ffmpeg');
     }
   }

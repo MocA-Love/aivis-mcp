@@ -1,10 +1,13 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { spawn } from 'child_process';
 import { createClient, type RedisClientType } from 'redis';
-import type { AppConfig } from '../config.js';
+import { version, type AppConfig } from '../config.js';
+import { WORKER_VERSION_KEY } from '../queue/keys.js';
+import { shouldSpawnWorker } from '../queue/worker-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -14,10 +17,14 @@ function sleep(ms: number): Promise<void> {
 }
 
 export async function tryStartRedis(): Promise<void> {
-  const lockDir = path.join(process.cwd(), 'temp');
-  const lockPath = path.join(lockDir, 'redis-start.lock');
+  // 起動した場所（cwd）に temp/ を作らないよう、置き場は OS の一時フォルダにする
+  const lockPath = path.join(os.tmpdir(), 'aivis-mcp-redis-start.lock');
   try {
-    fs.mkdirSync(lockDir, { recursive: true });
+    // 前回のプロセスが消し損ねた古い lock は使わない
+    const stat = fs.statSync(lockPath, { throwIfNoEntry: false });
+    if (stat && Date.now() - stat.mtimeMs > 10_000) {
+      fs.rmSync(lockPath, { force: true });
+    }
     const fd = fs.openSync(lockPath, 'wx');
     fs.closeSync(fd);
   } catch {
@@ -28,6 +35,8 @@ export async function tryStartRedis(): Promise<void> {
       detached: true,
       stdio: 'ignore',
     });
+    // redis-server が無いと error が非同期に来る。受け手が無いとプロセスごと落ちる
+    child.on('error', error => console.error('Failed to start redis-server:', error.message));
     child.unref();
   } catch (error) {
     console.error('Failed to start redis-server:', error);
@@ -38,8 +47,7 @@ export async function tryStartRedis(): Promise<void> {
   }
 }
 
-/** 動いているworkerの版（workerがlockと同じ寿命で書く）。 */
-export const WORKER_VERSION_KEY = 'aivis-mcp:worker-version';
+export { WORKER_VERSION_KEY };
 
 export async function connectRedis(redisUrl: string): Promise<RedisClientType> {
   let client = createClient({ url: redisUrl }) as RedisClientType;
@@ -67,19 +75,31 @@ export async function connectRedis(redisUrl: string): Promise<RedisClientType> {
   process.exit(1);
 }
 
-export function spawnWorker(_config?: AppConfig): void {
+export function spawnWorker(config?: AppConfig): void {
   const indexPath = path.join(__dirname, '../index.js');
+  // テスト用の置き場の差し替えは、起こした worker（ほかの発話も鳴らす共有のもの）に引き継がない
+  const env: NodeJS.ProcessEnv = { ...process.env, AIVIS_WORKER_MODE: '1', ...(config ? { REDIS_URL: config.redisUrl } : {}) };
+  delete env.AIVIS_CONFIG_FILE;
+  delete env.AIVIS_GAIN_FILE;
   const child = spawn(process.execPath, [indexPath, '--worker'], {
-    env: { ...process.env, AIVIS_WORKER_MODE: '1' },
+    // `--redis-url` で指定した接続先を、起こした worker にも引き継ぐ
+    env,
     stdio: 'ignore',
     detached: true,
   });
   child.unref();
 }
 
-export async function ensureWorkerRunning(client: RedisClientType, config: AppConfig): Promise<void> {
-  const workerLock = await client.get(config.workerLockKey);
-  if (workerLock) return;
+/**
+ * worker が動いていなければ起こす。動いている worker が自分より古い版なら、新しい worker を起こす
+ * （起きた worker が lock を引き取る。設計 3.6 R2）。起こしたら true。
+ */
+export async function ensureWorkerRunning(client: RedisClientType, config: AppConfig): Promise<boolean> {
+  const [workerLock, workerVersion] = await Promise.all([client.get(config.workerLockKey), client.get(WORKER_VERSION_KEY)]);
+  if (!shouldSpawnWorker(workerLock, workerVersion, version)) {
+    return false;
+  }
   spawnWorker(config);
   await sleep(300);
+  return true;
 }

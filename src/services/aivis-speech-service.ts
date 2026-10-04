@@ -1,34 +1,21 @@
-import axios from 'axios';
-import fs from 'fs';
-import path from 'path';
-import { spawn } from 'child_process';
-import http from 'http';
-import { platform } from 'os';
-import { PassThrough, Readable } from 'stream';
 import { createClient, type RedisClientType } from 'redis';
-import { v4 as uuidv4 } from 'uuid';
 import { version, type AppConfig } from '../config.js';
-import { tryStartRedis, WORKER_VERSION_KEY } from './redis-service.js';
-import { isMuted } from './mute-service.js';
-import { captureParaCodeVoiceTarget, isParaCodeVoiceTarget, type ParaCodeVoiceTarget } from './para-code-voice.js';
-import { describeElevenLabsError, synthesizeElevenLabsStream } from './elevenlabs-client.js';
-
-interface ParaCodeForwardResult {
-  readonly audio?: Buffer;
-  readonly playedLocally: boolean;
-}
+import { ensureWorkerRunning, tryStartRedis } from './redis-service.js';
+import { captureParaCodeVoiceTarget } from './para-code-voice.js';
+import { enqueueSynthesis } from '../queue/enqueue.js';
+import { PlaybackWorker } from '../worker/playback-worker.js';
+import { createAudioBackend } from '../audio/player.js';
+import { measureLoudness } from '../audio/loudness.js';
+import { synthesizeStream } from '../audio/synthesize.js';
 
 /**
- * Aivis Cloud APIとの通信を行うサービスクラス
+ * MCP・CLI から発話を列に積む側と、worker を動かす入口。
+ * 鳴らすのは Redis 全体で 1 つだけの worker（`PlaybackWorker`）。
  */
 export class AivisSpeechService {
   private config: AppConfig;
   private loadConfig: () => AppConfig;
   private redisClient: RedisClientType;
-  private redisWorkerClient: RedisClientType;
-  private workerId: string;
-  private workerHeartbeat?: NodeJS.Timeout;
-  private workerActive: boolean;
 
   /**
    * @param loadConfig 発話ごとに最新の設定を返す関数。MCPツールで config.json が書き換わっても
@@ -37,49 +24,37 @@ export class AivisSpeechService {
   constructor(config: AppConfig, loadConfig?: () => AppConfig) {
     this.config = config;
     this.loadConfig = loadConfig ?? (() => this.config);
-    this.workerId = uuidv4();
-    this.workerActive = false;
     this.redisClient = createClient({ url: config.redisUrl });
-    this.redisWorkerClient = createClient({ url: config.redisUrl });
-
     this.redisClient.on('error', (error) => {
-      console.error('Redis error:', error);
-    });
-    this.redisWorkerClient.on('error', (error) => {
-      console.error('Redis worker error:', error);
+      console.error('Redis error:', error instanceof Error ? error.message : error);
     });
   }
 
-  async synthesizeInBackground(params: any): Promise<void> {
+  async synthesizeInBackground(params: Record<string, unknown>): Promise<void> {
     try {
       await this.ensureRedisReady();
-      if (this.config.debug) {
-        console.error('[queue] enqueue', {
-          instance: this.workerId,
-          wait_ms: params.wait_ms
-        });
-      }
+      // 動いている worker が古ければ新しい worker を起こす（起きた worker が lock を引き取る）
+      await ensureWorkerRunning(this.redisClient, this.config);
       // 再生workerはRedis全体で1つだけなので、そのprocess.envは要求元MCPと一致しない。
       // 現在の要求元をenqueue時に確定し、短命なjob payloadとしてworkerへ引き渡す。
       const voiceTarget = await captureParaCodeVoiceTarget();
       const queuedParams = voiceTarget === undefined ? params : { ...params, _paraCodeVoiceTarget: voiceTarget };
-      await this.redisClient.rPush(this.config.queueKey, JSON.stringify(queuedParams));
+      const job = await enqueueSynthesis(this.redisClient, queuedParams);
+      if (this.config.debug) {
+        console.error('[queue] enqueue', { id: job.id, wait_ms: params.wait_ms });
+      }
     } catch (error) {
-      console.error('Queue enqueue error:', error);
+      console.error('Queue enqueue error:', error instanceof Error ? error.message : error);
     }
   }
 
   private async ensureRedisReady(): Promise<void> {
-    if (this.redisClient.isOpen && this.redisWorkerClient.isOpen) {
+    if (this.redisClient.isOpen) {
       return;
     }
-
     await this.ensureRedisRunning();
     if (!this.redisClient.isOpen) {
       await this.redisClient.connect();
-    }
-    if (!this.redisWorkerClient.isOpen) {
-      await this.redisWorkerClient.connect();
     }
   }
 
@@ -89,15 +64,9 @@ export class AivisSpeechService {
       await probe.connect();
       await probe.ping();
       await probe.disconnect();
-      if (this.config.debug) {
-        console.error('[redis] ready');
-      }
       return;
     } catch (error) {
       await probe.disconnect().catch(() => undefined);
-      if (this.config.debug) {
-        console.error('[redis] not running, try start');
-      }
       await tryStartRedis();
       for (let i = 0; i < 10; i += 1) {
         try {
@@ -105,578 +74,51 @@ export class AivisSpeechService {
           await retry.connect();
           await retry.ping();
           await retry.disconnect();
-          if (this.config.debug) {
-            console.error('[redis] started');
-          }
           return;
         } catch {
-          await this.sleep(200);
+          await new Promise(resolve => setTimeout(resolve, 200));
         }
       }
       throw error;
     }
   }
 
+  /** worker として列を読み続ける。lock が取れない・失ったら終わる。 */
   async runWorkerLoop(): Promise<void> {
-    await this.ensureRedisReady();
-
-    if (!(await this.tryAcquireWorkerLock())) {
-      if (this.config.debug) {
-        console.error('[worker] lock not acquired, exiting', { instance: this.workerId });
-      }
-      await this.cleanup();
-      process.exit(0);
-      return;
-    }
-
-    if (this.config.debug) {
-      console.error('[worker] lock acquired', { instance: this.workerId });
-    }
-
-    const heartbeatMs = 5000;
-    this.workerHeartbeat = setInterval(() => {
-      this.refreshWorkerLock().catch((error) => {
-        console.error('Worker lock refresh error:', error);
+    await this.ensureRedisRunning();
+    const worker = new PlaybackWorker({
+      redisUrl: this.config.redisUrl,
+      version,
+      loadConfig: this.loadConfig,
+      backend: createAudioBackend(),
+      synthesize: synthesizeStream,
+      measure: audio => measureLoudness(audio),
+      debug: this.config.debug,
+    });
+    for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+      process.once(signal, () => {
+        void worker.shutdown().finally(() => process.exit(0));
       });
-    }, heartbeatMs);
-
-    await this.startWorker();
-  }
-
-  private async tryAcquireWorkerLock(): Promise<boolean> {
-    const acquired = await this.redisClient.set(
-      this.config.workerLockKey,
-      this.workerId,
-      { NX: true, PX: 20000 }
-    );
-    if (acquired) {
-      await this.publishWorkerVersion();
     }
-    return Boolean(acquired);
-  }
-
-  /**
-   * 動いているworkerの版を知らせる。`--play-audio` は、合成済みMP3のjobを読めない古いworkerへ
-   * 積まないよう、これを見てから積む（古いworkerは text の無いjobを合成して「undefined」と読む）。
-   */
-  private async publishWorkerVersion(): Promise<void> {
-    try {
-      await this.redisClient.set(WORKER_VERSION_KEY, version, { PX: 20000 });
-    } catch {}
-  }
-
-  private async refreshWorkerLock(): Promise<void> {
-    if (!this.redisClient.isOpen) {
-      return;
+    const result = await worker.run();
+    if (this.config.debug) {
+      console.error(`[worker] ${result}`, { instance: worker.id });
     }
-    const updated = await this.redisClient.eval(
-      'if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("PEXPIRE", KEYS[1], ARGV[2]) else return 0 end',
-      {
-        keys: [this.config.workerLockKey],
-        arguments: [this.workerId, '20000']
-      }
-    );
-    if (updated) {
-      await this.publishWorkerVersion();
-    }
-    if (!updated) {
-      if (this.config.debug) {
-        console.error('[worker] lock lost', { instance: this.workerId });
-      }
-      this.stopWorker();
-    }
-  }
-
-  private stopWorker(): void {
-    if (this.workerHeartbeat) {
-      clearInterval(this.workerHeartbeat);
-      this.workerHeartbeat = undefined;
-    }
-    this.workerActive = false;
-  }
-
-  private async acquirePlayLock(): Promise<void> {
-    const playLockKey = 'aivis-mcp:play-lock';
-    while (true) {
-      const acquired = await this.redisClient.set(playLockKey, this.workerId, { NX: true, PX: 120000 });
-      if (acquired) return;
-      await this.sleep(100);
-    }
-  }
-
-  private async releasePlayLock(): Promise<void> {
-    const playLockKey = 'aivis-mcp:play-lock';
-    try {
-      await this.redisClient.eval(
-        'if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end',
-        { keys: [playLockKey], arguments: [this.workerId] }
-      );
-    } catch {}
+    process.exit(0);
   }
 
   async waitForCompletion(requestId: string, timeoutSeconds: number): Promise<void> {
     await this.ensureRedisReady();
     const key = `aivis-mcp:done:${requestId}`;
+    // 待つ接続を分けないと、同じ接続のほかの呼び出しが止まる
+    const waiter = this.redisClient.duplicate();
     try {
-      await this.redisClient.brPop(key, timeoutSeconds);
+      await waiter.connect();
+      await waiter.brPop(key, timeoutSeconds);
     } catch (error) {
-      console.error('waitForCompletion error:', error);
+      console.error('waitForCompletion error:', error instanceof Error ? error.message : error);
+    } finally {
+      await waiter.disconnect().catch(() => undefined);
     }
   }
-
-  private async notifyCompletion(requestId: string): Promise<void> {
-    try {
-      const key = `aivis-mcp:done:${requestId}`;
-      await this.redisClient.rPush(key, 'done');
-      await this.redisClient.expire(key, 10);
-    } catch (error) {
-      console.error('notifyCompletion error:', error);
-    }
-  }
-
-  private async cleanup(): Promise<void> {
-    try {
-      if (this.redisClient.isOpen) await this.redisClient.disconnect();
-    } catch {}
-    try {
-      if (this.redisWorkerClient.isOpen) await this.redisWorkerClient.disconnect();
-    } catch {}
-  }
-
-  private async startWorker(): Promise<void> {
-    if (this.workerActive) {
-      return;
-    }
-    this.workerActive = true;
-
-    while (this.workerActive) {
-      try {
-        const result = await this.redisWorkerClient.brPop(this.config.queueKey, 1);
-        if (!result) {
-          continue;
-        }
-        if (this.config.debug) {
-          console.error('[queue] dequeue', { instance: this.workerId });
-        }
-        const payload = JSON.parse(result.element);
-        // ミュート中は合成も再生もせず捨てる。ただし --wait で待っている呼び出し元は
-        // ブロックしたままにしないよう完了通知だけは返す。
-        if (await isMuted(this.redisWorkerClient)) {
-          if (this.config.debug) {
-            console.error('[mute] skipped synthesis', { instance: this.workerId });
-          }
-          if (payload._requestId) {
-            await this.notifyCompletion(payload._requestId);
-          }
-          continue;
-        }
-        await this.acquirePlayLock();
-        try {
-          if (this.config.debug) {
-            console.error('[synthesize] start', { instance: this.workerId });
-          }
-          await this.synthesizeAndPlay(payload);
-          if (this.config.debug) {
-            console.error('[synthesize] done', { instance: this.workerId });
-          }
-          if (payload._requestId) {
-            await this.notifyCompletion(payload._requestId);
-          }
-        } finally {
-          await this.releasePlayLock();
-        }
-      } catch (error) {
-        console.error('Queue worker error:', error);
-      }
-    }
-
-    this.stopWorker();
-  }
-
-  private async sleep(ms: number): Promise<void> {
-    await new Promise<void>((resolve) => setTimeout(resolve, ms));
-  }
-
-  async synthesizeAndPlay(params: any): Promise<void> {
-    // Para Code が SSH 先から受け取った合成済みMP3（`--play-audio`）。合成もPara Codeへの転送もしない
-    if (typeof params._audioBase64 === 'string') {
-      await this.playQueuedAudio(params._audioBase64);
-      return;
-    }
-    const config = this.loadConfig();
-    // provider未指定のjobは、この機能より前のバージョンがenqueueしたものなのでAivisとして扱う
-    const provider = params.provider === 'elevenlabs' ? 'elevenlabs' : 'aivis';
-    try {
-      if (provider === 'aivis' && !config.apiKey) {
-        console.error('APIキーが設定されていません');
-        return;
-      }
-      if (provider === 'elevenlabs' && !config.elevenLabsApiKey) {
-        console.error('ElevenLabs のAPIキーが設定されていません');
-        return;
-      }
-
-      if (typeof params.wait_ms === 'number' && params.wait_ms > 0) {
-        const waitMs = Math.min(params.wait_ms, 60000);
-        await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
-      }
-
-      const audioStream = provider === 'elevenlabs'
-        ? await synthesizeElevenLabsStream(config, {
-          text: params.text,
-          voice_id: params.voice_id,
-          model_id: params.model_id,
-          speaking_rate: params.speaking_rate,
-        })
-        : await this.synthesizeAivisStream(config, params);
-
-      // モバイル転送の data listener が元streamを flowing modeへ移しても、PCプレイヤーの
-      // 探索中に先頭チャンクを取りこぼさないよう、先に再生用PassThroughを接続する。
-      // PassThroughが未消費の間はbackpressureでAxios streamを止め、streamPlay接続後に再開する。
-      const playbackStream = new PassThrough();
-      audioStream.pipe(playbackStream);
-      audioStream.once('error', (error: unknown) => {
-        console.error('Stream error:', error);
-        playbackStream.end();
-      });
-      const forwarding = this.forwardStreamToParaCode(audioStream, params._paraCodeVoiceTarget);
-      // ElevenLabs は Aivis より 17dB ほど大きく出力されるため、再生時に下げて揃える
-      const gainDb = provider === 'elevenlabs' ? config.elevenLabsVolumeDb : 0;
-      const target = params._paraCodeVoiceTarget;
-      if (isParaCodeVoiceTarget(target) && target.localPlayback === true) {
-        // SSH先から発話し、Para Code が手元のPCで鳴らすと答えた。この機械では鳴らさない。
-        // 次の発話と順番が入れ替わらないよう、渡し終えるまで再生ロックを持ったまま待つ。
-        playbackStream.resume();
-        const result = await forwarding;
-        if (!result.playedLocally && result.audio !== undefined) {
-          // 手元で鳴らせなかったときだけ、この機械で鳴らして発話を失わない
-          await this.streamPlay(Readable.from([result.audio]), gainDb);
-        } else if (!result.playedLocally) {
-          // 大きすぎて手元へ送れなかった・途中で切れた。読み捨てた分は戻らないので、合成し直して鳴らす
-          console.error('Para Code へ音声を渡せなかったので、この機械で鳴らします');
-          await this.synthesizeAndPlay({ ...params, wait_ms: undefined, _paraCodeVoiceTarget: undefined });
-        }
-        return;
-      }
-      await this.streamPlay(playbackStream, gainDb);
-    } catch (error) {
-      console.error('Error in synthesizeAndPlay');
-      if (provider === 'elevenlabs') {
-        console.error(describeElevenLabsError(error));
-      }
-      this.logDetailedError(error);
-    }
-  }
-
-  private async synthesizeAivisStream(config: AppConfig, params: any): Promise<NodeJS.ReadableStream> {
-    const requestParams = {
-      model_uuid: params.model_uuid || config.modelUuid,
-      text: '<break time="500ms"/>' + params.text,
-      output_format: 'mp3',
-      speaker_uuid: params.speaker_uuid,
-      style_id: params.style_id,
-      style_name: params.style_name,
-      speaking_rate: params.speaking_rate || params.speed_scale,
-      emotional_intensity: params.emotional_intensity,
-      tempo_dynamics: params.tempo_dynamics,
-      pitch: params.pitch || params.pitch_scale,
-      volume: params.volume || params.volume_scale,
-      leading_silence_seconds: params.leading_silence_seconds || params.pre_phoneme_length,
-      trailing_silence_seconds: params.trailing_silence_seconds || params.post_phoneme_length,
-      line_break_silence_seconds: params.line_break_silence_seconds
-    };
-
-    Object.keys(requestParams).forEach(key => {
-      if (requestParams[key as keyof typeof requestParams] === undefined) {
-        delete requestParams[key as keyof typeof requestParams];
-      }
-    });
-
-    const response = await axios.post(
-      `${config.apiUrl}/tts/synthesize`,
-      requestParams,
-      {
-        headers: {
-          'Authorization': `Bearer ${config.apiKey}`,
-          'Content-Type': 'application/json'
-        },
-        responseType: 'stream',
-        timeout: 60000
-      }
-    );
-    return response.data;
-  }
-
-  /**
-   * AivisレスポンスをPCプレイヤーと同時に観測し、Para Codeから起動された時だけ
-   * 同じMP3をlocalhostへ送る。転送は完全な副経路で、失敗してもPC再生へ伝播しない。
-   * 結果の `audio` は受け取った全体（取れなかったら undefined）、`playedLocally` は
-   * Para Code が手元のPCで鳴らしたか。
-   */
-  private forwardStreamToParaCode(stream: NodeJS.ReadableStream, target: unknown): Promise<ParaCodeForwardResult> {
-    if (!isParaCodeVoiceTarget(target)) {
-      return Promise.resolve({ playedLocally: false });
-    }
-
-    const maximumBytes = 8 * 1024 * 1024;
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let accepted = true;
-    return new Promise(resolve => {
-      stream.on('data', (value: Buffer | string) => {
-        if (!accepted) {
-          return;
-        }
-        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-        total += chunk.byteLength;
-        if (total > maximumBytes) {
-          accepted = false;
-          chunks.length = 0;
-          return;
-        }
-        chunks.push(Buffer.from(chunk));
-      });
-      stream.once('error', () => {
-        accepted = false;
-        chunks.length = 0;
-        resolve({ playedLocally: false });
-      });
-      stream.once('end', () => {
-        if (!accepted || total === 0) {
-          resolve({ playedLocally: false });
-          return;
-        }
-        const audio = Buffer.concat(chunks, total);
-        void this.postAudioToParaCode(target, audio).then(playedLocally => resolve({ audio, playedLocally }));
-      });
-    });
-  }
-
-  /** 送れたら Para Code が手元のPCで鳴らしたか（応答の `localPlayback`）を返す。 */
-  private async postAudioToParaCode(target: ParaCodeVoiceTarget, audio: Buffer): Promise<boolean> {
-    if (!(await this.isCurrentParaCodeInstance(target))) {
-      return false;
-    }
-    return new Promise<boolean>(resolve => {
-      const request = http.request({
-        hostname: '127.0.0.1',
-        port: target.port,
-        path: '/paradis-mcp/mobile-voice',
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${target.ticket}`,
-          'Content-Type': 'audio/mpeg',
-          'Content-Length': audio.byteLength,
-        },
-        // 手元で鳴らすときは、Para Code が手元のキューへ積み終えるまで応答を待つ。Para Code は本文を
-        // 受け取ってから 10 秒で諦めるので、SSH を運ばれている時間の分も見込んで十分長く待つ
-        // （先に諦めて自分で鳴らすと、手元でも鳴って二重になる）
-        timeout: target.localPlayback === true ? 30000 : 3000,
-      }, response => {
-        const chunks: Buffer[] = [];
-        let size = 0;
-        response.on('data', value => {
-          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-          size += chunk.byteLength;
-          if (size <= 16 * 1024) {
-            chunks.push(chunk);
-          }
-        });
-        response.once('end', () => {
-          const status = response.statusCode ?? 0;
-          if (status < 200 || status >= 300 || size <= 0 || size > 16 * 1024) {
-            resolve(false);
-            return;
-          }
-          try {
-            const body = JSON.parse(Buffer.concat(chunks, size).toString('utf8')) as { localPlayback?: unknown };
-            resolve(body.localPlayback === true);
-          } catch {
-            resolve(false);
-          }
-        });
-      });
-      request.once('timeout', () => { request.destroy(); resolve(false); });
-      request.once('error', () => resolve(false));
-      request.end(audio);
-    });
-  }
-
-  /** `--play-audio` で積まれた合成済みMP3をこの機械で鳴らす。 */
-  private async playQueuedAudio(audioBase64: string): Promise<void> {
-    try {
-      const audio = Buffer.from(audioBase64, 'base64');
-      if (audio.byteLength === 0) {
-        return;
-      }
-      await this.streamPlay(Readable.from([audio]));
-    } catch (error) {
-      console.error('Error in playQueuedAudio:', error);
-    }
-  }
-
-  private isCurrentParaCodeInstance(target: ParaCodeVoiceTarget): Promise<boolean> {
-    if (target.expiresAt < Date.now()) {
-      return Promise.resolve(false);
-    }
-    return new Promise(resolve => {
-      const request = http.get({
-        hostname: '127.0.0.1',
-        port: target.port,
-        path: '/paradis-mcp/health',
-        timeout: 2000,
-      }, response => {
-        const chunks: Buffer[] = [];
-        let size = 0;
-        response.on('data', value => {
-          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-          size += chunk.byteLength;
-          if (size <= 16 * 1024) {
-            chunks.push(chunk);
-          }
-        });
-        response.once('end', () => {
-          if (response.statusCode !== 200 || size <= 0 || size > 16 * 1024) {
-            resolve(false);
-            return;
-          }
-          try {
-            const body = JSON.parse(Buffer.concat(chunks, size).toString('utf8')) as { instanceId?: unknown };
-            resolve(body.instanceId === target.instanceId);
-          } catch {
-            resolve(false);
-          }
-        });
-      });
-      request.once('timeout', () => { request.destroy(); resolve(false); });
-      request.once('error', () => resolve(false));
-    });
-  }
-
-  private async streamPlay(stream: any, gainDb = 0): Promise<void> {
-    const system = platform();
-
-    let players: string[] = [];
-    if (system === 'darwin') {
-      players = ['ffplay', 'mpv', 'afplay'];
-    } else if (system === 'linux') {
-      players = ['ffplay', 'mpv', 'mplayer', 'play'];
-    } else if (system === 'win32') {
-      players = ['ffplay.exe', 'mpv.exe'];
-    }
-
-    let playerCmd: string | null = null;
-
-    for (const player of players) {
-      try {
-        const checkCmd = system === 'win32' ? 'where' : 'which';
-        const result = spawn(checkCmd, [player], { stdio: 'pipe' });
-        await new Promise<void>((resolve) => {
-          result.on('exit', (code) => {
-            if (code === 0) {
-              playerCmd = player;
-            }
-            resolve();
-          });
-        });
-        if (playerCmd) break;
-      } catch {
-        continue;
-      }
-    }
-
-    if (!playerCmd) {
-      const tempDir = path.join(process.cwd(), 'temp');
-      if (!fs.existsSync(tempDir)) {
-        fs.mkdirSync(tempDir, { recursive: true });
-      }
-      const audioFilePath = path.join(tempDir, `speech_${Date.now()}.mp3`);
-
-      const writeStream = fs.createWriteStream(audioFilePath);
-      stream.pipe(writeStream);
-
-      await new Promise<void>((resolve, reject) => {
-        writeStream.on('finish', resolve);
-        writeStream.on('error', reject);
-      });
-
-      if (system === 'darwin') {
-        await new Promise<void>((resolve, reject) => {
-          const afplayArgs = gainDb === 0 ? [audioFilePath] : ['-v', String(10 ** (gainDb / 20)), audioFilePath];
-          const proc = spawn('afplay', afplayArgs, { stdio: 'ignore' });
-          proc.on('error', reject);
-          proc.on('close', () => resolve());
-        });
-      } else if (system === 'win32') {
-        spawn('cmd', ['/c', 'start', '', audioFilePath], { stdio: 'ignore' });
-      } else {
-        console.error('No audio player found for playback');
-      }
-
-      try {
-        fs.unlinkSync(audioFilePath);
-      } catch {}
-
-      return;
-    }
-
-    let cmd: string[];
-    if (playerCmd === 'ffplay' || playerCmd === 'ffplay.exe') {
-      cmd = [
-        '-f', 'mp3',
-        '-nodisp', '-autoexit', '-loglevel', 'quiet',
-        '-volume', '100',
-        ...(gainDb === 0 ? [] : ['-af', `volume=${gainDb}dB`]),
-        '-i', '-'
-      ];
-    } else if (playerCmd === 'mpv' || playerCmd === 'mpv.exe') {
-      cmd = [
-        '--no-video', '--really-quiet',
-        '--demuxer-lavf-o=fflags=+nobuffer',
-        '--audio-buffer=1', '--cache=yes', '--cache-secs=1',
-        '--demuxer-readahead-secs=1',
-        ...(gainDb === 0 ? [] : [`--af=lavfi=[volume=${gainDb}dB]`]),
-        '-'
-      ];
-    } else {
-      cmd = ['-'];
-    }
-
-    const playerProcess = spawn(playerCmd, cmd, {
-      stdio: ['pipe', 'ignore', 'ignore']
-    });
-
-    stream.pipe(playerProcess.stdin);
-
-    playerProcess.on('error', (error) => {
-      console.error('Player process error:', error);
-    });
-
-    stream.on('error', (error: any) => {
-      console.error('Stream error:', error);
-      playerProcess.kill();
-    });
-
-    await new Promise<void>((resolve, reject) => {
-      playerProcess.on('close', () => resolve());
-      playerProcess.on('error', reject);
-    });
-  }
-
-  /**
-   * AxiosErrorをそのまま出すと config.headers や stream応答の req._header に
-   * APIキー（Authorization / xi-api-key）が平文で含まれるため、要約だけを出す。
-   */
-  private logDetailedError(error: any): void {
-    if (axios.isAxiosError(error)) {
-      console.error('Request failed:', {
-        status: error.response?.status,
-        code: error.code,
-        message: error.message,
-      });
-    } else {
-      console.error('Non-Axios error:', error);
-    }
-  }
-
 }
