@@ -4,7 +4,7 @@ import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './co
 import { MCPService } from './services/mcp-service.js';
 import { AivisSpeechService } from './services/aivis-speech-service.js';
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
-import { runHealth, runReboot, runMute, runUnmute, runMuteStatus } from './commands.js';
+import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio } from './commands.js';
 import { runDoctor, checkDependencies } from './doctor.js';
 import { runInit } from './settings.js';
 
@@ -20,6 +20,7 @@ function printHelp(): void {
   console.log('  aivis-mcp --mute --mute-for 30m    30分間ミュート');
   console.log('  aivis-mcp --unmute                 ミュート解除');
   console.log('  aivis-mcp --mute-status            ミュート状態を確認');
+  console.log('  aivis-mcp --play-audio             標準入力のMP3をキューに積んで再生');
   console.log('  aivis-mcp --init                   初期設定（APIキー等を保存）');
   console.log('  aivis-mcp --doctor                 依存ツール診断');
   console.log('  aivis-mcp --version                バージョン表示');
@@ -106,6 +107,11 @@ async function main() {
 
   if (values.unmute) {
     await runUnmute(config);
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+  }
+
+  if (values['play-audio']) {
+    await runPlayAudio(config);
     process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
 

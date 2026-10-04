@@ -4,14 +4,19 @@ import path from 'path';
 import { spawn } from 'child_process';
 import http from 'http';
 import { platform } from 'os';
-import { PassThrough } from 'stream';
+import { PassThrough, Readable } from 'stream';
 import { createClient, type RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
-import type { AppConfig } from '../config.js';
-import { tryStartRedis } from './redis-service.js';
+import { version, type AppConfig } from '../config.js';
+import { tryStartRedis, WORKER_VERSION_KEY } from './redis-service.js';
 import { isMuted } from './mute-service.js';
 import { captureParaCodeVoiceTarget, isParaCodeVoiceTarget, type ParaCodeVoiceTarget } from './para-code-voice.js';
 import { describeElevenLabsError, synthesizeElevenLabsStream } from './elevenlabs-client.js';
+
+interface ParaCodeForwardResult {
+  readonly audio?: Buffer;
+  readonly playedLocally: boolean;
+}
 
 /**
  * Aivis Cloud APIとの通信を行うサービスクラス
@@ -144,7 +149,20 @@ export class AivisSpeechService {
       this.workerId,
       { NX: true, PX: 20000 }
     );
+    if (acquired) {
+      await this.publishWorkerVersion();
+    }
     return Boolean(acquired);
+  }
+
+  /**
+   * 動いているworkerの版を知らせる。`--play-audio` は、合成済みMP3のjobを読めない古いworkerへ
+   * 積まないよう、これを見てから積む（古いworkerは text の無いjobを合成して「undefined」と読む）。
+   */
+  private async publishWorkerVersion(): Promise<void> {
+    try {
+      await this.redisClient.set(WORKER_VERSION_KEY, version, { PX: 20000 });
+    } catch {}
   }
 
   private async refreshWorkerLock(): Promise<void> {
@@ -158,6 +176,9 @@ export class AivisSpeechService {
         arguments: [this.workerId, '20000']
       }
     );
+    if (updated) {
+      await this.publishWorkerVersion();
+    }
     if (!updated) {
       if (this.config.debug) {
         console.error('[worker] lock lost', { instance: this.workerId });
@@ -277,6 +298,11 @@ export class AivisSpeechService {
   }
 
   async synthesizeAndPlay(params: any): Promise<void> {
+    // Para Code が SSH 先から受け取った合成済みMP3（`--play-audio`）。合成もPara Codeへの転送もしない
+    if (typeof params._audioBase64 === 'string') {
+      await this.playQueuedAudio(params._audioBase64);
+      return;
+    }
     const config = this.loadConfig();
     // provider未指定のjobは、この機能より前のバージョンがenqueueしたものなのでAivisとして扱う
     const provider = params.provider === 'elevenlabs' ? 'elevenlabs' : 'aivis';
@@ -313,9 +339,25 @@ export class AivisSpeechService {
         console.error('Stream error:', error);
         playbackStream.end();
       });
-      this.forwardStreamToParaCode(audioStream, params._paraCodeVoiceTarget);
+      const forwarding = this.forwardStreamToParaCode(audioStream, params._paraCodeVoiceTarget);
       // ElevenLabs は Aivis より 17dB ほど大きく出力されるため、再生時に下げて揃える
       const gainDb = provider === 'elevenlabs' ? config.elevenLabsVolumeDb : 0;
+      const target = params._paraCodeVoiceTarget;
+      if (isParaCodeVoiceTarget(target) && target.localPlayback === true) {
+        // SSH先から発話し、Para Code が手元のPCで鳴らすと答えた。この機械では鳴らさない。
+        // 次の発話と順番が入れ替わらないよう、渡し終えるまで再生ロックを持ったまま待つ。
+        playbackStream.resume();
+        const result = await forwarding;
+        if (!result.playedLocally && result.audio !== undefined) {
+          // 手元で鳴らせなかったときだけ、この機械で鳴らして発話を失わない
+          await this.streamPlay(Readable.from([result.audio]), gainDb);
+        } else if (!result.playedLocally) {
+          // 大きすぎて手元へ送れなかった・途中で切れた。読み捨てた分は戻らないので、合成し直して鳴らす
+          console.error('Para Code へ音声を渡せなかったので、この機械で鳴らします');
+          await this.synthesizeAndPlay({ ...params, wait_ms: undefined, _paraCodeVoiceTarget: undefined });
+        }
+        return;
+      }
       await this.streamPlay(playbackStream, gainDb);
     } catch (error) {
       console.error('Error in synthesizeAndPlay');
@@ -368,47 +410,54 @@ export class AivisSpeechService {
   /**
    * AivisレスポンスをPCプレイヤーと同時に観測し、Para Codeから起動された時だけ
    * 同じMP3をlocalhostへ送る。転送は完全な副経路で、失敗してもPC再生へ伝播しない。
+   * 結果の `audio` は受け取った全体（取れなかったら undefined）、`playedLocally` は
+   * Para Code が手元のPCで鳴らしたか。
    */
-  private forwardStreamToParaCode(stream: NodeJS.ReadableStream, target: unknown): void {
+  private forwardStreamToParaCode(stream: NodeJS.ReadableStream, target: unknown): Promise<ParaCodeForwardResult> {
     if (!isParaCodeVoiceTarget(target)) {
-      return;
+      return Promise.resolve({ playedLocally: false });
     }
 
     const maximumBytes = 8 * 1024 * 1024;
     const chunks: Buffer[] = [];
     let total = 0;
     let accepted = true;
-    stream.on('data', (value: Buffer | string) => {
-      if (!accepted) {
-        return;
-      }
-      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-      total += chunk.byteLength;
-      if (total > maximumBytes) {
+    return new Promise(resolve => {
+      stream.on('data', (value: Buffer | string) => {
+        if (!accepted) {
+          return;
+        }
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        total += chunk.byteLength;
+        if (total > maximumBytes) {
+          accepted = false;
+          chunks.length = 0;
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+      });
+      stream.once('error', () => {
         accepted = false;
         chunks.length = 0;
-        return;
-      }
-      chunks.push(Buffer.from(chunk));
-    });
-    stream.once('error', () => {
-      accepted = false;
-      chunks.length = 0;
-    });
-    stream.once('end', () => {
-      if (!accepted || total === 0) {
-        return;
-      }
-      const audio = Buffer.concat(chunks, total);
-      void this.postAudioToParaCode(target, audio);
+        resolve({ playedLocally: false });
+      });
+      stream.once('end', () => {
+        if (!accepted || total === 0) {
+          resolve({ playedLocally: false });
+          return;
+        }
+        const audio = Buffer.concat(chunks, total);
+        void this.postAudioToParaCode(target, audio).then(playedLocally => resolve({ audio, playedLocally }));
+      });
     });
   }
 
-  private async postAudioToParaCode(target: ParaCodeVoiceTarget, audio: Buffer): Promise<void> {
+  /** 送れたら Para Code が手元のPCで鳴らしたか（応答の `localPlayback`）を返す。 */
+  private async postAudioToParaCode(target: ParaCodeVoiceTarget, audio: Buffer): Promise<boolean> {
     if (!(await this.isCurrentParaCodeInstance(target))) {
-      return;
+      return false;
     }
-    await new Promise<void>(resolve => {
+    return new Promise<boolean>(resolve => {
       const request = http.request({
         hostname: '127.0.0.1',
         port: target.port,
@@ -419,12 +468,51 @@ export class AivisSpeechService {
           'Content-Type': 'audio/mpeg',
           'Content-Length': audio.byteLength,
         },
-        timeout: 3000,
-      }, response => { response.resume(); response.once('end', resolve); });
-      request.once('timeout', () => { request.destroy(); resolve(); });
-      request.once('error', () => resolve());
+        // 手元で鳴らすときは、Para Code が手元のキューへ積み終えるまで応答を待つ。Para Code は本文を
+        // 受け取ってから 10 秒で諦めるので、SSH を運ばれている時間の分も見込んで十分長く待つ
+        // （先に諦めて自分で鳴らすと、手元でも鳴って二重になる）
+        timeout: target.localPlayback === true ? 30000 : 3000,
+      }, response => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on('data', value => {
+          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+          size += chunk.byteLength;
+          if (size <= 16 * 1024) {
+            chunks.push(chunk);
+          }
+        });
+        response.once('end', () => {
+          const status = response.statusCode ?? 0;
+          if (status < 200 || status >= 300 || size <= 0 || size > 16 * 1024) {
+            resolve(false);
+            return;
+          }
+          try {
+            const body = JSON.parse(Buffer.concat(chunks, size).toString('utf8')) as { localPlayback?: unknown };
+            resolve(body.localPlayback === true);
+          } catch {
+            resolve(false);
+          }
+        });
+      });
+      request.once('timeout', () => { request.destroy(); resolve(false); });
+      request.once('error', () => resolve(false));
       request.end(audio);
     });
+  }
+
+  /** `--play-audio` で積まれた合成済みMP3をこの機械で鳴らす。 */
+  private async playQueuedAudio(audioBase64: string): Promise<void> {
+    try {
+      const audio = Buffer.from(audioBase64, 'base64');
+      if (audio.byteLength === 0) {
+        return;
+      }
+      await this.streamPlay(Readable.from([audio]));
+    } catch (error) {
+      console.error('Error in playQueuedAudio:', error);
+    }
   }
 
   private isCurrentParaCodeInstance(target: ParaCodeVoiceTarget): Promise<boolean> {

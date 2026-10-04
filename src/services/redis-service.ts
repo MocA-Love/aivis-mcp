@@ -38,6 +38,9 @@ export async function tryStartRedis(): Promise<void> {
   }
 }
 
+/** 動いているworkerの版（workerがlockと同じ寿命で書く）。 */
+export const WORKER_VERSION_KEY = 'aivis-mcp:worker-version';
+
 export async function connectRedis(redisUrl: string): Promise<RedisClientType> {
   let client = createClient({ url: redisUrl }) as RedisClientType;
   try {
