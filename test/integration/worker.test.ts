@@ -9,7 +9,7 @@ import { PlaybackWorker } from '../../src/worker/playback-worker.js';
 import { AudioStreamWriter } from '../../src/queue/audio-stream.js';
 import { enqueueJob, enqueueLegacy, enqueueSynthesis } from '../../src/queue/enqueue.js';
 import { clearHold, setHold } from '../../src/queue/hold.js';
-import { LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, PLAY_LOCK_KEY, PRELUDE_DIRS_KEY, WORKER_LOCK_KEY, WORKER_VERSION_KEY } from '../../src/queue/keys.js';
+import { LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, PLAY_LOCK_KEY, preludeDirsKey, WORKER_LOCK_KEY, WORKER_VERSION_KEY } from '../../src/queue/keys.js';
 import { readStatuses } from '../../src/queue/status.js';
 import type { Job, StreamJob } from '../../src/queue/jobs.js';
 import { setMute } from '../../src/services/mute-service.js';
@@ -44,7 +44,7 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     preludeFile = path.join(tempDir, 'chime.wav');
     fs.writeFileSync(preludeFile, 'RIFF');
     // --ingest が起動時に置く許可フォルダ
-    await client.sAdd(PRELUDE_DIRS_KEY, tempDir);
+    await client.sAdd(preludeDirsKey('test-ingest'), tempDir);
   });
 
   afterEach(async () => {
@@ -87,7 +87,7 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     return waitFor(async () => {
       const { entries } = await readStatuses(client, id, 0);
       const last = entries[entries.length - 1];
-      return last && !['queued', 'playing'].includes(last.status) ? { status: last.status, reason: last.reason } : undefined;
+      return last && !['queued', 'dequeued', 'playing'].includes(last.status) ? { status: last.status, reason: last.reason } : undefined;
     });
   }
 
@@ -350,7 +350,7 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     await runs[0];
     // 終わりの知らせは 1 回だけ
     const { entries } = await readStatuses(client, 'long', 0);
-    expect(entries.filter(entry => !['queued', 'playing'].includes(entry.status))).toHaveLength(1);
+    expect(entries.filter(entry => !['queued', 'dequeued', 'playing'].includes(entry.status))).toHaveLength(1);
   });
 
   test('鳴り始める前に中断されたら、鳴っている着信音も止めてから次へ進む', async () => {
@@ -417,4 +417,15 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     expect(worker.holdWaiterCount).toBeLessThanOrEqual(1);
     await clearHold(client, 'mic');
   });
+
+  test('再生 lock を失ったら、鳴らしている発話を止めて failed（play-lock-lost）で終える', async () => {
+    const backend = new FakeBackend({ voiceMs: 10_000 });
+    startWorker(backend);
+    await streamJob('stolen');
+    await waitFor(() => backend.events.some(event => event.kind === 'voice-start') ? true : undefined);
+    await client.set(PLAY_LOCK_KEY, 'someone-else', { PX: 10_000 });
+    expect(await finalStatus('stolen')).toEqual({ status: 'failed', reason: 'play-lock-lost' });
+    expect(backend.voices[0].killed).toBe(true);
+  });
 });
+

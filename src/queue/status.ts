@@ -1,6 +1,6 @@
 /**
  * 進み具合の知らせ `aivis-mcp:status:<id>`（期限 300 秒）。
- * 積む側が queued、worker が playing → done | skipped | held | muted | failed を積む。
+ * 積む側が queued、worker が dequeued（取り出した。内部用）→ playing → done | skipped | held | muted | failed を積む。
  */
 
 import type { RedisClientType } from 'redis';
@@ -8,7 +8,7 @@ import { statusKey } from './keys.js';
 
 export const STATUS_TTL_SECONDS = 300;
 
-export type JobStatus = 'queued' | 'playing' | 'done' | 'skipped' | 'held' | 'muted' | 'failed';
+export type JobStatus = 'queued' | 'dequeued' | 'playing' | 'done' | 'skipped' | 'held' | 'muted' | 'failed';
 
 export const TERMINAL_STATUSES: ReadonlySet<JobStatus> = new Set(['done', 'skipped', 'held', 'muted', 'failed']);
 
@@ -18,7 +18,7 @@ export interface StatusEntry {
   readonly at: number;
 }
 
-const STATUSES: ReadonlySet<string> = new Set(['queued', 'playing', 'done', 'skipped', 'held', 'muted', 'failed']);
+const STATUSES: ReadonlySet<string> = new Set(['queued', 'dequeued', 'playing', 'done', 'skipped', 'held', 'muted', 'failed']);
 
 export function encodeStatus(entry: StatusEntry): string {
   return JSON.stringify(entry.reason === undefined ? { s: entry.status, t: entry.at } : { s: entry.status, r: entry.reason, t: entry.at });

@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import {
-  afplayVolume, buildGainTable, finalGainDb, INITIAL_GAIN_DB, isLearnable, learnSample, legacyElevenLabsVolumeToOffset,
+  afplayVolume, buildGainTable, writeFileAtomic, finalGainDb, INITIAL_GAIN_DB, isLearnable, learnSample, legacyElevenLabsVolumeToOffset,
   loadLearnedGains, MAX_LEARNED_ENTRIES, median, pruneLearnedGains, saveLearnedGains, migrateVolumeSettings, recordMeasurement, resolveGainDb, voiceFilter, type VolumeMigrationInput,
 } from '../../src/audio/gain-table.js';
 
@@ -130,6 +130,24 @@ describe('表の大きさと鍵', () => {
       expect(resolveGainDb('toString', learned)).toBe(0);
       saveLearnedGains(learned, file);
       expect(fs.readdirSync(dir)).toEqual(['gain.json']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('writeFileAtomic', () => {
+  test('シンボリックリンクは壊さず、実体を書き換える', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-atomic-'));
+    try {
+      const real = path.join(dir, 'real.json');
+      const link = path.join(dir, 'link.json');
+      fs.writeFileSync(real, 'old');
+      fs.symlinkSync(real, link);
+      writeFileAtomic(link, 'new', 0o600);
+      expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(fs.readFileSync(real, 'utf8')).toBe('new');
+      expect(fs.readdirSync(dir).sort()).toEqual(['link.json', 'real.json']);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

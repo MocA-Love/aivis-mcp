@@ -49,6 +49,14 @@ function decodeAll(stdout: Buffer): Record<string, unknown>[] {
   });
 }
 
+/** node だけを置いた PATH（redis-server などほかのコマンドを見つけさせない）。 */
+function nodeOnlyPath(base: string): string {
+  const bin = path.join(base, 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.symlinkSync(process.execPath, path.join(bin, path.basename(process.execPath)));
+  return bin;
+}
+
 async function freePort(): Promise<number> {
   return new Promise(resolve => {
     const server = net.createServer();
@@ -67,7 +75,7 @@ describe('実プロセスの --ingest（Redis 無し）', () => {
       const result = await runIngest({
         ...process.env,
         HOME: cwd,
-        PATH: path.dirname(process.execPath),
+        PATH: nodeOnlyPath(cwd),
         REDIS_URL: `redis://127.0.0.1:${port}`,
       }, cwd, [], 30_000);
       expect(result.code).toBe(1);
@@ -103,7 +111,7 @@ describeWithRedis('実プロセスの --ingest（別ポートの redis-server）
     await client.set(WORKER_VERSION_KEY, '99.0.0', { PX: 60_000 });
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-proc-'));
     try {
-      const result = await runIngest({ ...process.env, HOME: cwd, REDIS_URL: redis.url, AIVIS_DEBUG: '1' }, cwd, [
+      const result = await runIngest({ ...process.env, HOME: cwd, PATH: nodeOnlyPath(cwd), REDIS_URL: redis.url, AIVIS_DEBUG: '1' }, cwd, [
         encodeControl({ type: 'open', id: 'p1', priority: 'high' }),
         encodeAudio('p1', mp3Frames(20)),
         encodeControl({ type: 'end', id: 'p1' }),

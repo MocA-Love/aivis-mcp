@@ -30,10 +30,8 @@ jobs:
       - name: Install redis-server
         run: sudo apt-get update && sudo apt-get install -y redis-server
 
-      - name: Build
-        run: npm run build
-
-      - name: Test
+      # npm test の pretest でビルドする（実プロセスのテストが dist/ を使う）
+      - name: Build and test
         run: npm test
 
       - name: Verify CLI

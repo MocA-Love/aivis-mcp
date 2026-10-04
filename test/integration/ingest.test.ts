@@ -6,7 +6,7 @@ import type { RedisClientType } from 'redis';
 import { IngestSession } from '../../src/ingest/ingest.js';
 import { PlaybackWorker } from '../../src/worker/playback-worker.js';
 import { encodeAudio, encodeControl, FrameDecoder } from '../../src/streaming/frame-protocol.js';
-import { audioStreamKey, HIGH_QUEUE_KEY, holdKey, NORMAL_QUEUE_KEY, PRELUDE_DIRS_KEY, statusKey, WORKER_LOCK_KEY } from '../../src/queue/keys.js';
+import { audioStreamKey, PLAY_LOCK_KEY, HIGH_QUEUE_KEY, holdKey, NORMAL_QUEUE_KEY, preludeDirsKey, statusKey, WORKER_LOCK_KEY } from '../../src/queue/keys.js';
 import { createIngestClient } from '../../src/ingest/ingest.js';
 import { setMute } from '../../src/services/mute-service.js';
 import { setHold, clearHold } from '../../src/queue/hold.js';
@@ -53,6 +53,7 @@ describeWithRedis('--ingest（別ポートの redis-server）', () => {
         }
       },
     }, { spawnWorker: false });
+    await session.publishPreludeDirs();
     session.start();
   });
 
@@ -321,8 +322,12 @@ describeWithRedis('--ingest（別ポートの redis-server）', () => {
   });
 
   test('起動時に許可フォルダを worker 向けに置く', async () => {
-    await waitFor(async () => (await client.sIsMember(PRELUDE_DIRS_KEY, tempDir)) ? true : undefined);
-    expect(await client.ttl(PRELUDE_DIRS_KEY)).toBeGreaterThan(0);
+    // --ingest ごとのキーで、起動時（名乗る前）に置く。期限は 90 秒
+    const key = preludeDirsKey(session.ingestId);
+    expect(await client.sIsMember(key, tempDir)).toBe(true);
+    const ttl = await client.ttl(key);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(90);
   });
 
   test('Redis が止まっても固まらず、open に failed（redis-error）を返して閉じられる', async () => {
@@ -351,4 +356,128 @@ describeWithRedis('--ingest（別ポートの redis-server）', () => {
       await ownClient.disconnect().catch(() => undefined);
     }
   });
+
+  function ownSession(options: { url?: string; now?: () => number; backpressureBytes?: number; client?: RedisClientType }) {
+    const ownInput = new PassThrough();
+    const ownMessages: Record<string, unknown>[] = [];
+    const decoder = new FrameDecoder();
+    const ownClient = options.client ?? createIngestClient(options.url ?? redis.url);
+    const ownSessionObject = new IngestSession(ownClient, () => testConfig(options.url ?? redis.url), [], {
+      input: ownInput,
+      write: frame => { for (const f of decoder.push(frame)) { if (f.kind === 'control') ownMessages.push(f.message); } },
+    }, { spawnWorker: false, now: options.now, backpressureBytes: options.backpressureBytes });
+    return { input: ownInput, messages: ownMessages, client: ownClient, session: ownSessionObject };
+  }
+
+  test('Redis への書き残しで止めた標準入力は、書き終わるにつれて再開する', async () => {
+    const own = ownSession({ backpressureBytes: 1024 * 1024 });
+    await own.client.connect();
+    own.session.start();
+    try {
+      own.input.write(encodeControl({ type: 'open', id: 'wb' }));
+      await waitFor(() => own.messages.some(m => m.id === 'wb' && m.status === 'queued') ? true : undefined);
+      const chunk = Buffer.alloc(700 * 1024, 1);
+      own.input.write(Buffer.concat([encodeAudio('wb', chunk), encodeAudio('wb', chunk), encodeAudio('wb', chunk)]));
+      await waitFor(() => own.session.isPaused ? true : undefined, 5000, 1);
+      await waitFor(() => !own.session.isPaused ? true : undefined);
+      own.input.write(encodeControl({ type: 'end', id: 'wb' }));
+      const total = await waitFor(async () => {
+        const entries = await client.xRange(audioStreamKey('wb'), '-', '+');
+        const ended = entries.some(entry => entry.message.e !== undefined);
+        return ended ? entries.reduce((sum, entry) => sum + (entry.message.d?.length ?? 0), 0) : undefined;
+      });
+      // 文字列として読むので長さは目安。3 枠分すべて届いている
+      expect(total).toBeGreaterThan(0);
+      expect(await client.xLen(audioStreamKey('wb'))).toBeGreaterThanOrEqual(4);
+    } finally {
+      own.input.end();
+      await own.session.closedPromise;
+      await own.client.disconnect().catch(() => undefined);
+    }
+  });
+
+  test('流れの途中で Redis が切れたら、その流れを failed（redis-error）で終える', async () => {
+    const red = await startTestRedis();
+    const own = ownSession({ url: red.url });
+    await own.client.connect();
+    own.session.start();
+    try {
+      own.input.write(encodeControl({ type: 'open', id: 'cut' }));
+      await waitFor(() => own.messages.some(m => m.id === 'cut' && m.status === 'queued') ? true : undefined);
+      await red.stop();
+      own.input.write(encodeAudio('cut', mp3Frames(30)));
+      own.input.write(encodeControl({ type: 'end', id: 'cut' }));
+      const failed = await waitFor(() => own.messages.find(m => m.id === 'cut' && m.status === 'failed'), 10_000);
+      expect(failed.reason).toBe('redis-error');
+      expect(own.messages.filter(m => m.id === 'cut' && ['done', 'failed', 'skipped'].includes(m.status as string))).toHaveLength(1);
+    } finally {
+      own.input.end();
+      await own.session.closedPromise;
+      await own.client.disconnect().catch(() => undefined);
+    }
+  });
+
+  test('worker が取り出した（dequeued）後は、再生 lock を待つ間も見失ったとみなさない', async () => {
+    await client.set(WORKER_LOCK_KEY, 'worker-a', { PX: 120_000 });
+    input.write(encodeControl({ type: 'open', id: 'dq' }));
+    await waitFor(() => statusesOf('dq').includes('queued') ? true : undefined);
+    await client.rPop(NORMAL_QUEUE_KEY);
+    await client.rPush(statusKey('dq'), JSON.stringify({ s: 'dequeued', t: Date.now() }));
+    await session.pollStatuses();
+    const now = Date.now();
+    await session.checkWorker(now);
+    await session.checkWorker(now + 120_000);
+    expect(terminalCount('dq')).toBe(0);
+    // worker が落ちた（lock が 30 秒無い）ときだけ lost。Stream は消さず期限切れに任せる
+    await client.del(WORKER_LOCK_KEY);
+    await session.checkWorker(now + 130_000);
+    await session.checkWorker(now + 160_000);
+    expect(messages.find(m => m.id === 'dq' && m.status === 'failed')).toMatchObject({ reason: 'lost' });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(await client.exists(audioStreamKey('dq'))).toBe(1);
+  });
+
+  test('再生 lock をほかが持つ間は、列から消えた件の時間を数えない', async () => {
+    await client.set(WORKER_LOCK_KEY, 'worker-a', { PX: 120_000 });
+    await client.set(PLAY_LOCK_KEY, 'old-worker', { PX: 120_000 });
+    input.write(encodeControl({ type: 'open', id: 'pl' }));
+    await waitFor(() => statusesOf('pl').includes('queued') ? true : undefined);
+    await client.rPop(NORMAL_QUEUE_KEY);
+    const now = Date.now();
+    await session.checkWorker(now);
+    await session.checkWorker(now + 60_000);
+    expect(terminalCount('pl')).toBe(0);
+    await client.del(PLAY_LOCK_KEY);
+    await session.checkWorker(now + 70_000);
+    await session.checkWorker(now + 100_000);
+    expect(messages.find(m => m.id === 'pl' && m.status === 'failed')).toMatchObject({ reason: 'lost' });
+  });
+
+  test('追跡の上限（15 分）は hold の時間を差し引く', async () => {
+    let clock = Date.now();
+    const own = ownSession({ now: () => clock });
+    await own.client.connect();
+    own.session.start();
+    try {
+      own.input.write(encodeControl({ type: 'open', id: 'hh' }));
+      await waitFor(() => own.messages.some(m => m.id === 'hh' && m.status === 'queued') ? true : undefined);
+      await client.set(WORKER_LOCK_KEY, 'worker-a', { PX: 120_000 });
+      await setHold(client, 'mic');
+      await own.session.checkWorker(clock);
+      clock += 10 * 60_000;
+      await own.session.checkWorker(clock);
+      await clearHold(client, 'mic');
+      clock += 6 * 60_000;
+      await own.session.pollStatuses();
+      expect(own.messages.some(m => m.id === 'hh' && m.status === 'failed')).toBe(false);
+      clock += 10 * 60_000;
+      await own.session.pollStatuses();
+      expect(own.messages.find(m => m.id === 'hh' && m.status === 'failed')).toMatchObject({ reason: 'untracked' });
+    } finally {
+      own.input.end();
+      await own.session.closedPromise;
+      await own.client.disconnect().catch(() => undefined);
+    }
+  });
 });
+

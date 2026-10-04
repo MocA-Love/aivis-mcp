@@ -77,9 +77,13 @@ export async function connectRedis(redisUrl: string): Promise<RedisClientType> {
 
 export function spawnWorker(config?: AppConfig): void {
   const indexPath = path.join(__dirname, '../index.js');
+  // テスト用の置き場の差し替えは、起こした worker（ほかの発話も鳴らす共有のもの）に引き継がない
+  const env: NodeJS.ProcessEnv = { ...process.env, AIVIS_WORKER_MODE: '1', ...(config ? { REDIS_URL: config.redisUrl } : {}) };
+  delete env.AIVIS_CONFIG_FILE;
+  delete env.AIVIS_GAIN_FILE;
   const child = spawn(process.execPath, [indexPath, '--worker'], {
     // `--redis-url` で指定した接続先を、起こした worker にも引き継ぐ
-    env: { ...process.env, AIVIS_WORKER_MODE: '1', ...(config ? { REDIS_URL: config.redisUrl } : {}) },
+    env,
     stdio: 'ignore',
     detached: true,
   });

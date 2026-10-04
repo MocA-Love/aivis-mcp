@@ -25,9 +25,15 @@ export const HOLD_CHANNEL = 'aivis-mcp:hold-events';
 /** 終わった hold の区間（ジョブの期限から hold の時間を除くため）。 */
 export const HOLD_LOG_KEY = 'aivis-mcp:hold-log';
 
-/** `--ingest` が起動時に受けた着信音の許可フォルダ（SET）。worker も鳴らす前にここで確かめる。 */
-export const PRELUDE_DIRS_KEY = 'aivis-mcp:prelude-dirs';
-export const PRELUDE_DIRS_TTL_SECONDS = 3600;
+/**
+ * `--ingest` が起動時に受けた着信音の許可フォルダ（SET、`--ingest` ごとに 1 つ）。worker は全部の和集合で確かめる。
+ */
+export const PRELUDE_DIRS_PREFIX = 'aivis-mcp:prelude-dirs:';
+export const PRELUDE_DIRS_TTL_SECONDS = 90;
+
+export function preludeDirsKey(ingestId: string): string {
+  return PRELUDE_DIRS_PREFIX + ingestId;
+}
 
 export function audioStreamKey(id: string): string {
   return AUDIO_STREAM_PREFIX + id;

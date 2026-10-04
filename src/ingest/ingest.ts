@@ -6,6 +6,7 @@
  */
 
 import fs from 'fs';
+import { v4 as uuidv4 } from 'uuid';
 import { createClient, type RedisClientType } from 'redis';
 import { version, type AppConfig } from '../config.js';
 import { buildGainTable, loadLearnedGains, MAX_BOOST_DB, TARGET_LUFS } from '../audio/gain-table.js';
@@ -13,12 +14,12 @@ import { validatePreludePath } from '../audio/prelude.js';
 import { MAX_UTTERANCE_MS } from '../streaming/playback-policy.js';
 import { AudioStreamWriter, MAX_STREAM_BYTES } from '../queue/audio-stream.js';
 import { enqueueJob, withdrawJob } from '../queue/enqueue.js';
-import { clearHold, isValidHoldOwner, setHold } from '../queue/hold.js';
+import { anyHoldActive, clearHold, isValidHoldOwner, setHold } from '../queue/hold.js';
 import { isValidStreamId, type Job, type JobPriority, type PreludeSpec } from '../queue/jobs.js';
 import {
-  audioStreamKey, PRELUDE_DIRS_KEY, PRELUDE_DIRS_TTL_SECONDS, queueKeyFor, statusKey, WORKER_LOCK_KEY,
+  audioStreamKey, PLAY_LOCK_KEY, preludeDirsKey, PRELUDE_DIRS_TTL_SECONDS, queueKeyFor, statusKey, WORKER_LOCK_KEY,
 } from '../queue/keys.js';
-import { pushStatus, readStatuses, STATUS_TTL_SECONDS, TERMINAL_STATUSES, type JobStatus } from '../queue/status.js';
+import { decodeStatus, pushStatus, readStatuses, STATUS_TTL_SECONDS, TERMINAL_STATUSES, type JobStatus } from '../queue/status.js';
 import { ensureWorkerRunning, tryStartRedis } from '../services/redis-service.js';
 import {
   encodeControl, FrameDecoder, FrameProtocolError, INGEST_PROTOCOL_VERSION, type Frame,
@@ -45,6 +46,8 @@ const FINISHED_MEMORY_MAX = 4096;
 const STATUS_POLL_MS = 200;
 const WORKER_CHECK_MS = 5_000;
 const CLOSE_WAIT_MS = 3_000;
+/** 背圧で止めてから進まないまま、これだけ経ったら読むのを再開する。 */
+const PAUSE_WATCHDOG_MS = 10_000;
 /** Redis が応答しないときに 1 つの操作を待つ上限。 */
 const REDIS_OP_TIMEOUT_MS = 5_000;
 
@@ -58,8 +61,13 @@ interface TrackedJob {
   statusIndex: number;
   started: boolean;
   startedAt: number | undefined;
-  /** 列に見当たらなくなった時刻（playing が来るまで） */
-  missingSince: number | undefined;
+  /** worker が取り出した（dequeued が来た） */
+  dequeued: boolean;
+  /** 列に見当たらないまま数えた時間（再生 lock をほかが持つ間は数えない） */
+  lostMs: number;
+  lastLostCheck: number | undefined;
+  /** open した時点での hold の累計（追跡の上限から hold の時間を除くため） */
+  readonly heldAtOpen: number;
 }
 
 export interface IngestIo {
@@ -71,6 +79,8 @@ export interface IngestOptions {
   readonly spawnWorker?: boolean;
   /** テスト用: 時計 */
   readonly now?: () => number;
+  /** テスト用: 背圧のバイト数の閾値 */
+  readonly backpressureBytes?: number;
 }
 
 function numberInRange(value: unknown, min: number, max: number): number | undefined {
@@ -99,6 +109,7 @@ export class IngestSession {
   private chainFrames = 0;
   private chainBytes = 0;
   private paused = false;
+  private pausedAt = 0;
   private timers: NodeJS.Timeout[] = [];
   private pollTimer: NodeJS.Timeout | undefined;
   private polling = false;
@@ -109,6 +120,11 @@ export class IngestSession {
   private resolveClosed!: () => void;
   readonly closedPromise: Promise<void>;
   private readonly now: () => number;
+  /** この --ingest の ID（許可フォルダのキーに使う） */
+  readonly ingestId = uuidv4();
+  /** hold が掛かっていた時間の累計（5 秒ごとに数える） */
+  private heldAccumMs = 0;
+  private lastHoldCheck: number | undefined;
 
   constructor(
     private readonly client: RedisClientType,
@@ -127,11 +143,19 @@ export class IngestSession {
     this.schedulePoll();
     this.timers.push(setInterval(() => { void this.touch(); }, STREAM_TOUCH_INTERVAL_MS));
     this.timers.push(setInterval(() => { void this.checkWorker(); }, WORKER_CHECK_MS));
+    // 止めたまま進まない（Redis が応答しない）ときも、親が閉じたことに気付けるよう読むのを再開する
+    this.timers.push(setInterval(() => {
+      if (this.paused && this.now() - this.pausedAt >= PAUSE_WATCHDOG_MS) {
+        this.paused = false;
+        if (!this.closing) {
+          this.io.input.resume();
+        }
+      }
+    }, 1000));
     this.io.input.on('data', (chunk: Buffer) => this.onInput(chunk));
     this.io.input.once('end', () => { void this.close(); });
     this.io.input.once('close', () => { void this.close(); });
     this.io.input.once('error', () => { void this.close(); });
-    void this.publishPreludeDirs();
     void this.ensureWorker();
   }
 
@@ -150,8 +174,11 @@ export class IngestSession {
     }
   }
 
-  /** worker が鳴らす前に確かめられるよう、許可フォルダを Redis に置く（実パスに直して）。 */
-  private async publishPreludeDirs(): Promise<void> {
+  /**
+   * worker が鳴らす前に確かめられるよう、許可フォルダを Redis に置く（実パスに直して）。
+   * `--ingest` ごとのキーで期限 90 秒、30 秒ごとに置き直す。起動時は名乗る前に置く。
+   */
+  async publishPreludeDirs(): Promise<void> {
     const dirs: string[] = [];
     for (const dir of this.preludeDirs) {
       try {
@@ -164,7 +191,8 @@ export class IngestSession {
       return;
     }
     try {
-      await withTimeout(this.client.multi().sAdd(PRELUDE_DIRS_KEY, dirs).expire(PRELUDE_DIRS_KEY, PRELUDE_DIRS_TTL_SECONDS).exec());
+      const key = preludeDirsKey(this.ingestId);
+      await withTimeout(this.client.multi().sAdd(key, dirs).expire(key, PRELUDE_DIRS_TTL_SECONDS).exec());
     } catch {
       // 次の延長で置き直す
     }
@@ -201,12 +229,20 @@ export class IngestSession {
 
   /** 処理待ちが溜まったら標準入力を止め、半分まで減ったら再開する。 */
   private updateBackpressure(): void {
-    const writerBacklog = [...this.jobs.values()].reduce((sum, job) => sum + (job.writer?.backlog ?? 0), 0);
-    const frames = this.chainFrames + writerBacklog;
-    if (!this.paused && (frames > BACKPRESSURE_FRAMES || this.chainBytes > BACKPRESSURE_BYTES)) {
+    let writerFrames = 0;
+    let writerBytes = 0;
+    for (const job of this.jobs.values()) {
+      writerFrames += job.writer?.backlog ?? 0;
+      writerBytes += job.writer?.backlogBytes ?? 0;
+    }
+    const frames = this.chainFrames + writerFrames;
+    const bytes = this.chainBytes + writerBytes;
+    const limit = this.options.backpressureBytes ?? BACKPRESSURE_BYTES;
+    if (!this.paused && (frames > BACKPRESSURE_FRAMES || bytes > limit)) {
       this.paused = true;
+      this.pausedAt = this.now();
       this.io.input.pause();
-    } else if (this.paused && frames <= BACKPRESSURE_FRAMES / 2 && this.chainBytes <= BACKPRESSURE_BYTES / 2) {
+    } else if (this.paused && frames <= BACKPRESSURE_FRAMES / 2 && bytes <= limit / 2) {
       this.paused = false;
       if (!this.closing) {
         this.io.input.resume();
@@ -346,10 +382,16 @@ export class IngestSession {
         ...(numberInRange(message.volumeDb, -60, 20) !== undefined ? { volumeDb: message.volumeDb as number } : {}),
         ...(message.tagged === true ? { tagged: true } : {}),
       };
-      writer = new AudioStreamWriter(this.client, id, MAX_STREAM_BYTES);
+      writer = new AudioStreamWriter(this.client, id, MAX_STREAM_BYTES, {
+        // Redis への書き残しが減ったら背圧を解く（止めたままにしない）
+        onProgress: () => this.updateBackpressure(),
+        // 途中の断片が抜けた流れは鳴らさない
+        onError: () => { void this.failWriter(id); },
+      });
     }
     const tracked: TrackedJob = {
-      id, kind, priority, raw: '', writer, openedAt: enqueuedAt, statusIndex: 0, started: false, startedAt: undefined, missingSince: undefined,
+      id, kind, priority, raw: '', writer, openedAt: enqueuedAt, statusIndex: 0, started: false, startedAt: undefined,
+      dequeued: false, lostMs: 0, lastLostCheck: undefined, heldAtOpen: this.heldAccumMs,
     };
     this.jobs.set(id, tracked);
     try {
@@ -402,6 +444,24 @@ export class IngestSession {
       return;
     }
     await job.writer.end();
+    if (job.writer.failed) {
+      await this.failWriter(job.id);
+    }
+  }
+
+  /**
+   * Redis への書き込みに失敗した（Redis が一瞬切れたなど）。途中が抜けた音声を鳴らさないよう、
+   * 中断の印を書いて failed（redis-error）で終える。worker は中断された流れを覚え直しにも使わない。
+   */
+  private async failWriter(id: string): Promise<void> {
+    const job = this.jobs.get(id);
+    if (!job || !job.writer) {
+      return;
+    }
+    await withTimeout(job.writer.abort('redis-error'), 2000).catch(() => undefined);
+    const withdrawn = !job.started && job.raw !== ''
+      && await withTimeout(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
+    this.finishJob(job, 'failed', 'redis-error', {}, withdrawn);
   }
 
   private async handleAbort(message: Record<string, unknown>): Promise<void> {
@@ -494,15 +554,18 @@ export class IngestSession {
         if (!job.raw || !this.jobs.has(job.id)) {
           continue;
         }
-        if (this.now() - job.openedAt > TRACK_LIMIT_MS) {
+        // hold の間は数えない
+        if (this.now() - job.openedAt - (this.heldAccumMs - job.heldAtOpen) > TRACK_LIMIT_MS) {
           this.finishJob(job, 'failed', 'untracked');
           continue;
         }
         try {
-          // 知らせのキーが期限切れで作り直されたら、頭から読み直す
-          const length = await withTimeout(this.client.lLen(statusKey(job.id)));
-          if (length < job.statusIndex) {
-            job.statusIndex = 0;
+          // 知らせのキーが期限切れで作り直されたら、頭から読み直す（先頭は必ず queued なので、そうでなければ作り直し）
+          if (job.statusIndex > 0) {
+            const first = await withTimeout(this.client.lIndex(statusKey(job.id), 0));
+            if (first === null || decodeStatus(first)?.status !== 'queued') {
+              job.statusIndex = 0;
+            }
           }
           const { entries, next } = await withTimeout(readStatuses(this.client, job.id, job.statusIndex));
           job.statusIndex = next;
@@ -511,6 +574,10 @@ export class IngestSession {
               break;
             }
             if (entry.status === 'queued') {
+              continue;
+            }
+            if (entry.status === 'dequeued') {
+              job.dequeued = true;
               continue;
             }
             if (TERMINAL_STATUSES.has(entry.status)) {
@@ -570,6 +637,16 @@ export class IngestSession {
     } catch {
       return;
     }
+    // 追跡の上限から除く hold の時間を数える
+    try {
+      const holding = await withTimeout(anyHoldActive(this.client));
+      if (holding && this.lastHoldCheck !== undefined) {
+        this.heldAccumMs += Math.max(0, now - this.lastHoldCheck);
+      }
+      this.lastHoldCheck = now;
+    } catch {
+      // 数えられなかった回は飛ばす
+    }
     if (lock) {
       this.workerMissingSince = undefined;
     } else {
@@ -583,7 +660,7 @@ export class IngestSession {
       }
       if (job.started) {
         if (workerGone || (job.startedAt !== undefined && now - job.startedAt >= PLAYING_SILENT_MS)) {
-          this.finishJob(job, 'failed', 'lost');
+          this.finishJob(job, 'failed', 'lost', {}, false);
         }
         continue;
       }
@@ -594,20 +671,36 @@ export class IngestSession {
           continue;
         }
       }
-      // 列から消えたのに playing も終わりも来ない（取り出した worker が落ちた）
+      if (job.dequeued) {
+        // worker が取り出し、再生 lock を待っている。worker が生きている間は見失ったとみなさない
+        if (workerGone) {
+          this.finishJob(job, 'failed', 'lost', {}, false);
+        }
+        continue;
+      }
+      // 列から消えたのに dequeued も playing も来ない（取り出した worker が落ちた）
       let position: number | null;
+      let playLock: string | null;
       try {
         position = await withTimeout(this.client.lPos(queueKeyFor(job.priority), job.raw));
+        playLock = await withTimeout(this.client.get(PLAY_LOCK_KEY));
       } catch {
         continue;
       }
+      const elapsed = job.lastLostCheck === undefined ? 0 : Math.max(0, now - job.lastLostCheck);
+      job.lastLostCheck = now;
       if (position !== null) {
-        job.missingSince = undefined;
+        job.lostMs = 0;
         continue;
       }
-      job.missingSince ??= now;
-      if (now - job.missingSince >= DEQUEUED_SILENT_MS) {
-        this.finishJob(job, 'failed', 'lost');
+      // 再生 lock を worker 以外（古い版の worker など）が持つ間は数えない
+      if (playLock !== null && playLock !== lock) {
+        continue;
+      }
+      job.lostMs += elapsed;
+      if (job.lostMs >= DEQUEUED_SILENT_MS) {
+        // Stream は消さず期限切れに任せる（まだ読んでいる worker がいるかもしれない）
+        this.finishJob(job, 'failed', 'lost', {}, false);
       }
     }
   }
@@ -707,6 +800,8 @@ export async function runIngest(loadConfig: () => AppConfig, preludeDirs: readon
   }
   client.on('error', error => console.error('[ingest] redis error:', error instanceof Error ? error.message : error));
   const session = new IngestSession(client, loadConfig, preludeDirs, { input: process.stdin, write });
+  // 許可フォルダは名乗る前に置く（起動直後の着信音も worker が確かめられるように）
+  await session.publishPreludeDirs();
   // 親が先に落ちて標準出力が EPIPE になった・止められたときも、hold を外し、書きかけを中断してから終わる
   process.stdout.on('error', () => { void session.close(); });
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {

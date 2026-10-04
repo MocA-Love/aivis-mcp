@@ -24,7 +24,7 @@ import {
   gainKeyFor, hasEmotionTags, heldOverlapMs, isJobExpired, parseJob, shouldPlayPrelude,
   type Job, type PreludeSpec, type SoundJob, type StreamJob, type SynthJob,
 } from '../queue/jobs.js';
-import { audioStreamKey, DEQUEUE_ORDER, HOLD_CHANNEL, PRELUDE_DIRS_KEY } from '../queue/keys.js';
+import { audioStreamKey, DEQUEUE_ORDER, HOLD_CHANNEL, PRELUDE_DIRS_PREFIX } from '../queue/keys.js';
 import { pushStatus, type JobStatus } from '../queue/status.js';
 import {
   acquirePlayLock, acquireWorkerLock, extendPlayLock, PLAY_LOCK_EXTEND_MS, refreshWorkerLock,
@@ -58,6 +58,8 @@ interface JobContext {
   /** 終わりの知らせをもう積んだか（止めたときに先に積む） */
   reported: boolean;
   cancelled: boolean;
+  /** 止めた理由（既定は worker-stopped） */
+  cancelReason?: string;
   readonly kills: Set<() => void>;
 }
 
@@ -219,10 +221,7 @@ export class PlaybackWorker {
     this.active = false;
     const current = this.current;
     if (current) {
-      current.cancelled = true;
-      for (const kill of current.kills) {
-        kill();
-      }
+      this.cancel(current, reason);
       if (current.id !== undefined && !current.reported && this.command.isOpen) {
         current.reported = true;
         await this.setStatus(current.id, 'failed', reason);
@@ -232,6 +231,18 @@ export class PlaybackWorker {
     if (this.command.isOpen) {
       await releasePlayLock(this.command, this.workerId).catch(() => undefined);
       await releaseWorkerLock(this.command, this.workerId).catch(() => undefined);
+    }
+  }
+
+  /** 今の件を止める（プレイヤー・着信音・合成を止める）。 */
+  private cancel(ctx: JobContext, reason: string): void {
+    if (ctx.cancelled) {
+      return;
+    }
+    ctx.cancelled = true;
+    ctx.cancelReason = reason;
+    for (const kill of ctx.kills) {
+      kill();
     }
   }
 
@@ -371,7 +382,13 @@ export class PlaybackWorker {
     const owner = this.workerId;
     await acquirePlayLock(this.command, owner);
     const extender = setInterval(() => {
-      void extendPlayLock(this.command, owner).catch(() => undefined);
+      void extendPlayLock(this.command, owner).then(extended => {
+        if (!extended && this.current) {
+          // 期限切れでほかに取られた。重ならないよう、この件は止めて failed で終える
+          console.error('再生の lock を失ったので、鳴らしている発話を止めます');
+          this.cancel(this.current, 'play-lock-lost');
+        }
+      }).catch(() => undefined);
     }, PLAY_LOCK_EXTEND_MS);
     try {
       return await body();
@@ -429,6 +446,8 @@ export class PlaybackWorker {
     const ctx: JobContext = { id: job.id, reported: false, cancelled: false, kills: new Set() };
     this.current = ctx;
     try {
+      // 取り出した印（--ingest は、ここから playing までの再生 lock の待ちを「見失った」に数えない）
+      await this.setStatus(job.id, 'dequeued');
       const outcome = await this.process(job, ctx);
       if (outcome === 'requeue') {
         await requeue();
@@ -501,8 +520,17 @@ export class PlaybackWorker {
 
   /** 許可フォルダ（`--ingest` が置いたもの）の中の着信音か確かめる。 */
   private async checkPrelude(prelude: PreludeSpec): Promise<{ ok: true; path: string; format: string } | { ok: false; reason: string }> {
-    const dirs = await this.command.sMembers(PRELUDE_DIRS_KEY).catch(() => [] as string[]);
-    return validatePreludePath(prelude.path, dirs);
+    const dirs = new Set<string>();
+    try {
+      for await (const key of this.command.scanIterator({ MATCH: `${PRELUDE_DIRS_PREFIX}*`, COUNT: 100 })) {
+        for (const dir of await this.command.sMembers(key)) {
+          dirs.add(dir);
+        }
+      }
+    } catch {
+      // 読めなければ許可フォルダは無いものとして扱う（鳴らさない）
+    }
+    return validatePreludePath(prelude.path, [...dirs]);
   }
 
   /** 着信音を鳴らし始める。待ちすぎ・検査で弾いた・プレイヤーが無いときは鳴らさない。 */
@@ -548,7 +576,7 @@ export class PlaybackWorker {
       case 'held': return { status: 'held' };
       case 'stale': return { status: 'skipped', reason: 'prelude-stale' };
       case 'no-player': return { status: 'failed', reason: 'no-player' };
-      case 'cancelled': return { status: 'failed', reason: 'worker-stopped' };
+      case 'cancelled': return { status: 'failed', reason: ctx.cancelReason ?? 'worker-stopped' };
       default: return { status: 'failed', reason: `prelude-${result.slice('rejected:'.length)}` };
     }
   }
@@ -803,7 +831,7 @@ export class PlaybackWorker {
       while (true) {
         if (ctx.cancelled) {
           await finishStopped();
-          return { status: 'failed', reason: 'worker-stopped' };
+          return { status: 'failed', reason: ctx.cancelReason ?? 'worker-stopped' };
         }
         if (this.held || preludeState.value === 'held') {
           await finishStopped();
@@ -871,8 +899,8 @@ export class PlaybackWorker {
             if (result === HOLD_INTERRUPTED) {
               return { status: 'held' };
             }
-            if (result === CANCELLED) {
-              return { status: 'failed', reason: 'worker-stopped' };
+            if (result === CANCELLED || ctx.cancelled) {
+              return { status: 'failed', reason: ctx.cancelReason ?? 'worker-stopped' };
             }
             return { status: 'done', reason: cutoff };
           }
@@ -911,8 +939,9 @@ export class PlaybackWorker {
           if (result === HOLD_INTERRUPTED) {
             return { status: 'held' };
           }
-          if (result === CANCELLED) {
-            return { status: 'failed', reason: 'worker-stopped' };
+          // 止めた（プレイヤーを kill した）結果として鳴り終わった場合も、止めた扱いにする
+          if (result === CANCELLED || ctx.cancelled) {
+            return { status: 'failed', reason: ctx.cancelReason ?? 'worker-stopped' };
           }
           if (result === 'timeout') {
             await finishStopped();

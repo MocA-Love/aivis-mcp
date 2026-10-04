@@ -180,7 +180,14 @@ export function afplayVolume(gainDb: number): number {
 /**
  * 一時ファイルに書いて fsync してから置き換える（書きかけや電源断で中身の無いファイルを残さない）。
  */
-export function writeFileAtomic(filePath: string, content: string, mode: number): void {
+export function writeFileAtomic(target: string, content: string, mode: number): void {
+  // シンボリックリンクなら実体へたどってから書く（リンクを普通のファイルで置き換えて壊さない）
+  let filePath = target;
+  try {
+    filePath = fs.realpathSync(target);
+  } catch {
+    // まだ無いファイルはそのまま作る
+  }
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   const fd = fs.openSync(temporary, 'w', mode);
@@ -198,6 +205,7 @@ export function writeFileAtomic(filePath: string, content: string, mode: number)
   }
 }
 
+/** 音量の表の置き場。`AIVIS_GAIN_FILE` での差し替えはテスト用（起こした worker には引き継がない）。 */
 export function gainFilePath(): string {
   return process.env.AIVIS_GAIN_FILE || path.join(os.homedir(), '.config', 'aivis-mcp', 'gain.json');
 }

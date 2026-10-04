@@ -15,6 +15,13 @@ export const MAX_STREAM_BYTES = 8 * 1024 * 1024;
 export const FLUSH_BYTES = 8 * 1024;
 export const FLUSH_INTERVAL_MS = 100;
 
+export interface AudioStreamWriterHooks {
+  /** Redis への書き込みが 1 件終わるたび（成功・失敗とも）に呼ぶ（背圧の解除に使う） */
+  readonly onProgress?: () => void;
+  /** 書き込みに失敗したら 1 回だけ呼ぶ（途中の断片が抜けた流れは鳴らさない） */
+  readonly onError?: (error: unknown) => void;
+}
+
 export class AudioStreamWriter {
   private pending: Buffer[] = [];
   private pendingBytes = 0;
@@ -25,6 +32,7 @@ export class AudioStreamWriter {
   private discarded = false;
   private failure: unknown;
   private queuedTasks = 0;
+  private queuedBytes = 0;
 
   readonly key: string;
 
@@ -32,6 +40,7 @@ export class AudioStreamWriter {
     private readonly client: RedisClientType,
     readonly id: string,
     private readonly maxBytes = MAX_STREAM_BYTES,
+    private readonly hooks: AudioStreamWriterHooks = {},
   ) {
     this.key = audioStreamKey(id);
   }
@@ -51,6 +60,16 @@ export class AudioStreamWriter {
   /** まだ Redis へ書いていない書き込みの数（背圧の目安）。 */
   get backlog(): number {
     return this.queuedTasks;
+  }
+
+  /** まだ Redis へ書いていないバイト数（溜めている断片を含む）。 */
+  get backlogBytes(): number {
+    return this.queuedBytes + this.pendingBytes;
+  }
+
+  /** 書き込みに失敗したか。 */
+  get failed(): boolean {
+    return this.failure !== undefined;
   }
 
   /** Stream を作る（列から取り出した worker が「Stream が無い」と捨てないように、積む前に呼ぶ）。 */
@@ -146,18 +165,19 @@ export class AudioStreamWriter {
     const data = Buffer.concat(this.pending, this.pendingBytes);
     this.pending = [];
     this.pendingBytes = 0;
-    void this.enqueueAdd({ d: data });
+    void this.enqueueAdd({ d: data }, data.length);
   }
 
   /** XADD と EXPIRE を 1 回（MULTI）で送る。期限の無いキーを残さない。 */
-  private enqueueAdd(message: Record<string, string | Buffer>): Promise<void> {
+  private enqueueAdd(message: Record<string, string | Buffer>, bytes = 0): Promise<void> {
     return this.enqueue(async () => {
       await this.client.multi().xAdd(this.key, '*', message).expire(this.key, STREAM_TTL_SECONDS).exec();
-    });
+    }, bytes);
   }
 
-  private enqueue(task: () => Promise<void>): Promise<void> {
+  private enqueue(task: () => Promise<void>, bytes = 0): Promise<void> {
     this.queuedTasks++;
+    this.queuedBytes += bytes;
     this.chain = this.chain.then(async () => {
       try {
         if (!this.discarded) {
@@ -165,9 +185,16 @@ export class AudioStreamWriter {
         }
       } finally {
         this.queuedTasks--;
+        this.queuedBytes -= bytes;
       }
     }).catch(error => {
+      const first = this.failure === undefined;
       this.failure = error;
+      if (first) {
+        this.hooks.onError?.(error);
+      }
+    }).finally(() => {
+      this.hooks.onProgress?.();
     });
     return this.chain;
   }
