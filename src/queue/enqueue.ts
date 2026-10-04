@@ -4,7 +4,7 @@
 
 import type { RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
-import { LEGACY_QUEUE_KEY, queueKeyFor } from './keys.js';
+import { HIGH_QUEUE_KEY, LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, queueKeyFor } from './keys.js';
 import type { Job, JobPriority, SynthJob } from './jobs.js';
 import { pushStatus } from './status.js';
 
@@ -20,6 +20,30 @@ export async function enqueueJob(client: RedisClientType, job: Job): Promise<str
 export async function withdrawJob(client: RedisClientType, priority: JobPriority, raw: string): Promise<boolean> {
   const removed = await client.lRem(queueKeyFor(priority), 1, raw);
   return removed === 1;
+}
+
+/**
+ * ID でジョブを探して列（q2:high・q2:normal）から外す。積んだのが別の `--ingest`（落ちた前の子など）でも外せる。
+ * 列を読んで ID が一致する要素だけを、その文字列そのままで LREM するので、ほかのジョブを巻き込まない。
+ * worker が同時に取り出していれば LREM は 0 になり、外せなかった（false）とする。
+ */
+export async function withdrawJobById(client: RedisClientType, id: string): Promise<boolean> {
+  for (const key of [HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY]) {
+    const items = await client.lRange(key, 0, -1);
+    for (const raw of items) {
+      let jobId: unknown;
+      try {
+        const parsed = JSON.parse(raw) as { v?: unknown; id?: unknown };
+        jobId = parsed.v === 2 ? parsed.id : undefined;
+      } catch {
+        continue;
+      }
+      if (jobId === id && await client.lRem(key, 1, raw) === 1) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** この機械のエージェントの発話（worker が合成しながら鳴らす）を積む。 */

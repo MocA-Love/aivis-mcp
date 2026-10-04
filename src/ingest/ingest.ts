@@ -13,7 +13,7 @@ import { buildGainTable, loadLearnedGains, MAX_BOOST_DB, TARGET_LUFS } from '../
 import { validatePreludePath } from '../audio/prelude.js';
 import { MAX_UTTERANCE_MS } from '../streaming/playback-policy.js';
 import { AudioStreamWriter, MAX_STREAM_BYTES } from '../queue/audio-stream.js';
-import { enqueueJob, withdrawJob } from '../queue/enqueue.js';
+import { enqueueJob, withdrawJob, withdrawJobById } from '../queue/enqueue.js';
 import { anyHoldActive, clearHold, isValidHoldOwner, setHold } from '../queue/hold.js';
 import { isValidStreamId, type Job, type JobPriority, type PreludeSpec } from '../queue/jobs.js';
 import {
@@ -516,22 +516,34 @@ export class IngestSession {
     });
   }
 
+  /**
+   * まだ worker が取り出していないジョブを列から外す。前の `--ingest`（落ちた子）が積んだジョブも、
+   * ID で列を探して外す。外せたら Stream と知らせを消す。取り出し済み（dequeued・playing がある）なら外さない。
+   */
   private async handleWithdraw(message: Record<string, unknown>): Promise<void> {
-    const job = typeof message.id === 'string' ? this.jobs.get(message.id) : undefined;
-    if (!job || !job.raw) {
-      this.send({ type: 'withdrawn', id: message.id ?? null, removed: false });
+    const id = message.id;
+    if (!isValidStreamId(id)) {
+      this.send({ type: 'withdrawn', id: typeof id === 'string' ? id.slice(0, 64) : null, removed: false });
       return;
     }
-    const removed = !job.started && await withTimeout(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
-    if (removed) {
-      await job.writer?.abort('withdrawn').catch(() => undefined);
-      this.jobs.delete(job.id);
-      this.rememberFinished(job.id);
-      job.writer?.discard();
-      await pushStatus(this.client, job.id, 'skipped', 'withdrawn').catch(() => undefined);
-      await this.client.del(audioStreamKey(job.id)).catch(() => undefined);
+    const job = this.jobs.get(id);
+    if (job?.started || job?.dequeued) {
+      this.send({ type: 'withdrawn', id, removed: false });
+      return;
     }
-    this.send({ type: 'withdrawn', id: job.id, removed });
+    // LREM が 1 のときだけ外せた。worker が同時に BRPOP していれば 0 で、その件は worker が鳴らす
+    const removed = await withTimeout(withdrawJobById(this.client, id)).catch(() => false);
+    if (removed) {
+      if (job) {
+        this.jobs.delete(id);
+        job.writer?.discard();
+        // 送りかけていた断片がキーを作り直さないよう、書き終わってから消す
+        await withTimeout(job.writer?.settled() ?? Promise.resolve(), 2000).catch(() => undefined);
+      }
+      this.rememberFinished(id);
+      await this.client.del([audioStreamKey(id), statusKey(id)]).catch(() => undefined);
+    }
+    this.send({ type: 'withdrawn', id, removed });
   }
 
   private schedulePoll(): void {

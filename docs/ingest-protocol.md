@@ -120,7 +120,11 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 { "type": "withdraw", "id": "…" }
 ```
 
-まだ worker が取り出していないジョブを列から外します（LREM）。返事は `{"type":"withdrawn","id":…,"removed":true|false}`。`removed` が `true` のときだけ、親はその件を自分で鳴らしてかまいません。
+まだ worker が取り出していないジョブを列から外します。返事は `{"type":"withdrawn","id":…,"removed":true|false}`。`removed` が `true` のときだけ、親はその件を自分で鳴らしてかまいません。
+
+- この子が積んだジョブだけでなく、前の `--ingest`（落ちて起動し直す前の子）が積んだジョブも、`aivis-mcp:q2:high` と `aivis-mcp:q2:normal` を読んで ID が一致する要素を探し、その要素だけを LREM します。ほかのジョブは巻き込みません
+- 外せたら、その件の Stream（`aivis-mcp:audio:<id>`）と知らせ（`aivis-mcp:status:<id>`）を消し、以後その件の `status` は返しません
+- worker がもう取り出していた（`dequeued` か `playing` を受け取っていた）件、列に見当たらない件は `removed: false` です。worker が同時に取り出したときは LREM が 0 になるので `removed: false` で、その件は worker が鳴らします（二重にはなりません）
 
 ### `ping`
 

@@ -479,5 +479,40 @@ describeWithRedis('--ingest（別ポートの redis-server）', () => {
       await own.client.disconnect().catch(() => undefined);
     }
   });
+
+  test('別の --ingest（落ちた前の子）が積んだジョブも withdraw で外せる。取り出し済みなら外さない', async () => {
+    const previous = ownSession({});
+    await previous.client.connect();
+    previous.session.start();
+    previous.input.write(encodeControl({ type: 'open', id: 'prev1' }));
+    previous.input.write(encodeAudio('prev1', mp3Frames(5)));
+    previous.input.write(encodeControl({ type: 'open', id: 'prev2' }));
+    previous.input.write(encodeControl({ type: 'open', id: 'other' }));
+    await waitFor(() => ['prev1', 'prev2', 'other'].every(id => previous.messages.some(m => m.id === id && m.status === 'queued')) ? true : undefined);
+    // 前の子が落ちた（流れは中断せずに消えたことにする）
+    previous.input.pause();
+    // prev2 は worker が取り出した後
+    const raw = (await client.lRange(NORMAL_QUEUE_KEY, 0, -1)).find(item => JSON.parse(item).id === 'prev2')!;
+    await client.lRem(NORMAL_QUEUE_KEY, 1, raw);
+    await client.rPush(statusKey('prev2'), JSON.stringify({ s: 'dequeued', t: Date.now() }));
+
+    input.write(encodeControl({ type: 'withdraw', id: 'prev1' }));
+    input.write(encodeControl({ type: 'withdraw', id: 'prev2' }));
+    input.write(encodeControl({ type: 'withdraw', id: 'prev1' }));
+    await waitFor(() => messages.filter(m => m.type === 'withdrawn').length === 3 ? true : undefined);
+    expect(messages.filter(m => m.type === 'withdrawn')).toEqual([
+      { type: 'withdrawn', id: 'prev1', removed: true },
+      { type: 'withdrawn', id: 'prev2', removed: false },
+      { type: 'withdrawn', id: 'prev1', removed: false },
+    ]);
+    // ほかのジョブは巻き込まない。外した件の Stream と知らせは消える
+    expect((await client.lRange(NORMAL_QUEUE_KEY, 0, -1)).map(item => JSON.parse(item).id)).toEqual(['other']);
+    expect(await client.exists(audioStreamKey('prev1'))).toBe(0);
+    expect(await client.exists(statusKey('prev1'))).toBe(0);
+    previous.input.resume();
+    previous.input.end();
+    await previous.session.closedPromise;
+    await previous.client.disconnect().catch(() => undefined);
+  });
 });
 
