@@ -42,6 +42,9 @@ function printHelp(): void {
   console.log('  aivis --version                   バージョン表示');
   console.log('');
   console.log('Options:');
+  console.log('  --provider <aivis|elevenlabs>     今回だけ使う音声合成サービス');
+  console.log('  --voice-id <id>                   ElevenLabs の voice_id');
+  console.log('  --eleven-model <id>               ElevenLabs の model_id');
   console.log('  -m, --model <uuid>                モデルUUID');
   console.log('  -r, --rate <value>                話速');
   console.log('  -p, --pitch <value>               ピッチ');

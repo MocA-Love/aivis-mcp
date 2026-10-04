@@ -13,6 +13,7 @@
 
 音声で報告する際は、aivis MCPの`aivis-speech`を使用すること。
 `text`パラメーターにSSML（Speech Synthesis Markup Language）タグを活用すると、より豊かな音声表現が可能です。
+ただし、`tts-get-settings` の `provider` が `elevenlabs` のときは SSML タグを使わないこと（自動で取り除かれ、効果がない）。間は句読点や「…」で表現する。
 
 ### 基本ルール
 

@@ -6,11 +6,28 @@ import * as readline from 'node:readline';
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'aivis-mcp');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 
+export type TtsProvider = 'aivis' | 'elevenlabs';
+
+export const TTS_PROVIDERS: readonly TtsProvider[] = ['aivis', 'elevenlabs'];
+
+export function isTtsProvider(value: unknown): value is TtsProvider {
+  return typeof value === 'string' && (TTS_PROVIDERS as readonly string[]).includes(value);
+}
+
+export interface ElevenLabsSettings {
+  apiKey?: string;
+  voiceId?: string;
+  modelId?: string;
+  volumeDb?: number;
+}
+
 export interface UserSettings {
+  provider?: TtsProvider;
   apiKey?: string;
   apiUrl?: string;
   modelUuid?: string;
   redisUrl?: string;
+  elevenlabs?: ElevenLabsSettings;
 }
 
 export function loadSettings(): UserSettings {
@@ -24,7 +41,30 @@ export function loadSettings(): UserSettings {
 
 export function saveSettings(settings: UserSettings): void {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
+  // APIキーを含むので本人以外から読めないようにする。既存ファイルはmodeが効かないためchmodも行う。
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(settings, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
+  fs.chmodSync(CONFIG_FILE, 0o600);
+}
+
+/**
+ * 既存の設定に部分的な変更を重ねて保存する。undefinedのキーは変更しない。
+ */
+export function updateSettings(patch: Omit<UserSettings, 'elevenlabs'> & { elevenlabs?: ElevenLabsSettings }): UserSettings {
+  const current = loadSettings();
+  const next: UserSettings = { ...current };
+  for (const [key, value] of Object.entries(patch)) {
+    if (key === 'elevenlabs' || value === undefined) continue;
+    (next as Record<string, unknown>)[key] = value;
+  }
+  if (patch.elevenlabs) {
+    const elevenlabs: ElevenLabsSettings = { ...current.elevenlabs };
+    for (const [key, value] of Object.entries(patch.elevenlabs)) {
+      if (value !== undefined) (elevenlabs as Record<string, unknown>)[key] = value;
+    }
+    next.elevenlabs = elevenlabs;
+  }
+  saveSettings(next);
+  return next;
 }
 
 export function getConfigPath(): string {
@@ -53,21 +93,53 @@ export async function runInit(): Promise<void> {
   try {
     const current = loadSettings();
 
-    const apiKey = await ask(
-      rl,
-      'AIVIS_API_KEY (https://hub.aivis-project.com/cloud-api/api-keys)',
-      current.apiKey
-    );
+    let provider = await ask(rl, '使用する音声合成サービス (aivis / elevenlabs)', current.provider ?? 'aivis');
+    while (!isTtsProvider(provider)) {
+      provider = await ask(rl, 'aivis か elevenlabs を入力してください', current.provider ?? 'aivis');
+    }
 
-    const modelUuid = await ask(
-      rl,
-      'モデルUUID (空欄でスキップ)',
-      current.modelUuid
-    );
+    const settings: UserSettings = { ...current, provider };
 
-    const settings: UserSettings = {};
-    if (apiKey) settings.apiKey = apiKey;
-    if (modelUuid) settings.modelUuid = modelUuid;
+    if (provider === 'aivis') {
+      const apiKey = await ask(
+        rl,
+        'AIVIS_API_KEY (https://hub.aivis-project.com/cloud-api/api-keys)',
+        current.apiKey
+      );
+
+      const modelUuid = await ask(
+        rl,
+        'モデルUUID (空欄でスキップ)',
+        current.modelUuid
+      );
+
+      if (apiKey) settings.apiKey = apiKey;
+      if (modelUuid) settings.modelUuid = modelUuid;
+    } else {
+      const apiKey = await ask(
+        rl,
+        'ELEVENLABS_API_KEY (https://elevenlabs.io/app/settings/api-keys)',
+        current.elevenlabs?.apiKey
+      );
+
+      const voiceId = await ask(
+        rl,
+        'Voice ID (空欄でスキップ)',
+        current.elevenlabs?.voiceId
+      );
+
+      const modelId = await ask(
+        rl,
+        'Model ID (空欄でスキップ)',
+        current.elevenlabs?.modelId
+      );
+
+      const elevenlabs: ElevenLabsSettings = { ...current.elevenlabs };
+      if (apiKey) elevenlabs.apiKey = apiKey;
+      if (voiceId) elevenlabs.voiceId = voiceId;
+      if (modelId) elevenlabs.modelId = modelId;
+      settings.elevenlabs = elevenlabs;
+    }
 
     saveSettings(settings);
     console.log('');

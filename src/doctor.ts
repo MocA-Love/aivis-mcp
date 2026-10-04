@@ -153,17 +153,32 @@ export async function runDoctor(config: AppConfig): Promise<void> {
   }
   console.log('');
 
-  // [2/4] AIVIS_API_KEY
-  console.log(`[2/${totalChecks}] AIVIS_API_KEY`);
-  if (config.apiKey) {
-    console.log(`  OK  設定済み`);
-    okCount++;
+  // [2/4] APIキー（使用中のサービスのもの）
+  if (config.provider === 'elevenlabs') {
+    console.log(`[2/${totalChecks}] ELEVENLABS_API_KEY / voice_id`);
+    if (config.elevenLabsApiKey && config.elevenLabsVoiceId) {
+      console.log(`  OK  設定済み (voice_id: ${config.elevenLabsVoiceId}, model_id: ${config.elevenLabsModelId})`);
+      okCount++;
+    } else {
+      if (!config.elevenLabsApiKey) console.log('  NG  APIキーが未設定');
+      if (!config.elevenLabsVoiceId) console.log('  NG  voice_id が未設定');
+      console.log('      npx aivis-mcp --init で設定するか、MCP経由で LLM に設定を依頼してください');
+      console.log('      環境変数 ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID でも指定できます');
+      console.log('      APIキーの取得: https://elevenlabs.io/app/settings/api-keys');
+      console.log(`      設定ファイル: ${getConfigPath()}`);
+    }
   } else {
-    console.log('  NG  未設定');
-    console.log('      npx aivis-mcp --init で設定するか、');
-    console.log('      環境変数 AIVIS_API_KEY または --api-key で指定してください');
-    console.log('      APIキーの取得: https://hub.aivis-project.com/cloud-api/api-keys');
-    console.log(`      設定ファイル: ${getConfigPath()}`);
+    console.log(`[2/${totalChecks}] AIVIS_API_KEY`);
+    if (config.apiKey) {
+      console.log(`  OK  設定済み`);
+      okCount++;
+    } else {
+      console.log('  NG  未設定');
+      console.log('      npx aivis-mcp --init で設定するか、');
+      console.log('      環境変数 AIVIS_API_KEY または --api-key で指定してください');
+      console.log('      APIキーの取得: https://hub.aivis-project.com/cloud-api/api-keys');
+      console.log(`      設定ファイル: ${getConfigPath()}`);
+    }
   }
   console.log('');
 
