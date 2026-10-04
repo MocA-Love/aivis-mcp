@@ -9,18 +9,16 @@ import { PlaybackWorker } from '../../src/worker/playback-worker.js';
 import { AudioStreamWriter } from '../../src/queue/audio-stream.js';
 import { enqueueJob, enqueueLegacy, enqueueSynthesis } from '../../src/queue/enqueue.js';
 import { clearHold, setHold } from '../../src/queue/hold.js';
-import { LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, WORKER_LOCK_KEY, WORKER_VERSION_KEY } from '../../src/queue/keys.js';
+import { LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, PLAY_LOCK_KEY, PRELUDE_DIRS_KEY, WORKER_LOCK_KEY, WORKER_VERSION_KEY } from '../../src/queue/keys.js';
 import { readStatuses } from '../../src/queue/status.js';
 import type { Job, StreamJob } from '../../src/queue/jobs.js';
 import { setMute } from '../../src/services/mute-service.js';
 import { loadLearnedGains } from '../../src/audio/gain-table.js';
-import { connect, hasRedisServer, startTestRedis, waitFor, type TestRedis } from '../helpers/redis.js';
+import { connect, describeWithRedis, startTestRedis, waitFor, type TestRedis } from '../helpers/redis.js';
 import { FakeBackend } from '../helpers/fake-backend.js';
 import { mp3Frames, testConfig } from '../helpers/fixtures.js';
 
-const describeRedis = hasRedisServer ? describe : describe.skip;
-
-describeRedis('worker（別ポートの redis-server）', () => {
+describeWithRedis('worker（別ポートの redis-server）', () => {
   let redis: TestRedis;
   let client: RedisClientType;
   let tempDir: string;
@@ -41,10 +39,12 @@ describeRedis('worker（別ポートの redis-server）', () => {
 
   beforeEach(async () => {
     await client.flushAll();
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-worker-'));
+    tempDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-worker-')));
     gainFile = path.join(tempDir, 'gain.json');
     preludeFile = path.join(tempDir, 'chime.wav');
     fs.writeFileSync(preludeFile, 'RIFF');
+    // --ingest が起動時に置く許可フォルダ
+    await client.sAdd(PRELUDE_DIRS_KEY, tempDir);
   });
 
   afterEach(async () => {
@@ -220,7 +220,7 @@ describeRedis('worker（別ポートの redis-server）', () => {
     expect(await finalStatus(job.id)).toEqual({ status: 'done' });
     expect(backend.voices[0].bytes.length).toBe(417 * 70);
     await worker.flushMeasurements();
-    expect(loadLearnedGains(gainFile)).toEqual({ 'aivis:model-b:default': { db: 5, samples: [5] } });
+    expect({ ...loadLearnedGains(gainFile) }).toEqual({ 'aivis:model-b:default': { db: 5, samples: [5], updatedAt: expect.any(Number) } });
     // 鳴らし終えた Stream は消す
     expect(await client.exists(`aivis-mcp:audio:${job.id}`)).toBe(0);
   });
@@ -235,7 +235,7 @@ describeRedis('worker（別ポートの redis-server）', () => {
     // ElevenLabs のキーが無い設定なので失敗するが、覚え直しもしない
     expect((await finalStatus(job.id)).status).toBe('failed');
     await worker.flushMeasurements();
-    expect(loadLearnedGains(gainFile)).toEqual({});
+    expect({ ...loadLearnedGains(gainFile) }).toEqual({});
   });
 
   test('鳴り始める前の中断は捨てる', async () => {
@@ -331,5 +331,90 @@ describeRedis('worker（別ポートの redis-server）', () => {
       expect(bodies).toHaveLength(0);
       expect(backend.voices).toHaveLength(1);
     });
+  });
+
+  test('止められたら今の件に failed（worker-stopped）を積み、プレイヤーを止め、再生 lock を手放す', async () => {
+    const backend = new FakeBackend({ voiceMs: 10_000 });
+    const worker = startWorker(backend);
+    await streamJob('long');
+    await waitFor(() => backend.events.some(event => event.kind === 'voice-start') ? true : undefined);
+    // 鳴らしている間の再生 lock は短い期限で延長し続ける
+    const ttl = await client.pTTL(PLAY_LOCK_KEY);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(10_000);
+    await worker.shutdown();
+    expect(await finalStatus('long')).toEqual({ status: 'failed', reason: 'worker-stopped' });
+    expect(backend.voices[0].killed).toBe(true);
+    expect(await client.exists(PLAY_LOCK_KEY)).toBe(0);
+    expect(await client.exists(WORKER_LOCK_KEY)).toBe(0);
+    await runs[0];
+    // 終わりの知らせは 1 回だけ
+    const { entries } = await readStatuses(client, 'long', 0);
+    expect(entries.filter(entry => !['queued', 'playing'].includes(entry.status))).toHaveLength(1);
+  });
+
+  test('鳴り始める前に中断されたら、鳴っている着信音も止めてから次へ進む', async () => {
+    const backend = new FakeBackend({ preludeMs: 5000 });
+    startWorker(backend);
+    const writer = new AudioStreamWriter(client, 'abort-prelude');
+    await writer.open();
+    await writer.settled();
+    await enqueueJob(client, { v: 2, type: 'stream', id: 'abort-prelude', priority: 'normal', source: 'ingest', enqueuedAt: Date.now(), prelude: { path: preludeFile, volume: 1 } });
+    await waitFor(() => backend.preludes.length === 1 ? true : undefined);
+    await streamJob('next');
+    await writer.abort('cancelled');
+    expect(await finalStatus('abort-prelude')).toEqual({ status: 'skipped', reason: 'cancelled' });
+    expect(backend.preludeKills).toBe(1);
+    expect(await finalStatus('next')).toEqual({ status: 'done' });
+    // 次の声は、止めた着信音の後に始まる（重ならない）
+    const kinds = backend.events.map(event => event.kind);
+    expect(kinds).toEqual(['prelude', 'voice-start', 'voice-end']);
+  });
+
+  test('2.5 の列を先に読み、古い列（2.4 の RPUSH が混ざっても）も鳴らす', async () => {
+    await client.rPush(LEGACY_QUEUE_KEY, JSON.stringify({ _audioBase64: mp3Frames(2, 1).toString('base64') }));
+    await enqueueLegacy(client, { _audioBase64: mp3Frames(2, 2).toString('base64') });
+    await streamJob('q2', { volumeDb: -5 });
+    const backend = new FakeBackend();
+    startWorker(backend);
+    await waitFor(() => backend.voices.length === 3 ? true : undefined);
+    expect(backend.voices[0].gainDb).toBe(-5);
+    expect(backend.voices.slice(1).map(voice => voice.bytes[10]).sort()).toEqual([1, 2]);
+  });
+
+  test('古い --play-audio の音声にも音量の表と上乗せを当てる', async () => {
+    await enqueueLegacy(client, { _audioBase64: mp3Frames(2).toString('base64'), gainKey: 'aivis:a670e6b8-0852-45b2-8704-1bc9862f2fe6:default' });
+    await enqueueLegacy(client, { _audioBase64: mp3Frames(2).toString('base64') });
+    const backend = new FakeBackend();
+    startWorker(backend);
+    await waitFor(() => backend.voices.length === 2 ? true : undefined);
+    expect(backend.voices.map(voice => voice.gainDb)).toEqual([4.1, 0]);
+  });
+
+  test('sound の理由: 許可フォルダの外・プレイヤーが無い', async () => {
+    const outside = path.join(os.tmpdir(), `aivis-outside-${process.pid}.wav`);
+    fs.writeFileSync(outside, 'RIFF');
+    try {
+      await enqueueJob(client, { v: 2, type: 'sound', id: 'outside', priority: 'normal', source: 'ingest', enqueuedAt: Date.now(), prelude: { path: outside, volume: 1 } });
+      startWorker(new FakeBackend());
+      expect(await finalStatus('outside')).toEqual({ status: 'failed', reason: 'prelude-outside-allowed-dirs' });
+    } finally {
+      fs.rmSync(outside, { force: true });
+    }
+  });
+
+  test('sound の理由: プレイヤーが無い', async () => {
+    await enqueueJob(client, { v: 2, type: 'sound', id: 'noplayer', priority: 'normal', source: 'ingest', enqueuedAt: Date.now(), prelude: { path: preludeFile, volume: 1 } });
+    startWorker(new FakeBackend({ kind: 'none' }));
+    expect(await finalStatus('noplayer')).toEqual({ status: 'failed', reason: 'no-player' });
+  });
+
+  test('hold の待ち手はタイムアウトで外れ、溜まらない', async () => {
+    await setHold(client, 'mic');
+    const worker = startWorker(new FakeBackend());
+    await waitFor(() => worker.isHeld ? true : undefined);
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    expect(worker.holdWaiterCount).toBeLessThanOrEqual(1);
+    await clearHold(client, 'mic');
   });
 });

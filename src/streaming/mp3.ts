@@ -16,6 +16,10 @@ export interface Mp3FrameInfo {
   readonly layer: 1 | 2 | 3;
   /** ヘッダーを含むフレームのバイト数 */
   readonly frameLength: number;
+  /** 1 フレームのサンプル数 */
+  readonly samplesPerFrame: number;
+  /** 単声（チャンネルモード 3）か */
+  readonly mono: boolean;
 }
 
 const BITRATES_V1: Record<number, readonly number[]> = {
@@ -47,6 +51,7 @@ export function parseFrameHeader(bytes: Uint8Array, offset: number): Mp3FrameInf
   const b1 = bytes[offset];
   const b2 = bytes[offset + 1];
   const b3 = bytes[offset + 2];
+  const b4 = bytes[offset + 3];
   if (b1 !== 0xff || (b2 & 0xe0) !== 0xe0) {
     return undefined;
   }
@@ -74,7 +79,8 @@ export function parseFrameHeader(bytes: Uint8Array, offset: number): Mp3FrameInf
   if (frameLength < 4) {
     return undefined;
   }
-  return { offset, bitrateKbps, sampleRate, version, layer, frameLength };
+  const samplesPerFrame = layer === 1 ? 384 : layer === 2 ? 1152 : version === 1 ? 1152 : 576;
+  return { offset, bitrateKbps, sampleRate, version, layer, frameLength, samplesPerFrame, mono: ((b4 >> 6) & 0x03) === 3 };
 }
 
 /** 先頭の ID3v2 タグの長さ（無ければ 0、まだ読み切れていなければ undefined）。 */
@@ -134,4 +140,76 @@ export function durationForBytes(bitrateKbps: number, bytes: number): number {
     return 0;
   }
   return (bytes * 8) / (bitrateKbps * 1000);
+}
+
+function readUInt32BE(bytes: Uint8Array, offset: number): number | undefined {
+  if (offset + 4 > bytes.length) {
+    return undefined;
+  }
+  return ((bytes[offset] << 24) >>> 0) + (bytes[offset + 1] << 16) + (bytes[offset + 2] << 8) + bytes[offset + 3];
+}
+
+function asciiAt(bytes: Uint8Array, offset: number, text: string): boolean {
+  if (offset + text.length > bytes.length) {
+    return false;
+  }
+  for (let i = 0; i < text.length; i++) {
+    if (bytes[offset + i] !== text.charCodeAt(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** 最初のフレームの Xing / Info / VBRI ヘッダーにあるフレーム数（無ければ undefined）。 */
+export function vbrFrameCount(bytes: Uint8Array, first: Mp3FrameInfo): number | undefined {
+  const sideInfo = first.version === 1 ? (first.mono ? 17 : 32) : (first.mono ? 9 : 17);
+  const xing = first.offset + 4 + sideInfo;
+  if (asciiAt(bytes, xing, 'Xing') || asciiAt(bytes, xing, 'Info')) {
+    const flags = readUInt32BE(bytes, xing + 4);
+    if (flags !== undefined && (flags & 0x01) !== 0) {
+      return readUInt32BE(bytes, xing + 8);
+    }
+    return undefined;
+  }
+  const vbri = first.offset + 4 + 32;
+  if (asciiAt(bytes, vbri, 'VBRI')) {
+    return readUInt32BE(bytes, vbri + 14);
+  }
+  return undefined;
+}
+
+/**
+ * MP3 全体の長さ（秒）。Xing / VBRI ヘッダーがあればそのフレーム数から、無ければ届いた全フレームを
+ * たどって合計する（可変ビットレートでも最初のフレームのビットレートで見積もらない）。
+ */
+export function estimateMp3Duration(bytes: Uint8Array): number | undefined {
+  const first = findFirstFrame(bytes);
+  if (first === undefined) {
+    return undefined;
+  }
+  const frames = vbrFrameCount(bytes, first);
+  if (frames !== undefined && frames > 0) {
+    return (frames * first.samplesPerFrame) / first.sampleRate;
+  }
+  let seconds = 0;
+  let offset = first.offset;
+  let skipped = 0;
+  while (offset + 4 <= bytes.length) {
+    const header = parseFrameHeader(bytes, offset);
+    if (header === undefined || offset + header.frameLength > bytes.length) {
+      if (header !== undefined) {
+        break; // 最後の途中までのフレーム
+      }
+      // 同期が外れたら 1 バイトずつ探し直す（壊れた入力で回り続けないよう上限を置く）
+      offset++;
+      if (++skipped > 64 * 1024) {
+        break;
+      }
+      continue;
+    }
+    seconds += header.samplesPerFrame / header.sampleRate;
+    offset += header.frameLength;
+  }
+  return seconds;
 }

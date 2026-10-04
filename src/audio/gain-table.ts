@@ -20,6 +20,8 @@ export const MIN_FINAL_DB = -60;
 export const LEARN_WINDOW = 5;
 /** これより短い発話は覚え直しに使わない。 */
 export const MIN_LEARN_SECONDS = 1.5;
+/** 表に覚える組の上限。超えたら更新の古いものから消す。 */
+export const MAX_LEARNED_ENTRIES = 200;
 /** 頭打ち（-1dBTP 相当）。 */
 export const LIMITER_FILTER = 'alimiter=limit=0.89';
 
@@ -53,6 +55,8 @@ export interface LearnedGain {
   readonly db: number;
   /** 直近の測定から出した値（新しいものが後ろ） */
   readonly samples: readonly number[];
+  /** 最後に覚え直した時刻（epoch ms）。上限を超えたときに古いものから消すのに使う */
+  readonly updatedAt?: number;
 }
 
 export interface GainFile {
@@ -89,7 +93,8 @@ function splitKey(key: string): { provider: string; voice: string; model: string
 
 /** 学習済みの値と最初の値を合わせた表。 */
 export function buildGainTable(learned: Readonly<Record<string, LearnedGain>>): Record<string, number> {
-  const table: Record<string, number> = { ...INITIAL_GAIN_DB };
+  // `__proto__` のような鍵で Object の性質を書き換えないよう、原型の無いオブジェクトに入れる
+  const table: Record<string, number> = Object.assign(Object.create(null) as Record<string, number>, INITIAL_GAIN_DB);
   for (const [key, entry] of Object.entries(learned)) {
     table[key] = entry.db;
   }
@@ -124,10 +129,20 @@ export function resolveGainDb(key: string | undefined, learned: Readonly<Record<
 }
 
 /** 測った大きさ（LUFS）を 1 回分の補正値として足し、直近 5 回の中央値を表の値にする。 */
-export function learnSample(previous: LearnedGain | undefined, measuredLufs: number): LearnedGain {
+export function learnSample(previous: LearnedGain | undefined, measuredLufs: number, now = Date.now()): LearnedGain {
   const sample = round1(clampTableDb(TARGET_LUFS - measuredLufs));
   const samples = [...(previous?.samples ?? []), sample].slice(-LEARN_WINDOW);
-  return { db: round1(median(samples)), samples };
+  return { db: round1(median(samples)), samples, updatedAt: now };
+}
+
+/** 上限を超えた分を、更新の古いものから消す。 */
+export function pruneLearnedGains(entries: Readonly<Record<string, LearnedGain>>, limit = MAX_LEARNED_ENTRIES): Record<string, LearnedGain> {
+  const sorted = Object.entries(entries).sort((a, b) => (b[1].updatedAt ?? 0) - (a[1].updatedAt ?? 0)).slice(0, limit);
+  const result: Record<string, LearnedGain> = Object.create(null);
+  for (const [key, entry] of sorted) {
+    result[key] = entry;
+  }
+  return result;
 }
 
 /** 覚え直しに使ってよい発話か。 */
@@ -162,6 +177,27 @@ export function afplayVolume(gainDb: number): number {
   return Math.min(1, Math.pow(10, gainDb / 20));
 }
 
+/**
+ * 一時ファイルに書いて fsync してから置き換える（書きかけや電源断で中身の無いファイルを残さない）。
+ */
+export function writeFileAtomic(filePath: string, content: string, mode: number): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  const fd = fs.openSync(temporary, 'w', mode);
+  try {
+    fs.writeSync(fd, content, null, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    fs.renameSync(temporary, filePath);
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    throw error;
+  }
+}
+
 export function gainFilePath(): string {
   return process.env.AIVIS_GAIN_FILE || path.join(os.homedir(), '.config', 'aivis-mcp', 'gain.json');
 }
@@ -179,34 +215,37 @@ function isLearnedGain(value: unknown): value is LearnedGain {
 export function loadLearnedGains(filePath = gainFilePath()): Record<string, LearnedGain> {
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Partial<GainFile>;
-    const result: Record<string, LearnedGain> = {};
+    const result: Record<string, LearnedGain> = Object.create(null);
     if (parsed && typeof parsed.entries === 'object' && parsed.entries !== null) {
       for (const [key, entry] of Object.entries(parsed.entries)) {
-        if (key.length <= 300 && isLearnedGain(entry)) {
-          result[key] = { db: clampTableDb(entry.db), samples: entry.samples.slice(-LEARN_WINDOW) };
+        if (key.length <= 300 && key !== '__proto__' && isLearnedGain(entry)) {
+          result[key] = {
+            db: clampTableDb(entry.db),
+            samples: entry.samples.slice(-LEARN_WINDOW),
+            ...(typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt) ? { updatedAt: entry.updatedAt } : {}),
+          };
         }
       }
     }
-    return result;
+    return pruneLearnedGains(result);
   } catch {
-    return {};
+    return Object.create(null);
   }
 }
 
 /** 一時ファイルに書いてから置き換える（書きかけを読ませない）。 */
 export function saveLearnedGains(entries: Readonly<Record<string, LearnedGain>>, filePath = gainFilePath()): void {
-  const body: GainFile = { version: 1, target: TARGET_LUFS, entries };
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const temporary = `${filePath}.${process.pid}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(body, null, 2) + '\n', 'utf8');
-  fs.renameSync(temporary, filePath);
+  const body: GainFile = { version: 1, target: TARGET_LUFS, entries: { ...pruneLearnedGains(entries) } };
+  writeFileAtomic(filePath, JSON.stringify(body, null, 2) + '\n', 0o644);
 }
 
 /** 1 回分の測定を表に足して保存する。 */
 export function recordMeasurement(key: string, measuredLufs: number, filePath = gainFilePath()): LearnedGain {
   const entries = loadLearnedGains(filePath);
   const next = learnSample(entries[key], measuredLufs);
-  saveLearnedGains({ ...entries, [key]: next }, filePath);
+  const merged: Record<string, LearnedGain> = Object.assign(Object.create(null), entries);
+  merged[key] = next;
+  saveLearnedGains(merged, filePath);
   return next;
 }
 

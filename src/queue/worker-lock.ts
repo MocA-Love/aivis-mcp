@@ -7,9 +7,10 @@ import { PLAY_LOCK_KEY, WORKER_LOCK_KEY, WORKER_VERSION_KEY } from './keys.js';
 
 export const WORKER_LOCK_TTL_MS = 20_000;
 export const WORKER_HEARTBEAT_MS = 5_000;
-export const PLAY_LOCK_TTL_MS = 60_000;
+/** 再生の lock の期限。worker が落ちても長く残らないよう短くし、鳴らしている間は延長し続ける。 */
+export const PLAY_LOCK_TTL_MS = 10_000;
 /** 鳴らしている間、再生の lock をこの間隔で延長する。 */
-export const PLAY_LOCK_EXTEND_MS = 30_000;
+export const PLAY_LOCK_EXTEND_MS = 3_000;
 
 /** `2.5.0` のような版を比べる（-beta などの後ろは無視）。a が古ければ負。 */
 export function compareVersions(a: string, b: string): number {

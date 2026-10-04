@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import {
   afplayVolume, buildGainTable, finalGainDb, INITIAL_GAIN_DB, isLearnable, learnSample, legacyElevenLabsVolumeToOffset,
-  loadLearnedGains, median, migrateVolumeSettings, recordMeasurement, resolveGainDb, voiceFilter, type VolumeMigrationInput,
+  loadLearnedGains, MAX_LEARNED_ENTRIES, median, pruneLearnedGains, saveLearnedGains, migrateVolumeSettings, recordMeasurement, resolveGainDb, voiceFilter, type VolumeMigrationInput,
 } from '../../src/audio/gain-table.js';
 
 describe('gain table', () => {
@@ -34,7 +34,7 @@ describe('gain table', () => {
 
   test('覚え直しは直近 5 回の中央値', () => {
     let entry = learnSample(undefined, -24);
-    expect(entry).toEqual({ db: 4, samples: [4] });
+    expect(entry).toEqual({ db: 4, samples: [4], updatedAt: expect.any(Number) });
     for (const lufs of [-30, -22, -21, -19, -10]) {
       entry = learnSample(entry, lufs);
     }
@@ -72,12 +72,12 @@ describe('gain table', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-gain-'));
     const file = path.join(dir, 'nested', 'gain.json');
     try {
-      expect(loadLearnedGains(file)).toEqual({});
+      expect({ ...loadLearnedGains(file) }).toEqual({});
       recordMeasurement('aivis:x:default', -25, file);
       recordMeasurement('aivis:x:default', -23, file);
-      expect(loadLearnedGains(file)).toEqual({ 'aivis:x:default': { db: 4, samples: [5, 3] } });
+      expect({ ...loadLearnedGains(file) }).toEqual({ 'aivis:x:default': { db: 4, samples: [5, 3], updatedAt: expect.any(Number) } });
       fs.writeFileSync(file, '{broken');
-      expect(loadLearnedGains(file)).toEqual({});
+      expect({ ...loadLearnedGains(file) }).toEqual({});
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -106,3 +106,33 @@ describe('volume_db の読み替え', () => {
     expect(migrateVolumeSettings({ elevenlabs: { apiKey: 'k' } as { volumeDb?: number } }).changed).toBe(false);
   });
 });
+
+describe('表の大きさと鍵', () => {
+  test('上限を超えたら更新の古いものから消す', () => {
+    const entries: Record<string, { db: number; samples: number[]; updatedAt: number }> = {};
+    for (let i = 0; i < MAX_LEARNED_ENTRIES + 5; i++) {
+      entries[`aivis:v${i}:default`] = { db: 1, samples: [1], updatedAt: i };
+    }
+    const pruned = pruneLearnedGains(entries);
+    expect(Object.keys(pruned)).toHaveLength(MAX_LEARNED_ENTRIES);
+    expect(pruned['aivis:v0:default']).toBeUndefined();
+    expect(pruned[`aivis:v${MAX_LEARNED_ENTRIES + 4}:default`]).toBeDefined();
+  });
+
+  test('__proto__ のような鍵で Object の性質を書き換えない', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-gain-'));
+    const file = path.join(dir, 'gain.json');
+    try {
+      fs.writeFileSync(file, '{"version":1,"target":-20,"entries":{"__proto__":{"db":5,"samples":[5]},"constructor":{"db":2,"samples":[2]}}}');
+      const learned = loadLearnedGains(file);
+      expect(Object.keys(learned)).toEqual(['constructor']);
+      expect(({} as Record<string, unknown>).db).toBeUndefined();
+      expect(resolveGainDb('toString', learned)).toBe(0);
+      saveLearnedGains(learned, file);
+      expect(fs.readdirSync(dir)).toEqual(['gain.json']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+

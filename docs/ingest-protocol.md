@@ -9,8 +9,11 @@ aivis-mcp --ingest --prelude-dir <着信音のフォルダ> [--prelude-dir <別�
 - `--prelude-dir` は着信音（prelude）として鳴らしてよいフォルダです。複数指定できます。ここに無いファイルは着信音として使いません
 - 接続先の Redis は、ほかの起動方法と同じく `--redis-url` / `REDIS_URL` / `config.json` / `redis://127.0.0.1:6379` の順で決まります
 - 標準出力は枠（下記）だけに使います。ログは標準エラーにだけ出ます
-- 親が標準入力を閉じると、書きかけの流れを中断し、この子が置いた hold を外して終わります（終了コード 0）
-- Redis に接続できないときは `hello` と `{"type":"error","reason":"redis-unavailable"}` を出して終了コード 1 で終わります
+- 親が標準入力を閉じる・標準出力が書けなくなる（EPIPE）・SIGTERM / SIGINT / SIGHUP を受けると、書きかけの流れを中断し、この子が置いた hold を外して終わります（終了コード 0）
+- Redis に接続できないとき（redis-server も無いとき）は `hello` と `{"type":"error","reason":"redis-unavailable"}` を出して終了コード 1 で終わります
+- 動き出した後に Redis が止まっても、コマンドを溜めずにすぐ失敗させます（`open` には `failed` / `redis-error`）。1 つの操作を待つのは最大 5 秒です
+- 処理待ちの枠が 256 個か 4 MiB を超えると標準入力を読むのを止め、半分まで減ったら再開します。親は標準入力への書き込みで drain を待ってください
+- `aivis-mcp --reboot` はこの子を止めません
 
 ## 枠
 
@@ -71,7 +74,9 @@ aivis-mcp --ingest --prelude-dir <着信音のフォルダ> [--prelude-dir <別�
 
 ### 音声の枠（型 `0x02`）
 
-`open` した流れの MP3 です。流れ 1 本 8 MiB、この `--ingest` が書いていて終わっていない流れの合計 32 MiB を超えると、その流れを中断し `{"type":"status","id":…,"status":"failed","reason":"too-large"}` を返します。知らない ID には `{"type":"error","reason":"unknown-stream","id":…}` を返します。
+`open` した流れの MP3 です。流れ 1 本 8 MiB、この `--ingest` が書いていて終わっていない流れの合計 32 MiB を超えると、その流れを中断し `{"type":"status","id":…,"status":"failed","reason":"too-large"}` を返します（これがその件の終わりの知らせで、後から別の終わりは来ません）。知らない ID には `{"type":"error","reason":"unknown-stream","id":…}` を返します。
+
+終わりの知らせ（下記）を返した件に後から届いた音声の枠・`end`・`abort` は、黙って捨てます（5 分間覚えています）。終わった件の Stream は、後から届いた断片で作り直さないよう `aivis-mcp` が消します。
 
 ### `end`
 
@@ -136,7 +141,7 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 | `gain` | `{"requestId":…, "target":-20, "maxBoostDb":8, "defaultDb":0, "entries":{鍵: dB}, "volumeOffsetDb":…, "elevenLabsVolumeOffsetDb":…}` | `gain?` の返事。`entries` に無い鍵は、同じ provider・同じモデルの平均、それも無ければ `defaultDb` |
 | `withdrawn` | `{"id":…, "removed":…}` | `withdraw` の返事 |
 | `pong` | `{"requestId":…}` | `ping` の返事 |
-| `error` | `{"reason":…, …}` | 枠や要求が正しくない。`reason` は `protocol`（この後終わる）・`unknown-type`・`unknown-stream`・`invalid-owner`・`redis-unavailable` |
+| `error` | `{"reason":…, …}` | 枠や要求が正しくない。`reason` は `protocol`（1 回だけ出し、以後の入力は捨てて終わる）・`unknown-type`・`unknown-stream`・`invalid-owner`・`redis-unavailable`・`redis-error`（`hold` を Redis に書けなかった） |
 
 `status` の `status` は次の順に進みます。終わり（`done` `skipped` `held` `muted` `failed`）は 1 回だけ来ます。
 
@@ -145,12 +150,21 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 | `queued` | 列に積んだ。親はここで手を離してよい | |
 | `playing` | worker が取り出して鳴らし始めた（着信音を含む） | |
 | `done` | 鳴らし終えた | なし（最後まで）、`slow-arrival`（届くのが遅すぎて届いた分で終えた）、`aborted` などの中断の理由（鳴り始めた後の `abort`）、`empty` |
-| `skipped` | 鳴らさなかった | `expired`（列で待ちすぎた。normal 120 秒・high 600 秒、hold の間は数えない）、`stream-missing`、`prelude-stale`（`sound` が 5 秒以上待った）、`withdrawn`、`abort` の理由 |
+| `skipped` | 鳴らさなかった | `expired`（列で待ちすぎた。normal 120 秒・high 600 秒、hold の間は数えない）、`stream-missing`、`prelude-stale`（`sound` が 5 秒以上待った）、`abort` の理由 |
 | `held` | hold で止めた（読み直さない） | |
 | `muted` | `aivis-mcp --mute` の間だった | |
-| `failed` | 鳴らせなかった | `first-audio-timeout`（取り出してから 10 秒、最初の音が来ない）、`max-duration`（1 発話 120 秒）、`slow-arrival`、`player-exited`、`too-large`、`worker-unavailable`（下記）、`redis-error`、`invalid-id`、`duplicate-id`、`prelude-required`・`prelude-<理由>`（`sound` の着信音が無い・通らない）、`internal-error` |
+| `failed` | 鳴らせなかった | `first-audio-timeout`（取り出してから 10 秒、最初の音が来ない）、`max-duration`（1 発話 120 秒）、`slow-arrival`、`player-exited`、`too-large`、`worker-unavailable`（下記）、`worker-stopped`（鳴らしている途中で worker が止められた）、`lost`（下記）、`untracked`（下記）、`no-player`（`sound` を鳴らすプレイヤーが無い）、`prelude-required`・`prelude-<理由>`（`sound` の着信音が無い・許可フォルダの外など）、`redis-error`、`invalid-id`、`duplicate-id`、`internal-error` |
 
 worker の lock が 30 秒続けて無いときは、まだ取り出されていないジョブを列から外し（LREM が 1 のときだけ）、`{"type":"status","status":"failed","reason":"worker-unavailable","withdrawn":true}` を返します。この知らせを受けた件だけ、親は自分で鳴らしてかまいません。
+
+次の件は、worker が落ちたなどで知らせが来ないものとして `failed` を返します。これらは鳴らし直していない（取り下げていない）ので、親は自分で鳴らし直さず、`failed` が続いたら次の件から自分で鳴らす判断（設計 N2）に使ってください。
+
+| `reason` | いつ |
+|---|---|
+| `lost` | 列から取り出されたのに 30 秒 `playing` が来ない、`playing` の後 180 秒終わりが来ない、`playing` の後に worker の lock が 30 秒無い |
+| `untracked` | `open` から 15 分経っても終わりが来ない（追うのをやめる） |
+
+`withdraw` の返事で `removed: true` だった件には、`status` は返しません。
 
 ## 打ち切り
 
@@ -167,7 +181,12 @@ worker は 1 発話ごとに次で打ち切ります。列で待つ時間は数�
 | `aivis-mcp:q2:high` / `aivis-mcp:q2:normal` | 2.5 の列（LPUSH で積み、worker が BRPOP で high から取り出す） |
 | `aivis-mcp:queue` | 2.4 までの列（2.5 の worker も読む） |
 | `aivis-mcp:audio:<id>` | 音声の Stream。項目 `o`（開いた印）・`d`（MP3）・`e`（終わり）・`a`（中断、値は理由）。期限 180 秒（`--ingest` が 30 秒ごとに延長） |
-| `aivis-mcp:status:<id>` | 進み具合のリスト（期限 300 秒） |
+| `aivis-mcp:status:<id>` | 進み具合のリスト（期限 300 秒。`--ingest` が 30 秒ごとに延長し、期限切れで作り直されたら頭から読み直す） |
+| `aivis-mcp:prelude-dirs` | `--ingest` が起動時に受けた着信音の許可フォルダ（SET、期限 1 時間・30 秒ごとに延長）。worker も鳴らす前にここで確かめる |
 | `aivis-mcp:hold:<owner>` | hold（期限 60 秒）。置いた・外したときは `aivis-mcp:hold-events` に publish |
 | `aivis-mcp:worker-lock` / `aivis-mcp:worker-version` | worker の lock と版 |
-| `aivis-mcp:play-lock` | 再生の lock（鳴らしている間 30 秒ごとに延長） |
+| `aivis-mcp:play-lock` | 再生の lock（期限 10 秒、鳴らしている間 3 秒ごとに延長。worker が止められたらすぐ消す） |
+
+## 移行中の制約
+
+- 2.4 までの `aivis` CLI・MCP・`--play-audio` は、古い列 `aivis-mcp:queue` に RPUSH で積みます。worker は BRPOP で右から取り出すので、2.4 から積まれた発話同士は後から積んだものが先に鳴ることがあります（2.5 から積む分は LPUSH なので積んだ順）。古い列は 2.5 の列（high → normal）より後に読みます。すべて 2.5 に更新すると解消します

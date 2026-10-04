@@ -6,14 +6,15 @@ import type { RedisClientType } from 'redis';
 import { IngestSession } from '../../src/ingest/ingest.js';
 import { PlaybackWorker } from '../../src/worker/playback-worker.js';
 import { encodeAudio, encodeControl, FrameDecoder } from '../../src/streaming/frame-protocol.js';
-import { HIGH_QUEUE_KEY, holdKey, NORMAL_QUEUE_KEY } from '../../src/queue/keys.js';
-import { connect, hasRedisServer, startTestRedis, waitFor, type TestRedis } from '../helpers/redis.js';
+import { audioStreamKey, HIGH_QUEUE_KEY, holdKey, NORMAL_QUEUE_KEY, PRELUDE_DIRS_KEY, statusKey, WORKER_LOCK_KEY } from '../../src/queue/keys.js';
+import { createIngestClient } from '../../src/ingest/ingest.js';
+import { setMute } from '../../src/services/mute-service.js';
+import { setHold, clearHold } from '../../src/queue/hold.js';
+import { connect, describeWithRedis, startTestRedis, waitFor, type TestRedis } from '../helpers/redis.js';
 import { FakeBackend } from '../helpers/fake-backend.js';
 import { mp3Frames, testConfig } from '../helpers/fixtures.js';
 
-const describeRedis = hasRedisServer ? describe : describe.skip;
-
-describeRedis('--ingest（別ポートの redis-server）', () => {
+describeWithRedis('--ingest（別ポートの redis-server）', () => {
   let redis: TestRedis;
   let client: RedisClientType;
   let sessionClient: RedisClientType;
@@ -42,7 +43,7 @@ describeRedis('--ingest（別ポートの redis-server）', () => {
     input = new PassThrough();
     messages = [];
     const decoder = new FrameDecoder();
-    session = new IngestSession(sessionClient, testConfig(redis.url), [tempDir], {
+    session = new IngestSession(sessionClient, () => testConfig(redis.url), [tempDir], {
       input,
       write: frame => {
         for (const decoded of decoder.push(frame)) {
@@ -170,5 +171,184 @@ describeRedis('--ingest（別ポートの redis-server）', () => {
     input.write(Buffer.from([0x07, 0, 0, 0, 1, 0]));
     await session.closedPromise;
     expect(messages.some(message => message.type === 'error' && message.reason === 'protocol')).toBe(true);
+  });
+
+  function terminalCount(id: string): number {
+    return messages.filter(message => message.id === id && message.type === 'status' && ['done', 'skipped', 'held', 'muted', 'failed'].includes(message.status as string)).length;
+  }
+
+  test('終わった件の Stream キーは、後から来た枠で作り直されない（ミュート中）', async () => {
+    await setMute(client, undefined);
+    startWorker(new FakeBackend());
+    input.write(encodeControl({ type: 'open', id: 'm1' }));
+    input.write(encodeAudio('m1', mp3Frames(5)));
+    await waitFor(() => statusesOf('m1').includes('muted') ? true : undefined);
+    // 終わりを知らされた後にも親は少し送ってくる
+    input.write(encodeAudio('m1', mp3Frames(5)));
+    input.write(encodeControl({ type: 'end', id: 'm1' }));
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(await client.exists(audioStreamKey('m1'))).toBe(0);
+    expect(messages.some(message => message.type === 'error')).toBe(false);
+    expect(terminalCount('m1')).toBe(1);
+  });
+
+  test('Stream のキーには必ず期限が付く', async () => {
+    input.write(encodeControl({ type: 'open', id: 'ttl1' }));
+    input.write(encodeAudio('ttl1', mp3Frames(30)));
+    await waitFor(async () => (await client.xLen(audioStreamKey('ttl1'))) >= 2 ? true : undefined);
+    const ttl = await client.ttl(audioStreamKey('ttl1'));
+    expect(ttl).toBeGreaterThan(0);
+  });
+
+  test('too-large の終わりは 1 回だけ', async () => {
+    startWorker(new FakeBackend());
+    input.write(encodeControl({ type: 'open', id: 'big2' }));
+    await waitFor(() => statusesOf('big2').includes('queued') ? true : undefined);
+    const chunk = Buffer.alloc(1024 * 1024 - 64);
+    for (let i = 0; i < 9; i++) {
+      input.write(encodeAudio('big2', chunk));
+    }
+    await waitFor(() => terminalCount('big2') > 0 ? true : undefined);
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    expect(terminalCount('big2')).toBe(1);
+    expect(messages.filter(message => message.id === 'big2' && message.type === 'error')).toHaveLength(0);
+  });
+
+  test('知らせのキーが期限切れで消えても、頭から読み直して終わりを返す', async () => {
+    await setHold(client, 'mic');
+    startWorker(new FakeBackend());
+    await waitFor(() => worker!.isHeld ? true : undefined);
+    input.write(encodeControl({ type: 'open', id: 'exp1', priority: 'high' }));
+    input.write(encodeAudio('exp1', mp3Frames(5)));
+    input.write(encodeControl({ type: 'end', id: 'exp1' }));
+    await waitFor(() => statusesOf('exp1').includes('queued') ? true : undefined);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    await client.del(statusKey('exp1'));
+    await clearHold(client, 'mic');
+    await waitFor(() => statusesOf('exp1').includes('done') ? true : undefined);
+  });
+
+  test('枠が溜まったら標準入力を止め、進んだら再開する', async () => {
+    input.write(encodeControl({ type: 'open', id: 'bp' }));
+    await waitFor(() => statusesOf('bp').includes('queued') ? true : undefined);
+    const frames = Buffer.concat(Array.from({ length: 600 }, () => encodeAudio('bp', Buffer.alloc(100))));
+    input.write(frames);
+    await waitFor(() => session.isPaused ? true : undefined, 2000, 1);
+    await waitFor(() => !session.isPaused ? true : undefined);
+  });
+
+  test('壊れた枠の知らせは 1 回だけ、以後の入力は捨てる', async () => {
+    input.write(Buffer.from([0x07, 0, 0, 0, 1, 0]));
+    input.write(Buffer.from([0x08, 0, 0, 0, 1, 0]));
+    input.write(encodeControl({ type: 'ping', requestId: 1 }));
+    await session.closedPromise;
+    expect(messages.filter(message => message.type === 'error')).toHaveLength(1);
+    expect(messages.some(message => message.type === 'pong')).toBe(false);
+  });
+
+  test('取り出されたのに playing が来ない件は failed（lost）を返す', async () => {
+    await client.set(WORKER_LOCK_KEY, 'someone', { PX: 60_000 });
+    input.write(encodeControl({ type: 'open', id: 'lost1' }));
+    await waitFor(() => statusesOf('lost1').includes('queued') ? true : undefined);
+    // worker が取り出して落ちた
+    await client.rPop(NORMAL_QUEUE_KEY);
+    const now = Date.now();
+    await session.checkWorker(now);
+    expect(terminalCount('lost1')).toBe(0);
+    await session.checkWorker(now + 30_000);
+    expect(messages.find(message => message.id === 'lost1' && message.status === 'failed')).toEqual({ type: 'status', id: 'lost1', status: 'failed', reason: 'lost' });
+    expect(session.trackedCount).toBe(0);
+  });
+
+  test('playing の後に終わりが来ない件も failed（lost）を返す', async () => {
+    await client.set(WORKER_LOCK_KEY, 'someone', { PX: 60_000 });
+    input.write(encodeControl({ type: 'open', id: 'lost2' }));
+    await waitFor(() => statusesOf('lost2').includes('queued') ? true : undefined);
+    await client.rPop(NORMAL_QUEUE_KEY);
+    await client.rPush(statusKey('lost2'), JSON.stringify({ s: 'playing', t: Date.now() }));
+    await waitFor(() => statusesOf('lost2').includes('playing') ? true : undefined);
+    await session.checkWorker(Date.now() + 181_000);
+    expect(messages.find(message => message.id === 'lost2' && message.status === 'failed')).toMatchObject({ reason: 'lost' });
+  });
+
+  test('追跡の上限を越えた件は failed（untracked）を返す', async () => {
+    let clock = Date.now();
+    const own = new PassThrough();
+    const ownMessages: Record<string, unknown>[] = [];
+    const decoder = new FrameDecoder();
+    const ownClient = await connect(redis.url);
+    const own_session = new IngestSession(ownClient, () => testConfig(redis.url), [], {
+      input: own,
+      write: frame => { for (const f of decoder.push(frame)) { if (f.kind === 'control') ownMessages.push(f.message); } },
+    }, { spawnWorker: false, now: () => clock });
+    own_session.start();
+    try {
+      own.write(encodeControl({ type: 'open', id: 'old1' }));
+      await waitFor(() => ownMessages.some(m => m.id === 'old1' && m.status === 'queued') ? true : undefined);
+      clock += 16 * 60_000;
+      await own_session.pollStatuses();
+      expect(ownMessages.find(m => m.id === 'old1' && m.status === 'failed')).toEqual({ type: 'status', id: 'old1', status: 'failed', reason: 'untracked' });
+    } finally {
+      own.end();
+      await own_session.closedPromise;
+      await ownClient.disconnect();
+    }
+  });
+
+  test('gain? の上乗せは毎回いまの設定から読む', async () => {
+    let offset = 0;
+    const own = new PassThrough();
+    const ownMessages: Record<string, unknown>[] = [];
+    const decoder = new FrameDecoder();
+    const ownClient = await connect(redis.url);
+    const own_session = new IngestSession(ownClient, () => ({ ...testConfig(redis.url), volumeOffsetDb: offset }), [], {
+      input: own,
+      write: frame => { for (const f of decoder.push(frame)) { if (f.kind === 'control') ownMessages.push(f.message); } },
+    }, { spawnWorker: false });
+    own_session.start();
+    try {
+      own.write(encodeControl({ type: 'gain?', requestId: 'a' }));
+      await waitFor(() => ownMessages.some(m => m.requestId === 'a') ? true : undefined);
+      offset = -4;
+      own.write(encodeControl({ type: 'gain?', requestId: 'b' }));
+      const reply = await waitFor(() => ownMessages.find(m => m.requestId === 'b'));
+      expect(reply.volumeOffsetDb).toBe(-4);
+    } finally {
+      own.end();
+      await own_session.closedPromise;
+      await ownClient.disconnect();
+    }
+  });
+
+  test('起動時に許可フォルダを worker 向けに置く', async () => {
+    await waitFor(async () => (await client.sIsMember(PRELUDE_DIRS_KEY, tempDir)) ? true : undefined);
+    expect(await client.ttl(PRELUDE_DIRS_KEY)).toBeGreaterThan(0);
+  });
+
+  test('Redis が止まっても固まらず、open に failed（redis-error）を返して閉じられる', async () => {
+    const own = await startTestRedis();
+    const ownClient = createIngestClient(own.url);
+    await ownClient.connect();
+    const ownInput = new PassThrough();
+    const ownMessages: Record<string, unknown>[] = [];
+    const decoder = new FrameDecoder();
+    const own_session = new IngestSession(ownClient, () => testConfig(own.url), [], {
+      input: ownInput,
+      write: frame => { for (const f of decoder.push(frame)) { if (f.kind === 'control') ownMessages.push(f.message); } },
+    }, { spawnWorker: false });
+    own_session.start();
+    try {
+      await own.stop();
+      ownInput.write(encodeControl({ type: 'open', id: 'r1' }));
+      ownInput.write(encodeAudio('r1', mp3Frames(3)));
+      const failed = await waitFor(() => ownMessages.find(m => m.id === 'r1' && m.status === 'failed'), 10_000);
+      expect(failed.reason).toBe('redis-error');
+      const started = Date.now();
+      ownInput.end();
+      await own_session.closedPromise;
+      expect(Date.now() - started).toBeLessThan(8000);
+    } finally {
+      await ownClient.disconnect().catch(() => undefined);
+    }
   });
 });

@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { checkPreludeFile, preludeFormat, validatePreludePath } from '../../src/audio/prelude.js';
-import { ffplayPreludeArgs, ffplayVoiceArgs, mpvVoiceArgs } from '../../src/audio/player.js';
+import { ffplayPreludeArgs, ffplayVoiceArgs, mpvPreludeArgs, mpvVoiceArgs } from '../../src/audio/player.js';
 
 describe('prelude', () => {
   let root: string;
@@ -69,4 +69,12 @@ describe('prelude', () => {
     const mpv = mpvVoiceArgs(-3);
     expect(mpv).toEqual(expect.arrayContaining(['--demuxer-lavf-probesize=32', '--demuxer-lavf-analyzeduration=0', '--demuxer-lavf-o=fflags=+nobuffer', '--af=lavfi=[volume=-3.0dB,alimiter=limit=0.89]']));
   });
+
+  test('mpv の着信音も形式を指定し、プレイリストとして読まない', () => {
+    const args = mpvPreludeArgs('/s/chime.wav', 'wav', 0.5);
+    expect(args).toEqual(expect.arrayContaining(['--load-unsafe-playlists=no', '--ytdl=no', '--demuxer-lavf-format=wav', '--volume=50']));
+    expect(args.slice(-2)).toEqual(['--', '/s/chime.wav']);
+    expect(args.join(' ')).not.toContain('alimiter');
+  });
 });
+

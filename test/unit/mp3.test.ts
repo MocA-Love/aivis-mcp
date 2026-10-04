@@ -1,4 +1,4 @@
-import { bytesForDuration, durationForBytes, findFirstFrame, id3v2Length, parseFrameHeader } from '../../src/streaming/mp3.js';
+import { bytesForDuration, durationForBytes, estimateMp3Duration, findFirstFrame, id3v2Length, parseFrameHeader } from '../../src/streaming/mp3.js';
 
 /** MPEG-1 Layer III 128kbps 44.1kHz（パディング無し）のフレームを n 個並べる。 */
 function mpeg1Frames(count: number): Buffer {
@@ -13,7 +13,7 @@ function mpeg1Frames(count: number): Buffer {
 describe('mp3', () => {
   test('MPEG-1 Layer III のヘッダーからビットレートとフレーム長を読む', () => {
     const header = parseFrameHeader(mpeg1Frames(1), 0);
-    expect(header).toEqual({ offset: 0, bitrateKbps: 128, sampleRate: 44100, version: 1, layer: 3, frameLength: 417 });
+    expect(header).toEqual({ offset: 0, bitrateKbps: 128, sampleRate: 44100, version: 1, layer: 3, frameLength: 417, samplesPerFrame: 1152, mono: false });
   });
 
   test('MPEG-2 Layer III（24kHz 32kbps）も読む', () => {
@@ -54,5 +54,46 @@ describe('mp3', () => {
     expect(bytesForDuration(32, 250)).toBe(1000);
     expect(durationForBytes(128, 16000)).toBe(1);
     expect(durationForBytes(0, 100)).toBe(0);
+  });
+});
+
+describe('長さの見積もり', () => {
+  /** MPEG-1 Layer III 44.1kHz のフレーム（ビットレートの番号を指定）。 */
+  function frame(bitrateIndex: number): Buffer {
+    const bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+    const length = Math.floor((144 * bitrates[bitrateIndex] * 1000) / 44100);
+    const bytes = Buffer.alloc(length);
+    bytes[0] = 0xff;
+    bytes[1] = 0xfb;
+    bytes[2] = (bitrateIndex << 4) | 0x00;
+    bytes[3] = 0x64;
+    return bytes;
+  }
+
+  test('可変ビットレートでも全フレームの合計で数える', () => {
+    // 128kbps と 32kbps を 50 フレームずつ。最初のフレームのビットレートで見積もると大きく外れる
+    const audio = Buffer.concat([...Array.from({ length: 50 }, () => frame(9)), ...Array.from({ length: 50 }, () => frame(1))]);
+    expect(estimateMp3Duration(audio)).toBeCloseTo((100 * 1152) / 44100, 5);
+  });
+
+  test('Xing ヘッダーがあればそのフレーム数を使う', () => {
+    const first = frame(9);
+    // MPEG-1 ステレオは サイド情報 32 バイトの後に Xing
+    first.write('Xing', 4 + 32, 'ascii');
+    first.writeUInt32BE(0x01, 4 + 32 + 4);
+    first.writeUInt32BE(1000, 4 + 32 + 8);
+    const audio = Buffer.concat([first, frame(9), frame(9)]);
+    expect(estimateMp3Duration(audio)).toBeCloseTo((1000 * 1152) / 44100, 5);
+  });
+
+  test('VBRI ヘッダーがあればそのフレーム数を使う', () => {
+    const first = frame(9);
+    first.write('VBRI', 36, 'ascii');
+    first.writeUInt32BE(500, 36 + 14);
+    expect(estimateMp3Duration(Buffer.concat([first, frame(9)]))).toBeCloseTo((500 * 1152) / 44100, 5);
+  });
+
+  test('フレームが無ければ分からない', () => {
+    expect(estimateMp3Duration(Buffer.alloc(10))).toBeUndefined();
   });
 });

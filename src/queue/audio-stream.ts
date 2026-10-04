@@ -22,7 +22,9 @@ export class AudioStreamWriter {
   private timer: NodeJS.Timeout | undefined;
   private chain: Promise<void> = Promise.resolve();
   private closed = false;
+  private discarded = false;
   private failure: unknown;
+  private queuedTasks = 0;
 
   readonly key: string;
 
@@ -42,17 +44,23 @@ export class AudioStreamWriter {
     return this.closed;
   }
 
+  get isDiscarded(): boolean {
+    return this.discarded;
+  }
+
+  /** まだ Redis へ書いていない書き込みの数（背圧の目安）。 */
+  get backlog(): number {
+    return this.queuedTasks;
+  }
+
   /** Stream を作る（列から取り出した worker が「Stream が無い」と捨てないように、積む前に呼ぶ）。 */
   open(): Promise<void> {
-    return this.enqueue(async () => {
-      await this.client.xAdd(this.key, '*', { o: '1' });
-      await this.client.expire(this.key, STREAM_TTL_SECONDS);
-    });
+    return this.enqueueAdd({ o: '1' });
   }
 
   /** 断片を足す。上限を超えたら false を返し、何も書かない（呼び出し側が abort する）。 */
   write(chunk: Buffer): boolean {
-    if (this.closed) {
+    if (this.closed || this.discarded) {
       return false;
     }
     if (this.totalBytes + chunk.length > this.maxBytes) {
@@ -76,14 +84,26 @@ export class AudioStreamWriter {
   abort(reason = 'aborted'): Promise<void> {
     // 中断の前の断片は捨てる（鳴り始めていなければ worker も捨てる）
     if (!this.closed) {
-      this.pending = [];
-      this.pendingBytes = 0;
+      this.clearPending();
     }
     return this.close({ a: reason.slice(0, 64) || 'aborted' });
   }
 
-  /** 列で待つ間・hold の間に期限を延ばす。 */
+  /**
+   * 以後の書き込みをすべて捨てる（タイマーも止める）。worker が終わりの知らせを積んで Stream を消した後に、
+   * 書きかけの断片がキーを作り直さないようにする。まだ Redis へ送っていない書き込みも捨てる。
+   */
+  discard(): void {
+    this.discarded = true;
+    this.closed = true;
+    this.clearPending();
+  }
+
+  /** 列で待つ間・hold の間に期限を延ばす（EXPIRE はキーを作らない）。 */
   touch(): Promise<void> {
+    if (this.discarded) {
+      return this.chain;
+    }
     return this.enqueue(async () => {
       await this.client.expire(this.key, STREAM_TTL_SECONDS);
     });
@@ -97,16 +117,22 @@ export class AudioStreamWriter {
     }
   }
 
+  private clearPending(): void {
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    this.pending = [];
+    this.pendingBytes = 0;
+  }
+
   private close(marker: Record<string, string>): Promise<void> {
     if (this.closed) {
       return this.chain;
     }
     this.flush();
     this.closed = true;
-    return this.enqueue(async () => {
-      await this.client.xAdd(this.key, '*', marker);
-      await this.client.expire(this.key, STREAM_TTL_SECONDS);
-    });
+    return this.enqueueAdd(marker);
   }
 
   private flush(): void {
@@ -114,19 +140,33 @@ export class AudioStreamWriter {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    if (this.pending.length === 0) {
+    if (this.pending.length === 0 || this.discarded) {
       return;
     }
     const data = Buffer.concat(this.pending, this.pendingBytes);
     this.pending = [];
     this.pendingBytes = 0;
-    void this.enqueue(async () => {
-      await this.client.xAdd(this.key, '*', { d: data });
+    void this.enqueueAdd({ d: data });
+  }
+
+  /** XADD と EXPIRE を 1 回（MULTI）で送る。期限の無いキーを残さない。 */
+  private enqueueAdd(message: Record<string, string | Buffer>): Promise<void> {
+    return this.enqueue(async () => {
+      await this.client.multi().xAdd(this.key, '*', message).expire(this.key, STREAM_TTL_SECONDS).exec();
     });
   }
 
   private enqueue(task: () => Promise<void>): Promise<void> {
-    this.chain = this.chain.then(task).catch(error => {
+    this.queuedTasks++;
+    this.chain = this.chain.then(async () => {
+      try {
+        if (!this.discarded) {
+          await task();
+        }
+      } finally {
+        this.queuedTasks--;
+      }
+    }).catch(error => {
       this.failure = error;
     });
     return this.chain;

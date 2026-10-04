@@ -28,6 +28,8 @@ function getAivisProcesses(): AivisProcess[] {
     for (const line of lines) {
       if (!line.includes('aivis-mcp') || !line.includes('dist/index.js')) continue;
       if (line.includes('ps aux')) continue;
+      // --ingest は Para Code が持つ常駐の子。止めると Para Code の読み上げが止まるので対象にしない
+      if (line.includes('--ingest')) continue;
       const parts = line.trim().split(/\s+/);
       if (parts.length < 2) continue;
       const pid = parts[1];

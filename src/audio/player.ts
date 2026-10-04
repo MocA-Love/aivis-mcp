@@ -74,6 +74,17 @@ export function ffplayPreludeArgs(filePath: string, format: string, volume: numb
   ];
 }
 
+/** mpv も形式を指定し、プレイリストとして読まない。 */
+export function mpvPreludeArgs(filePath: string, format: string, volume: number): string[] {
+  return [
+    '--no-video', '--really-quiet', '--no-terminal',
+    '--load-unsafe-playlists=no', '--ytdl=no', '--playlist-start=0', '--no-resume-playback',
+    `--demuxer-lavf-format=${format}`,
+    `--volume=${Math.round(Math.min(1, Math.max(0, volume)) * 100)}`,
+    '--', filePath,
+  ];
+}
+
 function commandExists(command: string): boolean {
   try {
     const result = spawnSync(process.platform === 'win32' ? 'where' : 'which', [command], { stdio: 'ignore' });
@@ -222,7 +233,7 @@ export function createAudioBackend(kind = detectPlayerKind(), canMeasure = hasFf
       if (kind === 'ffplay') {
         child = spawn('ffplay', ffplayPreludeArgs(filePath, format, volume), { stdio: 'ignore' });
       } else if (kind === 'mpv') {
-        child = spawn('mpv', ['--no-video', '--really-quiet', '--no-terminal', `--volume=${Math.round(volume * 100)}`, '--', filePath], { stdio: 'ignore' });
+        child = spawn('mpv', mpvPreludeArgs(filePath, format, volume), { stdio: 'ignore' });
       } else if (kind === 'afplay') {
         child = spawn('afplay', ['-v', Math.min(1, Math.max(0, volume)).toFixed(3), filePath], { stdio: 'ignore' });
       }

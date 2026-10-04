@@ -116,7 +116,7 @@ async function main() {
   // --ingest（Para Code が起動する常駐の子）。標準出力は枠だけに使うので、ほかより先に分ける
   if (values.ingest) {
     const preludeDirs = Array.isArray(values['prelude-dir']) ? values['prelude-dir'] : [];
-    await runIngest(config, preludeDirs);
+    await runIngest(() => resolveConfig(values), preludeDirs);
     return;
   }
 

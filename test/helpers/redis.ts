@@ -70,3 +70,21 @@ export async function waitFor<T>(probe: () => Promise<T | undefined> | T | undef
   }
   throw new Error('waitFor timed out');
 }
+
+/**
+ * redis-server を使う結合テストの describe。手元に無ければ飛ばすが、CI（`CI` がある）で無いときは
+ * 黙って飛ばさず失敗させる。
+ */
+export function describeWithRedis(name: string, body: () => void): void {
+  if (hasRedisServer) {
+    describe(name, body);
+  } else if (process.env.CI) {
+    describe(name, () => {
+      test('CI では redis-server が必要', () => {
+        throw new Error('redis-server が見つかりません（CI では結合テストを飛ばしません）');
+      });
+    });
+  } else {
+    describe.skip(name, body);
+  }
+}

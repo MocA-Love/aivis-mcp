@@ -1,4 +1,4 @@
-import type { AudioBackend, PreludePlayback, VoicePlayback } from '../../src/audio/player.js';
+import type { AudioBackend, PlayerKind, PreludePlayback, VoicePlayback } from '../../src/audio/player.js';
 
 export interface PlayedVoice {
   readonly gainDb: number;
@@ -16,15 +16,17 @@ export interface BackendEvent {
  * 音を出さない鳴らし先。届いたバイトを記録し、入力が閉じてから `voiceMs` 後に鳴り終わる。
  */
 export class FakeBackend implements AudioBackend {
-  readonly kind = 'ffplay' as const;
+  readonly kind: PlayerKind;
   readonly streaming = true;
   readonly canMeasure: boolean;
   readonly voices: PlayedVoice[] = [];
   readonly events: BackendEvent[] = [];
   readonly preludes: string[] = [];
+  preludeKills = 0;
 
-  constructor(private readonly options: { voiceMs?: number; preludeMs?: number; canMeasure?: boolean } = {}) {
+  constructor(private readonly options: { voiceMs?: number; preludeMs?: number; canMeasure?: boolean; kind?: PlayerKind } = {}) {
     this.canMeasure = options.canMeasure ?? false;
+    this.kind = options.kind ?? 'ffplay';
   }
 
   startVoice(gainDb: number): VoicePlayback {
@@ -60,6 +62,6 @@ export class FakeBackend implements AudioBackend {
     let resolve!: () => void;
     const done = new Promise<void>(r => { resolve = r; });
     const timer = setTimeout(resolve, this.options.preludeMs ?? 10);
-    return { kill: () => { clearTimeout(timer); resolve(); }, done };
+    return { kill: () => { this.preludeKills++; clearTimeout(timer); resolve(); }, done };
   }
 }

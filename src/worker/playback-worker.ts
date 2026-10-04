@@ -14,17 +14,17 @@ import type { AppConfig } from '../config.js';
 import type { AudioBackend, VoicePlayback } from '../audio/player.js';
 import { finalGainDb, isLearnable, loadLearnedGains, recordMeasurement, resolveGainDb } from '../audio/gain-table.js';
 import type { LoudnessResult } from '../audio/loudness.js';
-import { checkPreludeFile } from '../audio/prelude.js';
+import { validatePreludePath } from '../audio/prelude.js';
 import { providerOf, summarizeError, synthesisSetupError, type SynthesizeFunction } from '../audio/synthesize.js';
-import { durationForBytes, findFirstFrame } from '../streaming/mp3.js';
-import { PlaybackMonitor, shouldStartPlayback } from '../streaming/playback-policy.js';
+import { estimateMp3Duration, findFirstFrame } from '../streaming/mp3.js';
+import { MAX_UTTERANCE_MS, PlaybackMonitor, shouldStartPlayback } from '../streaming/playback-policy.js';
 import { AudioStreamReader, AudioStreamWriter, MAX_STREAM_BYTES } from '../queue/audio-stream.js';
 import { anyHoldActive, appendHoldInterval, HOLD_SCAN_INTERVAL_MS, loadHoldIntervals } from '../queue/hold.js';
 import {
   gainKeyFor, hasEmotionTags, heldOverlapMs, isJobExpired, parseJob, shouldPlayPrelude,
   type Job, type PreludeSpec, type SoundJob, type StreamJob, type SynthJob,
 } from '../queue/jobs.js';
-import { audioStreamKey, DEQUEUE_ORDER, HOLD_CHANNEL } from '../queue/keys.js';
+import { audioStreamKey, DEQUEUE_ORDER, HOLD_CHANNEL, PRELUDE_DIRS_KEY } from '../queue/keys.js';
 import { pushStatus, type JobStatus } from '../queue/status.js';
 import {
   acquirePlayLock, acquireWorkerLock, extendPlayLock, PLAY_LOCK_EXTEND_MS, refreshWorkerLock,
@@ -52,8 +52,18 @@ interface Outcome {
   readonly reason?: string;
 }
 
+/** いま扱っている 1 件。止められたときに知らせと後始末をするために持つ。 */
+interface JobContext {
+  readonly id: string | undefined;
+  /** 終わりの知らせをもう積んだか（止めたときに先に積む） */
+  reported: boolean;
+  cancelled: boolean;
+  readonly kills: Set<() => void>;
+}
+
 interface StreamPlayRequest {
   readonly job: Job;
+  readonly ctx: JobContext;
   readonly streamKey: string;
   readonly gainKey: string | undefined;
   readonly extraGainDb: number;
@@ -63,8 +73,35 @@ interface StreamPlayRequest {
   readonly heldMs: number;
 }
 
+type PreludeResult = 'played' | 'held' | 'stale' | 'no-player' | 'cancelled' | `rejected:${string}`;
+
+interface PreludeHandle {
+  readonly result: Promise<PreludeResult>;
+  kill(): void;
+}
+
 const POLL_MS = 100;
 const HOLD_INTERRUPTED = 'hold';
+const CANCELLED = 'cancelled';
+/** 先に返るとき、合成の流れの後始末を待つ上限。 */
+const SYNTHESIS_SETTLE_MS = 5_000;
+/** Para Code が引き受けた発話の合成を送り終えるまで待つ上限。 */
+const SYNTHESIS_FORWARD_MS = MAX_UTTERANCE_MS + 10_000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** 上限つきで待つ。上限を過ぎたら false。 */
+async function settleWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), ms); });
+  try {
+    return await Promise.race([promise.then(() => true, () => true), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export class PlaybackWorker {
   private readonly workerId = uuidv4();
@@ -75,12 +112,16 @@ export class PlaybackWorker {
   private active = false;
   private held = false;
   private holdStartedAt: number | undefined;
+  /** hold を確かめた順番。遅れて返った古い結果で状態を戻さない */
+  private holdCheckSeq = 0;
+  private holdAppliedSeq = 0;
   private heartbeat: NodeJS.Timeout | undefined;
   private holdScan: NodeJS.Timeout | undefined;
-  private holdWaiters: (() => void)[] = [];
+  private holdWaiters = new Set<() => void>();
+  private current: JobContext | undefined;
   private readonly now: () => number;
   /** 覚え直しの測定（テストで待てるように持っておく） */
-  private pendingMeasurements: Promise<void>[] = [];
+  private pendingMeasurements = new Set<Promise<void>>();
 
   constructor(private readonly deps: WorkerDependencies) {
     this.now = deps.now ?? Date.now;
@@ -99,6 +140,11 @@ export class PlaybackWorker {
 
   get isHeld(): boolean {
     return this.held;
+  }
+
+  /** テスト用: 待ち手の数（タイムアウトで外れることを確かめる）。 */
+  get holdWaiterCount(): number {
+    return this.holdWaiters.size;
   }
 
   private log(...args: unknown[]): void {
@@ -150,11 +196,11 @@ export class PlaybackWorker {
       } catch (error) {
         if (this.active) {
           console.error('Queue worker error:', summarizeError(error));
-          await new Promise(resolve => setTimeout(resolve, 200));
+          await delay(200);
         }
       }
     }
-    await Promise.allSettled(this.pendingMeasurements);
+    await Promise.allSettled([...this.pendingMeasurements]);
     await this.close();
     return 'stopped';
   }
@@ -166,19 +212,37 @@ export class PlaybackWorker {
   }
 
   /**
-   * 止められた（SIGTERM など）ときに lock をすぐ手放す。手放さないと期限の 20 秒の間、
-   * 次の worker が起きない（lock が残っているので起こす側が動いていると思う）。
+   * 止められた（SIGTERM など）。今の件に failed（worker-stopped）を積み、鳴らしている途中ならプレイヤーを止め、
+   * 再生の lock と worker の lock をすぐ手放す。手放さないと次の worker がしばらく鳴らせない。
    */
-  async releaseLockNow(): Promise<void> {
+  async shutdown(reason = 'worker-stopped'): Promise<void> {
     this.active = false;
+    const current = this.current;
+    if (current) {
+      current.cancelled = true;
+      for (const kill of current.kills) {
+        kill();
+      }
+      if (current.id !== undefined && !current.reported && this.command.isOpen) {
+        current.reported = true;
+        await this.setStatus(current.id, 'failed', reason);
+      }
+    }
+    this.wakeHoldWaiters();
     if (this.command.isOpen) {
+      await releasePlayLock(this.command, this.workerId).catch(() => undefined);
       await releaseWorkerLock(this.command, this.workerId).catch(() => undefined);
     }
   }
 
+  /** 互換のための別名（2.5.0 の SIGTERM の受け手）。 */
+  async releaseLockNow(): Promise<void> {
+    await this.shutdown();
+  }
+
   /** テスト用: 裏で走っている覚え直しを待つ。 */
   async flushMeasurements(): Promise<void> {
-    await Promise.allSettled(this.pendingMeasurements);
+    await Promise.allSettled([...this.pendingMeasurements]);
   }
 
   private async close(): Promise<void> {
@@ -220,12 +284,18 @@ export class PlaybackWorker {
     if (!this.command.isOpen) {
       return;
     }
+    const seq = ++this.holdCheckSeq;
     let active: boolean;
     try {
       active = await anyHoldActive(this.command);
     } catch {
       return;
     }
+    // 知らせと 10 秒ごとの確認が重なったとき、後から始めた確認の結果だけを使う
+    if (seq < this.holdAppliedSeq) {
+      return;
+    }
+    this.holdAppliedSeq = seq;
     if (active === this.held) {
       return;
     }
@@ -246,22 +316,23 @@ export class PlaybackWorker {
   }
 
   private wakeHoldWaiters(): void {
-    const waiters = this.holdWaiters;
-    this.holdWaiters = [];
+    const waiters = [...this.holdWaiters];
+    this.holdWaiters.clear();
     for (const wake of waiters) {
       wake();
     }
   }
 
+  /** hold が変わるか `timeoutMs` 経つまで待つ。タイムアウトしたら待ち手を外す。 */
   private waitForHoldChange(timeoutMs: number): Promise<void> {
     return new Promise(resolve => {
-      const timer = setTimeout(done, timeoutMs);
-      const waiter = () => done();
-      function done() {
+      const waiter = () => {
         clearTimeout(timer);
+        this.holdWaiters.delete(waiter);
         resolve();
-      }
-      this.holdWaiters.push(waiter);
+      };
+      const timer = setTimeout(waiter, timeoutMs);
+      this.holdWaiters.add(waiter);
     });
   }
 
@@ -295,6 +366,21 @@ export class PlaybackWorker {
     await this.handleJob(parsed.job, requeue);
   }
 
+  /** 再生の lock を取り、鳴らしている間は延長し続ける。 */
+  private async withPlayLock<T>(body: () => Promise<T>): Promise<T> {
+    const owner = this.workerId;
+    await acquirePlayLock(this.command, owner);
+    const extender = setInterval(() => {
+      void extendPlayLock(this.command, owner).catch(() => undefined);
+    }, PLAY_LOCK_EXTEND_MS);
+    try {
+      return await body();
+    } finally {
+      clearInterval(extender);
+      await releasePlayLock(this.command, owner).catch(() => undefined);
+    }
+  }
+
   /** 2.4 までの列のジョブ（古い CLI・MCP の合成、`--play-audio` の合成済み MP3）。 */
   private async handleLegacy(payload: Record<string, unknown>, requeue: () => Promise<void>): Promise<void> {
     if (typeof payload._audioBase64 === 'string') {
@@ -305,16 +391,24 @@ export class PlaybackWorker {
       if (audio.length === 0) {
         return;
       }
-      const owner = this.workerId;
-      await acquirePlayLock(this.command, owner);
+      const ctx: JobContext = { id: undefined, reported: false, cancelled: false, kills: new Set() };
+      this.current = ctx;
       try {
-        const config = this.deps.loadConfig();
-        const playback = this.deps.backend.startVoice(finalGainDb(config.volumeOffsetDb));
-        playback.write(audio);
-        playback.end();
-        await this.raceHold(playback.done, () => playback.kill());
+        await this.withPlayLock(async () => {
+          if (this.held || !this.active) {
+            await requeue();
+            return;
+          }
+          // 表も当てる（鍵が無ければ表の補正は 0dB で、利用者の上乗せだけ）
+          const gainKey = typeof payload.gainKey === 'string' && payload.gainKey.length <= 300 ? payload.gainKey : undefined;
+          const playback = this.deps.backend.startVoice(this.gainFor(gainKey, 0));
+          ctx.kills.add(() => playback.kill());
+          playback.write(audio);
+          playback.end();
+          await this.raceHold(playback.done, () => playback.kill(), ctx);
+        });
       } finally {
-        await releasePlayLock(this.command, owner).catch(() => undefined);
+        this.current = undefined;
       }
       return;
     }
@@ -332,17 +426,27 @@ export class PlaybackWorker {
 
   private async handleJob(job: Job, requeue: () => Promise<void>): Promise<void> {
     const requestId = job.type === 'synth' && typeof job.params._requestId === 'string' ? job.params._requestId : undefined;
+    const ctx: JobContext = { id: job.id, reported: false, cancelled: false, kills: new Set() };
+    this.current = ctx;
     try {
-      const outcome = await this.process(job);
+      const outcome = await this.process(job, ctx);
       if (outcome === 'requeue') {
         await requeue();
         return;
       }
-      await this.setStatus(job.id, outcome.status, outcome.reason);
+      if (!ctx.reported) {
+        ctx.reported = true;
+        await this.setStatus(job.id, outcome.status, outcome.reason);
+      }
       this.log('job finished', { id: job.id, type: job.type, ...outcome });
     } catch (error) {
       console.error('Job error:', summarizeError(error));
-      await this.setStatus(job.id, 'failed', 'internal-error');
+      if (!ctx.reported) {
+        ctx.reported = true;
+        await this.setStatus(job.id, 'failed', 'internal-error');
+      }
+    } finally {
+      this.current = undefined;
     }
     if (job.type !== 'sound') {
       await this.command.del(audioStreamKey(job.id)).catch(() => undefined);
@@ -362,14 +466,14 @@ export class PlaybackWorker {
     }
   }
 
-  private async process(job: Job): Promise<Outcome | 'requeue'> {
-    const handlingStartedAt = this.now();
+  private async process(job: Job, ctx: JobContext): Promise<Outcome | 'requeue'> {
+    const dequeuedAt = this.now();
     // ミュート中は着信音も鳴らさない（Q206 B）。合成もしない
     if (await isMuted(this.command)) {
       return { status: 'muted' };
     }
-    const heldMs = await this.heldMsSince(job.enqueuedAt, handlingStartedAt);
-    if (isJobExpired(job, handlingStartedAt, heldMs)) {
+    const heldMs = await this.heldMsSince(job.enqueuedAt, dequeuedAt);
+    if (isJobExpired(job, dequeuedAt, heldMs)) {
       return { status: 'skipped', reason: 'expired' };
     }
     if (job.type === 'stream' && (await this.command.exists(audioStreamKey(job.id))) === 0) {
@@ -377,55 +481,76 @@ export class PlaybackWorker {
       return { status: 'skipped', reason: 'stream-missing' };
     }
 
-    const owner = this.workerId;
-    await acquirePlayLock(this.command, owner);
-    const extender = setInterval(() => {
-      void extendPlayLock(this.command, owner).catch(() => undefined);
-    }, PLAY_LOCK_EXTEND_MS);
-    try {
+    return this.withPlayLock(async () => {
       if (this.held || !this.active) {
         // lock を待つ間に hold が掛かった・lock を失った。列の先頭へ戻す
-        return 'requeue';
+        return 'requeue' as const;
       }
+      // 打ち切りの時計は、再生の lock を取った後から数える（lock の待ちを含めない）
+      const handlingStartedAt = this.now();
       await this.setStatus(job.id, 'playing');
       if (job.type === 'sound') {
-        return await this.playSound(job, handlingStartedAt, heldMs);
+        return this.playSound(job, ctx, heldMs);
       }
       if (job.type === 'stream') {
-        return await this.playStreamJob(job, handlingStartedAt, heldMs);
+        return this.playStreamJob(job, ctx, handlingStartedAt, heldMs);
       }
-      return await this.playSynthJob(job, handlingStartedAt, heldMs);
-    } finally {
-      clearInterval(extender);
-      await releasePlayLock(this.command, owner).catch(() => undefined);
-    }
+      return this.playSynthJob(job, ctx, heldMs);
+    });
   }
 
-  /** 着信音を鳴らす（待ちすぎていれば飛ばす）。鳴らしたら true。 */
-  private async playPrelude(job: Job, prelude: PreludeSpec | undefined, heldMs: number): Promise<'played' | 'skipped' | 'held'> {
-    if (prelude === undefined) {
-      return 'skipped';
-    }
-    if (!shouldPlayPrelude(job, this.now(), heldMs)) {
-      this.log('prelude skipped (waited too long)', { id: job.id });
-      return 'skipped';
-    }
-    const file = checkPreludeFile(prelude.path);
-    if (!file.ok) {
-      this.log('prelude rejected', { id: job.id, reason: file.reason });
-      return 'skipped';
-    }
-    const playback = this.deps.backend.playPrelude(file.path, file.format, prelude.volume);
-    const result = await this.raceHold(playback.done, () => playback.kill());
-    return result === HOLD_INTERRUPTED ? 'held' : 'played';
+  /** 許可フォルダ（`--ingest` が置いたもの）の中の着信音か確かめる。 */
+  private async checkPrelude(prelude: PreludeSpec): Promise<{ ok: true; path: string; format: string } | { ok: false; reason: string }> {
+    const dirs = await this.command.sMembers(PRELUDE_DIRS_KEY).catch(() => [] as string[]);
+    return validatePreludePath(prelude.path, dirs);
   }
 
-  private async playSound(job: SoundJob, _handlingStartedAt: number, heldMs: number): Promise<Outcome> {
-    const result = await this.playPrelude(job, job.prelude, heldMs);
-    if (result === 'held') {
-      return { status: 'held' };
+  /** 着信音を鳴らし始める。待ちすぎ・検査で弾いた・プレイヤーが無いときは鳴らさない。 */
+  private startPrelude(job: Job, prelude: PreludeSpec, heldMs: number, ctx: JobContext): PreludeHandle {
+    let killPlayback: (() => void) | undefined;
+    let killed = false;
+    const kill = () => {
+      killed = true;
+      killPlayback?.();
+    };
+    ctx.kills.add(kill);
+    const result = (async (): Promise<PreludeResult> => {
+      if (!shouldPlayPrelude(job, this.now(), heldMs)) {
+        this.log('prelude skipped (waited too long)', { id: job.id });
+        return 'stale';
+      }
+      const file = await this.checkPrelude(prelude);
+      if (!file.ok) {
+        this.log('prelude rejected', { id: job.id, reason: file.reason });
+        return `rejected:${file.reason}`;
+      }
+      if (this.deps.backend.kind === 'none') {
+        return 'no-player';
+      }
+      if (killed) {
+        return 'cancelled';
+      }
+      const playback = this.deps.backend.playPrelude(file.path, file.format, prelude.volume);
+      killPlayback = () => playback.kill();
+      const raced = await this.raceHold(playback.done, () => playback.kill(), ctx);
+      if (raced === HOLD_INTERRUPTED) {
+        return 'held';
+      }
+      return raced === CANCELLED || killed ? 'cancelled' : 'played';
+    })().finally(() => ctx.kills.delete(kill));
+    return { result, kill };
+  }
+
+  private async playSound(job: SoundJob, ctx: JobContext, heldMs: number): Promise<Outcome> {
+    const result = await this.startPrelude(job, job.prelude, heldMs, ctx).result;
+    switch (result) {
+      case 'played': return { status: 'done' };
+      case 'held': return { status: 'held' };
+      case 'stale': return { status: 'skipped', reason: 'prelude-stale' };
+      case 'no-player': return { status: 'failed', reason: 'no-player' };
+      case 'cancelled': return { status: 'failed', reason: 'worker-stopped' };
+      default: return { status: 'failed', reason: `prelude-${result.slice('rejected:'.length)}` };
     }
-    return result === 'played' ? { status: 'done' } : { status: 'skipped', reason: 'prelude-stale' };
   }
 
   private gainFor(gainKey: string | undefined, extraDb: number): number {
@@ -435,9 +560,10 @@ export class PlaybackWorker {
     return finalGainDb(resolveGainDb(gainKey, learned), extraDb, config.volumeOffsetDb, providerOffset);
   }
 
-  private async playStreamJob(job: StreamJob, handlingStartedAt: number, heldMs: number): Promise<Outcome> {
+  private async playStreamJob(job: StreamJob, ctx: JobContext, handlingStartedAt: number, heldMs: number): Promise<Outcome> {
     return this.playFromStream({
       job,
+      ctx,
       streamKey: audioStreamKey(job.id),
       gainKey: job.gainKey,
       extraGainDb: job.volumeDb ?? 0,
@@ -452,7 +578,7 @@ export class PlaybackWorker {
    * この機械のエージェントの声。合成しながら Stream に流し、同じ Stream から鳴らす。
    * Para Code から起動されていれば、同じ音声を Para Code へも送る（取込の発話は送り返さない）。
    */
-  private async playSynthJob(job: SynthJob, _dequeuedAt: number, heldMs: number): Promise<Outcome> {
+  private async playSynthJob(job: SynthJob, ctx: JobContext, heldMs: number): Promise<Outcome> {
     const config = this.deps.loadConfig();
     const params = job.params;
     const setupError = synthesisSetupError(config, params);
@@ -461,7 +587,7 @@ export class PlaybackWorker {
       return { status: 'failed', reason: 'not-configured' };
     }
     if (typeof params.wait_ms === 'number' && params.wait_ms > 0) {
-      await new Promise(resolve => setTimeout(resolve, Math.min(params.wait_ms as number, 60000)));
+      await delay(Math.min(params.wait_ms as number, 60000));
     }
     // 最初の音・1 発話の上限は、待ち（wait_ms）の後から数える
     const handlingStartedAt = this.now();
@@ -479,18 +605,25 @@ export class PlaybackWorker {
 
     let overflow = false;
     let synthesisFailed = false;
+    let source: NodeJS.ReadableStream | undefined;
+    let finished = false;
     const synthesis = (async () => {
-      let stream: NodeJS.ReadableStream;
       try {
-        stream = await this.deps.synthesize(config, params);
+        source = await this.deps.synthesize(config, params);
       } catch (error) {
         synthesisFailed = true;
+        finished = true;
         console.error('Error in synthesize:', summarizeError(error));
         await writer.abort('synthesis-failed');
         forward?.abort();
         return;
       }
+      const stream = source;
       await new Promise<void>(resolve => {
+        const done = () => {
+          finished = true;
+          resolve();
+        };
         stream.on('data', (value: Buffer | string) => {
           const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
           if (!writer.write(chunk)) {
@@ -504,34 +637,57 @@ export class PlaybackWorker {
         stream.once('end', () => {
           void writer.end();
           forward?.end();
-          resolve();
+          done();
         });
         stream.once('error', (error: unknown) => {
           synthesisFailed = true;
           console.error('Stream error:', summarizeError(error));
           void writer.abort('synthesis-failed');
           forward?.abort();
-          resolve();
+          done();
+        });
+        // destroy された・相手が切った（end も error も来ない）ときも待ちを終える
+        stream.once('close', () => {
+          if (!finished) {
+            void writer.abort('synthesis-closed');
+            forward?.abort();
+          }
+          done();
         });
       });
     })();
+    /** 合成をやめる（流れを閉じる）。 */
+    const stopSynthesis = () => {
+      const stream = source as (NodeJS.ReadableStream & { destroy?: (error?: Error) => void }) | undefined;
+      if (!finished && stream && typeof stream.destroy === 'function') {
+        stream.destroy();
+      }
+    };
+    ctx.kills.add(stopSynthesis);
 
+    let keepSynthesizing = false;
     try {
       if (forward !== undefined && isParaCodeVoiceTarget(target) && target.localPlayback === true) {
         // SSH 先から発話し、Para Code が手元の PC で鳴らす。引き受けたと分かったら、この機械では鳴らさない
         const decision = await forward.decision;
         if (decision === 'remote') {
-          await synthesis;
+          keepSynthesizing = true;
+          if (!(await settleWithin(synthesis, SYNTHESIS_FORWARD_MS))) {
+            stopSynthesis();
+          }
           return { status: 'done', reason: 'played-by-para-code' };
         }
-        await synthesis;
+        if (!(await settleWithin(synthesis, SYNTHESIS_FORWARD_MS))) {
+          stopSynthesis();
+          return { status: 'failed', reason: 'synthesis-timeout' };
+        }
         if (overflow) {
           // 大きすぎて Stream に収まらなかった。読み捨てた分は戻らないので、合成し直して鳴らす
           console.error('Para Code へ音声を渡せなかったので、この機械で鳴らします');
           // 合成を作り直すジョブには着信音を付けない
           const retry: SynthJob = { ...job, id: uuidv4(), prelude: undefined, params: { ...params, wait_ms: undefined, _paraCodeVoiceTarget: undefined } };
           try {
-            return await this.playSynthJob(retry, this.now(), 0);
+            return await this.playSynthJob(retry, ctx, 0);
           } finally {
             await this.command.del(audioStreamKey(retry.id)).catch(() => undefined);
           }
@@ -539,6 +695,7 @@ export class PlaybackWorker {
       }
       const outcome = await this.playFromStream({
         job,
+        ctx,
         streamKey: writer.key,
         gainKey,
         extraGainDb: job.volumeDb ?? 0,
@@ -552,30 +709,38 @@ export class PlaybackWorker {
       }
       return outcome;
     } finally {
-      await synthesis;
-      await writer.settled().catch(() => undefined);
+      ctx.kills.delete(stopSynthesis);
+      if (!keepSynthesizing && !finished) {
+        // 先に返った（止めた・hold・打ち切り）。合成はもう要らない
+        stopSynthesis();
+      }
+      await settleWithin(synthesis, SYNTHESIS_SETTLE_MS);
+      await settleWithin(writer.settled(), SYNTHESIS_SETTLE_MS);
     }
   }
 
-  /** 鳴っている間に hold が掛かったら止める。 */
-  private async raceHold<T>(done: Promise<T>, stop: () => void): Promise<T | typeof HOLD_INTERRUPTED> {
+  /** 鳴っている間に hold が掛かる・止められたら止める。 */
+  private async raceHold<T>(done: Promise<T>, stop: () => void, ctx?: JobContext): Promise<T | typeof HOLD_INTERRUPTED | typeof CANCELLED> {
     let finished = false;
-    const watcher = (async (): Promise<typeof HOLD_INTERRUPTED | undefined> => {
+    const watcher = (async (): Promise<typeof HOLD_INTERRUPTED | typeof CANCELLED | undefined> => {
       while (!finished) {
+        if (ctx?.cancelled) {
+          stop();
+          return CANCELLED;
+        }
         if (this.held) {
           stop();
           return HOLD_INTERRUPTED;
         }
-        await this.waitForHoldChange(500);
+        await this.waitForHoldChange(250);
       }
       return undefined;
     })();
-    const result = await Promise.race([done.then(value => ({ value })), watcher.then(held => ({ held }))]);
+    const result = await Promise.race([done.then(value => ({ value })), watcher.then(stopped => ({ stopped }))]);
     finished = true;
-    this.wakeHoldWaiters();
-    if ('held' in result && result.held === HOLD_INTERRUPTED) {
+    if ('stopped' in result && result.stopped !== undefined) {
       await done.catch(() => undefined);
-      return HOLD_INTERRUPTED;
+      return result.stopped;
     }
     if ('value' in result) {
       return result.value;
@@ -585,9 +750,25 @@ export class PlaybackWorker {
 
   /**
    * Stream を読みながら 1 つのデコーダで鳴らす。着信音は合成の最初の音を待つ間に鳴らす。
+   * どこで返っても、鳴っている着信音は止めてから返る。
    */
   private async playFromStream(request: StreamPlayRequest): Promise<Outcome> {
-    const { job, streamKey } = request;
+    let prelude: PreludeHandle | undefined;
+    try {
+      if (request.prelude !== undefined) {
+        prelude = this.startPrelude(request.job, request.prelude, request.heldMs, request.ctx);
+      }
+      return await this.readAndPlay(request, prelude);
+    } finally {
+      if (prelude) {
+        prelude.kill();
+        await prelude.result.catch(() => undefined);
+      }
+    }
+  }
+
+  private async readAndPlay(request: StreamPlayRequest, prelude: PreludeHandle | undefined): Promise<Outcome> {
+    const { streamKey, ctx } = request;
     const reader = new AudioStreamReader(this.reader, streamKey);
     const monitor = new PlaybackMonitor(request.handlingStartedAt);
     const received: Buffer[] = [];
@@ -602,153 +783,166 @@ export class PlaybackWorker {
     let playbackDone = false;
     let lastExistsCheck = this.now();
 
-    // 着信音は合成の最初の音を待つ間に鳴らす
-    const prelude: { state: 'playing' | 'finished' | 'held' } = { state: 'finished' };
-    if (request.prelude !== undefined) {
-      prelude.state = 'playing';
-      void this.playPrelude(job, request.prelude, request.heldMs).then(result => {
-        prelude.state = result === 'held' ? 'held' : 'finished';
-      });
-    }
+    const preludeState: { value: 'playing' | 'finished' | 'held' } = { value: prelude ? 'playing' : 'finished' };
+    void prelude?.result.then(result => {
+      preludeState.value = result === 'held' ? 'held' : 'finished';
+    });
 
     const stopPlayback = () => {
       playback?.kill();
     };
+    ctx.kills.add(stopPlayback);
+    const finishStopped = async (): Promise<void> => {
+      stopPlayback();
+      if (playback) {
+        await playback.done;
+      }
+    };
 
-    while (true) {
-      if (this.held) {
-        stopPlayback();
-        if (playback) {
-          await playback.done;
+    try {
+      while (true) {
+        if (ctx.cancelled) {
+          await finishStopped();
+          return { status: 'failed', reason: 'worker-stopped' };
         }
-        return { status: 'held' };
-      }
-      if (prelude.state === 'held') {
-        return { status: 'held' };
-      }
-
-      if (!ended && !aborted) {
-        const events = await reader.read(POLL_MS);
-        const now = this.now();
-        for (const event of events) {
-          if (event.kind === 'data') {
-            monitor.onAudio(now, event.data.length);
-            if (receivedBytes + event.data.length <= MAX_STREAM_BYTES) {
-              received.push(event.data);
-              receivedBytes += event.data.length;
-            }
-            if (playback) {
-              playback.write(event.data);
-            } else {
-              buffered.push(event.data);
-              bufferedBytes += event.data.length;
-            }
-          } else if (event.kind === 'end') {
-            ended = true;
-            monitor.onEnded();
-          } else {
-            aborted = true;
-            abortReason = event.reason;
-            monitor.onEnded();
-          }
-        }
-        if (events.length === 0 && now - lastExistsCheck >= 1000) {
-          lastExistsCheck = now;
-          if ((await this.command.exists(streamKey)) === 0) {
-            aborted = true;
-            abortReason = 'stream-expired';
-            monitor.onEnded();
-          }
-        }
-      } else {
-        await this.waitForHoldChange(POLL_MS);
-      }
-
-      if (bitrateKbps === undefined && bufferedBytes > 0 && !playback) {
-        const frame = findFirstFrame(Buffer.concat(buffered, bufferedBytes));
-        if (frame !== undefined) {
-          bitrateKbps = frame.bitrateKbps;
-          monitor.setBitrate(frame.bitrateKbps);
-        }
-      }
-
-      const cutoff = monitor.check(this.now());
-      if (cutoff === 'first-audio-timeout') {
-        return { status: 'failed', reason: cutoff };
-      }
-      if (cutoff === 'max-duration') {
-        stopPlayback();
-        if (playback) {
-          await playback.done;
-        }
-        return { status: 'failed', reason: cutoff };
-      }
-      if (cutoff === 'slow-arrival') {
-        // 届いた分は鳴らし切って終える
-        if (playback) {
-          playback.end();
-          const result = await this.raceHold(playback.done, stopPlayback);
-          return result === HOLD_INTERRUPTED ? { status: 'held' } : { status: 'done', reason: cutoff };
-        }
-        return { status: 'failed', reason: cutoff };
-      }
-
-      if (aborted && !playback) {
-        // 鳴り始める前の中断は捨てる
-        return { status: 'skipped', reason: abortReason ?? 'aborted' };
-      }
-
-      if (!playback && prelude.state === 'finished' && shouldStartPlayback({ bufferedBytes, bitrateKbps, ended })) {
-        playback = this.deps.backend.startVoice(this.gainFor(request.gainKey, request.extraGainDb));
-        void playback.done.then(() => { playbackDone = true; });
-        for (const chunk of buffered) {
-          playback.write(chunk);
-        }
-        buffered = [];
-        bufferedBytes = 0;
-      }
-
-      if (ended && !playback && bufferedBytes === 0) {
-        return { status: 'done', reason: 'empty' };
-      }
-
-      if ((ended || aborted) && playback) {
-        playback.end();
-        const deadline = request.handlingStartedAt + 120_000;
-        const timer = new Promise<'timeout'>(resolve => {
-          const handle = setTimeout(() => resolve('timeout'), Math.max(0, deadline - this.now()));
-          void playback!.done.then(() => clearTimeout(handle));
-        });
-        const result = await this.raceHold(Promise.race([playback.done.then(() => 'finished' as const), timer]), stopPlayback);
-        if (result === HOLD_INTERRUPTED) {
+        if (this.held || preludeState.value === 'held') {
+          await finishStopped();
           return { status: 'held' };
         }
-        if (result === 'timeout') {
-          stopPlayback();
-          await playback.done;
-          return { status: 'failed', reason: 'max-duration' };
-        }
-        const completed = ended && !aborted;
-        if (completed) {
-          this.scheduleLearning(request, Buffer.concat(received, receivedBytes), bitrateKbps);
-        }
-        return completed ? { status: 'done' } : { status: 'done', reason: abortReason ?? 'aborted' };
-      }
 
-      if (playback && playbackDone && !ended && !aborted) {
-        // デコーダが先に落ちた
-        return { status: 'failed', reason: 'player-exited' };
+        if (!ended && !aborted) {
+          const events = await reader.read(POLL_MS);
+          const now = this.now();
+          for (const event of events) {
+            if (event.kind === 'data') {
+              monitor.onAudio(now, event.data.length);
+              if (receivedBytes + event.data.length <= MAX_STREAM_BYTES) {
+                received.push(event.data);
+                receivedBytes += event.data.length;
+              }
+              if (playback) {
+                playback.write(event.data);
+              } else {
+                buffered.push(event.data);
+                bufferedBytes += event.data.length;
+              }
+            } else if (event.kind === 'end') {
+              ended = true;
+              monitor.onEnded();
+            } else {
+              aborted = true;
+              abortReason = event.reason;
+              monitor.onEnded();
+            }
+          }
+          if (events.length === 0 && now - lastExistsCheck >= 1000) {
+            lastExistsCheck = now;
+            if ((await this.command.exists(streamKey)) === 0) {
+              aborted = true;
+              abortReason = 'stream-expired';
+              monitor.onEnded();
+            }
+          }
+        } else {
+          await this.waitForHoldChange(POLL_MS);
+        }
+
+        if (bitrateKbps === undefined && bufferedBytes > 0 && !playback) {
+          const frame = findFirstFrame(Buffer.concat(buffered, bufferedBytes));
+          if (frame !== undefined) {
+            bitrateKbps = frame.bitrateKbps;
+            monitor.setBitrate(frame.bitrateKbps);
+          }
+        }
+
+        const cutoff = monitor.check(this.now());
+        if (cutoff === 'first-audio-timeout') {
+          return { status: 'failed', reason: cutoff };
+        }
+        if (cutoff === 'max-duration') {
+          await finishStopped();
+          return { status: 'failed', reason: cutoff };
+        }
+        if (cutoff === 'slow-arrival') {
+          // 届いた分は鳴らし切って終える
+          if (playback) {
+            playback.end();
+            const result = await this.raceHold(playback.done, stopPlayback, ctx);
+            if (result === HOLD_INTERRUPTED) {
+              return { status: 'held' };
+            }
+            if (result === CANCELLED) {
+              return { status: 'failed', reason: 'worker-stopped' };
+            }
+            return { status: 'done', reason: cutoff };
+          }
+          return { status: 'failed', reason: cutoff };
+        }
+
+        if (aborted && !playback) {
+          // 鳴り始める前の中断は捨てる
+          return { status: 'skipped', reason: abortReason ?? 'aborted' };
+        }
+
+        if (!playback && preludeState.value === 'finished' && shouldStartPlayback({ bufferedBytes, bitrateKbps, ended })) {
+          playback = this.deps.backend.startVoice(this.gainFor(request.gainKey, request.extraGainDb));
+          void playback.done.then(() => { playbackDone = true; });
+          for (const chunk of buffered) {
+            playback.write(chunk);
+          }
+          buffered = [];
+          bufferedBytes = 0;
+        }
+
+        if (ended && !playback && bufferedBytes === 0) {
+          return { status: 'done', reason: 'empty' };
+        }
+
+        if ((ended || aborted) && playback) {
+          playback.end();
+          const deadline = request.handlingStartedAt + MAX_UTTERANCE_MS;
+          const current = playback;
+          let timer: NodeJS.Timeout | undefined;
+          const timeout = new Promise<'timeout'>(resolve => {
+            timer = setTimeout(() => resolve('timeout'), Math.max(0, deadline - this.now()));
+          });
+          const result = await this.raceHold(Promise.race([current.done.then(() => 'finished' as const), timeout]), stopPlayback, ctx);
+          clearTimeout(timer);
+          if (result === HOLD_INTERRUPTED) {
+            return { status: 'held' };
+          }
+          if (result === CANCELLED) {
+            return { status: 'failed', reason: 'worker-stopped' };
+          }
+          if (result === 'timeout') {
+            await finishStopped();
+            return { status: 'failed', reason: 'max-duration' };
+          }
+          const completed = ended && !aborted;
+          if (completed) {
+            this.scheduleLearning(request, Buffer.concat(received, receivedBytes));
+          }
+          return completed ? { status: 'done' } : { status: 'done', reason: abortReason ?? 'aborted' };
+        }
+
+        if (playback && playbackDone && !ended && !aborted) {
+          // デコーダが先に落ちた
+          return { status: 'failed', reason: 'player-exited' };
+        }
       }
+    } finally {
+      ctx.kills.delete(stopPlayback);
     }
   }
 
   /** 鳴らし切った発話の、補正前の音声を測って表を覚え直す（鳴らした後に裏で）。 */
-  private scheduleLearning(request: StreamPlayRequest, audio: Buffer, bitrateKbps: number | undefined): void {
+  private scheduleLearning(request: StreamPlayRequest, audio: Buffer): void {
     const measure = this.deps.measure;
     if (measure === undefined || !this.deps.backend.canMeasure || request.gainKey === undefined) {
       return;
     }
-    const estimated = bitrateKbps === undefined ? undefined : durationForBytes(bitrateKbps, audio.length);
+    // 長さは Xing/VBRI ヘッダー、無ければ全フレームの合計で数える（可変ビットレートでも外さない）
+    const estimated = estimateMp3Duration(audio);
     if (!isLearnable({ tagged: request.tagged, durationSeconds: estimated, completed: true })) {
       return;
     }
@@ -764,9 +958,7 @@ export class PlaybackWorker {
       const learned = recordMeasurement(gainKey, result.integratedLufs, this.deps.gainFile);
       this.log('gain learned', { gainKey, lufs: result.integratedLufs, db: learned.db });
     })().catch(error => console.error('Gain learning error:', summarizeError(error)));
-    this.pendingMeasurements.push(task);
-    void task.finally(() => {
-      this.pendingMeasurements = this.pendingMeasurements.filter(pending => pending !== task);
-    });
+    this.pendingMeasurements.add(task);
+    void task.finally(() => this.pendingMeasurements.delete(task));
   }
 }

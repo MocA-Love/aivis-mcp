@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
@@ -16,10 +17,14 @@ function sleep(ms: number): Promise<void> {
 }
 
 export async function tryStartRedis(): Promise<void> {
-  const lockDir = path.join(process.cwd(), 'temp');
-  const lockPath = path.join(lockDir, 'redis-start.lock');
+  // 起動した場所（cwd）に temp/ を作らないよう、置き場は OS の一時フォルダにする
+  const lockPath = path.join(os.tmpdir(), 'aivis-mcp-redis-start.lock');
   try {
-    fs.mkdirSync(lockDir, { recursive: true });
+    // 前回のプロセスが消し損ねた古い lock は使わない
+    const stat = fs.statSync(lockPath, { throwIfNoEntry: false });
+    if (stat && Date.now() - stat.mtimeMs > 10_000) {
+      fs.rmSync(lockPath, { force: true });
+    }
     const fd = fs.openSync(lockPath, 'wx');
     fs.closeSync(fd);
   } catch {
@@ -30,6 +35,8 @@ export async function tryStartRedis(): Promise<void> {
       detached: true,
       stdio: 'ignore',
     });
+    // redis-server が無いと error が非同期に来る。受け手が無いとプロセスごと落ちる
+    child.on('error', error => console.error('Failed to start redis-server:', error.message));
     child.unref();
   } catch (error) {
     console.error('Failed to start redis-server:', error);

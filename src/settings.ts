@@ -2,10 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import * as readline from 'node:readline';
-import { migrateVolumeSettings } from './audio/gain-table.js';
+import { migrateVolumeSettings, writeFileAtomic } from './audio/gain-table.js';
 
-const CONFIG_DIR = path.join(os.homedir(), '.config', 'aivis-mcp');
-const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+/** 設定ファイル。`AIVIS_CONFIG_FILE` で差し替えられる（テスト用）。 */
+function configFile(): string {
+  return process.env.AIVIS_CONFIG_FILE || path.join(os.homedir(), '.config', 'aivis-mcp', 'config.json');
+}
 
 export type TtsProvider = 'aivis' | 'elevenlabs';
 
@@ -40,7 +42,7 @@ export interface UserSettings {
 
 export function loadSettings(): UserSettings {
   try {
-    const data = fs.readFileSync(CONFIG_FILE, 'utf-8');
+    const data = fs.readFileSync(configFile(), 'utf-8');
     return JSON.parse(data) as UserSettings;
   } catch {
     return {};
@@ -51,23 +53,29 @@ export function loadSettings(): UserSettings {
  * 設定を読み、2.4 の `elevenlabs.volumeDb` を 1 回だけ 2.5 の上乗せへ読み替える（移行済みの印を残す）。
  */
 export function loadSettingsWithMigration(): UserSettings {
-  const settings = loadSettings();
-  const migrated = migrateVolumeSettings(settings);
-  if (migrated.changed) {
-    try {
-      saveSettings(migrated.settings);
-    } catch {
-      // 書けなくても、今回の値は読み替えたものを使う
-    }
+  const migrated = migrateVolumeSettings(loadSettings());
+  if (!migrated.changed) {
+    return migrated.settings;
   }
-  return migrated.settings;
+  try {
+    // 書く直前に読み直し、ほかのプロセスが先に読み替えていたら（印があれば）書かない。
+    // 読み替えは 1 回だけで、ほかのプロセスが書いた別の項目も消さない
+    const fresh = migrateVolumeSettings(loadSettings());
+    if (fresh.changed) {
+      saveSettings(fresh.settings);
+    }
+    return fresh.settings;
+  } catch {
+    // 書けなくても、今回の値は読み替えたものを使う
+    return migrated.settings;
+  }
 }
 
 export function saveSettings(settings: UserSettings): void {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  // APIキーを含むので本人以外から読めないようにする。既存ファイルはmodeが効かないためchmodも行う。
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(settings, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
-  fs.chmodSync(CONFIG_FILE, 0o600);
+  // APIキーを含むので本人以外から読めないようにする。一時ファイルを 0600 で作ってから置き換える
+  // （書きかけのファイルを読ませない）
+  writeFileAtomic(configFile(), JSON.stringify(settings, null, 2) + '\n', 0o600);
+  fs.chmodSync(configFile(), 0o600);
 }
 
 /**
@@ -92,7 +100,7 @@ export function updateSettings(patch: Omit<UserSettings, 'elevenlabs'> & { eleve
 }
 
 export function getConfigPath(): string {
-  return CONFIG_FILE;
+  return configFile();
 }
 
 function ask(rl: readline.Interface, question: string, currentValue?: string): Promise<string> {
@@ -167,7 +175,7 @@ export async function runInit(): Promise<void> {
 
     saveSettings(settings);
     console.log('');
-    console.log(`設定を保存しました: ${CONFIG_FILE}`);
+    console.log(`設定を保存しました: ${configFile()}`);
   } finally {
     rl.close();
   }

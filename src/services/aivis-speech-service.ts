@@ -97,7 +97,7 @@ export class AivisSpeechService {
     });
     for (const signal of ['SIGTERM', 'SIGINT'] as const) {
       process.once(signal, () => {
-        void worker.releaseLockNow().finally(() => process.exit(0));
+        void worker.shutdown().finally(() => process.exit(0));
       });
     }
     const result = await worker.run();
