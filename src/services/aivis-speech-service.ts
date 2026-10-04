@@ -318,7 +318,7 @@ export class AivisSpeechService {
       const gainDb = provider === 'elevenlabs' ? config.elevenLabsVolumeDb : 0;
       await this.streamPlay(playbackStream, gainDb);
     } catch (error) {
-      console.error('Error in synthesizeAndPlay:', error);
+      console.error('Error in synthesizeAndPlay');
       if (provider === 'elevenlabs') {
         console.error(describeElevenLabsError(error));
       }
@@ -575,18 +575,20 @@ export class AivisSpeechService {
     });
   }
 
+  /**
+   * AxiosErrorをそのまま出すと config.headers や stream応答の req._header に
+   * APIキー（Authorization / xi-api-key）が平文で含まれるため、要約だけを出す。
+   */
   private logDetailedError(error: any): void {
     if (axios.isAxiosError(error)) {
-      if (error.response) {
-        console.error('Response error data:', error.response.data);
-        console.error('Response error status:', error.response.status);
-      } else if (error.request) {
-        console.error('No response received. Request:', error.request);
-      } else {
-        console.error('Error message:', error.message);
-      }
+      console.error('Request failed:', {
+        status: error.response?.status,
+        code: error.code,
+        message: error.message,
+      });
     } else {
       console.error('Non-Axios error:', error);
     }
   }
+
 }
