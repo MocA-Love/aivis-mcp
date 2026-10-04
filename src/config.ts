@@ -1,13 +1,18 @@
 import { parseArgs } from 'node:util';
 import { createRequire } from 'module';
-import { loadSettings } from './settings.js';
+import { loadSettings, isTtsProvider, type TtsProvider } from './settings.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
 
 export { version };
 
+export const DEFAULT_ELEVENLABS_MODEL_ID = 'eleven_v4_turbo';
+// 実測で ElevenLabs(eleven_v4_turbo) は -11.5 LUFS 前後、Aivis は -24 LUFS 前後だったので、その差を再生時に詰める
+export const DEFAULT_ELEVENLABS_VOLUME_DB = -13;
+
 export interface AppConfig {
+  provider: TtsProvider;
   apiKey: string;
   apiUrl: string;
   modelUuid: string;
@@ -21,6 +26,11 @@ export interface AppConfig {
   leadingSilenceSeconds?: number;
   trailingSilenceSeconds?: number;
   lineBreakSilenceSeconds?: number;
+  elevenLabsApiKey: string;
+  elevenLabsApiUrl: string;
+  elevenLabsVoiceId?: string;
+  elevenLabsModelId: string;
+  elevenLabsVolumeDb: number;
   redisUrl: string;
   debug: boolean;
   queueKey: string;
@@ -44,6 +54,10 @@ export const cliOptions = {
   unmute:                { type: 'boolean' as const, default: false },
   'mute-status':         { type: 'boolean' as const, default: false },
   worker:                { type: 'boolean' as const, default: false },
+  provider:              { type: 'string' as const },
+  'voice-id':            { type: 'string' as const },
+  'eleven-model':        { type: 'string' as const },
+  'elevenlabs-api-key':  { type: 'string' as const },
   'api-key':             { type: 'string' as const, short: 'k' },
   'api-url':             { type: 'string' as const },
   model:                 { type: 'string' as const, short: 'm' },
@@ -86,9 +100,23 @@ function optString(cliVal: string | boolean | undefined, envKey: string): string
   return undefined;
 }
 
+function resolveProvider(cliVal: string | boolean | undefined, settingsVal: TtsProvider | undefined): TtsProvider {
+  const candidate = optString(cliVal, 'TTS_PROVIDER');
+  if (candidate !== undefined) {
+    if (isTtsProvider(candidate)) return candidate;
+    console.error(`[aivis-mcp] 不明なプロバイダ "${candidate}" を無視します（aivis / elevenlabs）`);
+  }
+  return settingsVal ?? 'aivis';
+}
+
+/**
+ * 設定の解決順は CLI引数 > 環境変数 > ~/.config/aivis-mcp/config.json > デフォルト。
+ * config.json はMCPツールから書き換わるので、発話ごとに呼び直して最新値を使う。
+ */
 export function resolveConfig(values: Record<string, string | boolean | undefined>): AppConfig {
   const settings = loadSettings();
   return {
+    provider: resolveProvider(values.provider, settings.provider),
     apiKey:
       (typeof values['api-key'] === 'string' ? values['api-key'] : undefined)
       ?? process.env.AIVIS_API_KEY
@@ -114,6 +142,22 @@ export function resolveConfig(values: Record<string, string | boolean | undefine
     leadingSilenceSeconds: optNumber(values['leading-silence'], 'AIVIS_LEADING_SILENCE_SECONDS'),
     trailingSilenceSeconds: optNumber(values['trailing-silence'], 'AIVIS_TRAILING_SILENCE_SECONDS'),
     lineBreakSilenceSeconds: optNumber(values['line-break-silence'], 'AIVIS_LINE_BREAK_SILENCE_SECONDS'),
+    elevenLabsApiKey:
+      optString(values['elevenlabs-api-key'], 'ELEVENLABS_API_KEY')
+      ?? settings.elevenlabs?.apiKey
+      ?? '',
+    elevenLabsApiUrl: process.env.ELEVENLABS_API_URL ?? 'https://api.elevenlabs.io',
+    elevenLabsVoiceId:
+      optString(values['voice-id'], 'ELEVENLABS_VOICE_ID')
+      ?? settings.elevenlabs?.voiceId,
+    elevenLabsModelId:
+      optString(values['eleven-model'], 'ELEVENLABS_MODEL_ID')
+      ?? settings.elevenlabs?.modelId
+      ?? DEFAULT_ELEVENLABS_MODEL_ID,
+    elevenLabsVolumeDb:
+      optNumber(undefined, 'ELEVENLABS_VOLUME_DB')
+      ?? settings.elevenlabs?.volumeDb
+      ?? DEFAULT_ELEVENLABS_VOLUME_DB,
     redisUrl:
       (typeof values['redis-url'] === 'string' ? values['redis-url'] : undefined)
       ?? process.env.REDIS_URL
@@ -126,8 +170,13 @@ export function resolveConfig(values: Record<string, string | boolean | undefine
 }
 
 export function buildSynthesisParams(config: AppConfig, text: string, waitMs?: number): Record<string, unknown> {
+  // workerはRedis全体で1つだけで、要求元とは設定が異なりうる。
+  // プロバイダと声は要求元で確定させてjob payloadに載せる（APIキーはworker側の設定から読む）。
   const params: Record<string, unknown> = {
     text,
+    provider: config.provider,
+    voice_id: config.elevenLabsVoiceId,
+    model_id: config.elevenLabsModelId,
     model_uuid: config.modelUuid,
     style_id: config.styleId,
     style_name: config.styleName,

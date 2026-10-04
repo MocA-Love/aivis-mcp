@@ -40,6 +40,10 @@ function printHelp(): void {
   console.log('  --leading-silence <sec>            先頭無音（秒）');
   console.log('  --trailing-silence <sec>           末尾無音（秒）');
   console.log('  --line-break-silence <sec>         改行無音（秒）');
+  console.log('  --provider <aivis|elevenlabs>      音声合成サービス');
+  console.log('  --voice-id <id>                    ElevenLabs の voice_id');
+  console.log('  --eleven-model <id>                ElevenLabs の model_id');
+  console.log('  --elevenlabs-api-key <key>         ElevenLabs のAPIキー');
   console.log('  -d, --debug                        デバッグモード');
   console.log('');
   console.log('MCP設定例 (claude_desktop_config.json):');
@@ -112,7 +116,7 @@ async function main() {
 
   // --worker（内部用）
   if (values.worker || process.env.AIVIS_WORKER_MODE === '1') {
-    const speechService = new AivisSpeechService(config);
+    const speechService = new AivisSpeechService(config, () => resolveConfig(values));
     await speechService.runWorkerLoop();
     return;
   }
@@ -138,7 +142,7 @@ async function main() {
       console.error('[aivis-mcp] npx aivis-mcp --doctor を実行して環境を確認してください');
     }
 
-    const mcpService = new MCPService(config);
+    const mcpService = new MCPService(config, () => resolveConfig(values));
     await mcpService.start();
 
     process.on('SIGINT', () => {

@@ -11,20 +11,27 @@ import type { AppConfig } from '../config.js';
 import { tryStartRedis } from './redis-service.js';
 import { isMuted } from './mute-service.js';
 import { captureParaCodeVoiceTarget, isParaCodeVoiceTarget, type ParaCodeVoiceTarget } from './para-code-voice.js';
+import { describeElevenLabsError, synthesizeElevenLabsStream } from './elevenlabs-client.js';
 
 /**
  * Aivis Cloud APIとの通信を行うサービスクラス
  */
 export class AivisSpeechService {
   private config: AppConfig;
+  private loadConfig: () => AppConfig;
   private redisClient: RedisClientType;
   private redisWorkerClient: RedisClientType;
   private workerId: string;
   private workerHeartbeat?: NodeJS.Timeout;
   private workerActive: boolean;
 
-  constructor(config: AppConfig) {
+  /**
+   * @param loadConfig 発話ごとに最新の設定を返す関数。MCPツールで config.json が書き換わっても
+   *   常駐workerを再起動せずにAPIキー等を反映するために使う。
+   */
+  constructor(config: AppConfig, loadConfig?: () => AppConfig) {
     this.config = config;
+    this.loadConfig = loadConfig ?? (() => this.config);
     this.workerId = uuidv4();
     this.workerActive = false;
     this.redisClient = createClient({ url: config.redisUrl });
@@ -270,9 +277,16 @@ export class AivisSpeechService {
   }
 
   async synthesizeAndPlay(params: any): Promise<void> {
+    const config = this.loadConfig();
+    // provider未指定のjobは、この機能より前のバージョンがenqueueしたものなのでAivisとして扱う
+    const provider = params.provider === 'elevenlabs' ? 'elevenlabs' : 'aivis';
     try {
-      if (!this.config.apiKey) {
+      if (provider === 'aivis' && !config.apiKey) {
         console.error('APIキーが設定されていません');
+        return;
+      }
+      if (provider === 'elevenlabs' && !config.elevenLabsApiKey) {
+        console.error('ElevenLabs のAPIキーが設定されていません');
         return;
       }
 
@@ -281,57 +295,74 @@ export class AivisSpeechService {
         await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
       }
 
-      const requestParams = {
-        model_uuid: params.model_uuid || this.config.modelUuid,
-        text: '<break time="500ms"/>' + params.text,
-        output_format: 'mp3',
-        speaker_uuid: params.speaker_uuid,
-        style_id: params.style_id,
-        style_name: params.style_name,
-        speaking_rate: params.speaking_rate || params.speed_scale,
-        emotional_intensity: params.emotional_intensity,
-        tempo_dynamics: params.tempo_dynamics,
-        pitch: params.pitch || params.pitch_scale,
-        volume: params.volume || params.volume_scale,
-        leading_silence_seconds: params.leading_silence_seconds || params.pre_phoneme_length,
-        trailing_silence_seconds: params.trailing_silence_seconds || params.post_phoneme_length,
-        line_break_silence_seconds: params.line_break_silence_seconds
-      };
-
-      Object.keys(requestParams).forEach(key => {
-        if (requestParams[key as keyof typeof requestParams] === undefined) {
-          delete requestParams[key as keyof typeof requestParams];
-        }
-      });
-
-      const response = await axios.post(
-        `${this.config.apiUrl}/tts/synthesize`,
-        requestParams,
-        {
-          headers: {
-            'Authorization': `Bearer ${this.config.apiKey}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: 'stream',
-          timeout: 60000
-        }
-      );
+      const audioStream = provider === 'elevenlabs'
+        ? await synthesizeElevenLabsStream(config, {
+          text: params.text,
+          voice_id: params.voice_id,
+          model_id: params.model_id,
+          speaking_rate: params.speaking_rate,
+        })
+        : await this.synthesizeAivisStream(config, params);
 
       // モバイル転送の data listener が元streamを flowing modeへ移しても、PCプレイヤーの
       // 探索中に先頭チャンクを取りこぼさないよう、先に再生用PassThroughを接続する。
       // PassThroughが未消費の間はbackpressureでAxios streamを止め、streamPlay接続後に再開する。
       const playbackStream = new PassThrough();
-      response.data.pipe(playbackStream);
-      response.data.once('error', (error: unknown) => {
+      audioStream.pipe(playbackStream);
+      audioStream.once('error', (error: unknown) => {
         console.error('Stream error:', error);
         playbackStream.end();
       });
-      this.forwardStreamToParaCode(response.data, params._paraCodeVoiceTarget);
-      await this.streamPlay(playbackStream);
+      this.forwardStreamToParaCode(audioStream, params._paraCodeVoiceTarget);
+      // ElevenLabs は Aivis より 17dB ほど大きく出力されるため、再生時に下げて揃える
+      const gainDb = provider === 'elevenlabs' ? config.elevenLabsVolumeDb : 0;
+      await this.streamPlay(playbackStream, gainDb);
     } catch (error) {
       console.error('Error in synthesizeAndPlay:', error);
+      if (provider === 'elevenlabs') {
+        console.error(describeElevenLabsError(error));
+      }
       this.logDetailedError(error);
     }
+  }
+
+  private async synthesizeAivisStream(config: AppConfig, params: any): Promise<NodeJS.ReadableStream> {
+    const requestParams = {
+      model_uuid: params.model_uuid || config.modelUuid,
+      text: '<break time="500ms"/>' + params.text,
+      output_format: 'mp3',
+      speaker_uuid: params.speaker_uuid,
+      style_id: params.style_id,
+      style_name: params.style_name,
+      speaking_rate: params.speaking_rate || params.speed_scale,
+      emotional_intensity: params.emotional_intensity,
+      tempo_dynamics: params.tempo_dynamics,
+      pitch: params.pitch || params.pitch_scale,
+      volume: params.volume || params.volume_scale,
+      leading_silence_seconds: params.leading_silence_seconds || params.pre_phoneme_length,
+      trailing_silence_seconds: params.trailing_silence_seconds || params.post_phoneme_length,
+      line_break_silence_seconds: params.line_break_silence_seconds
+    };
+
+    Object.keys(requestParams).forEach(key => {
+      if (requestParams[key as keyof typeof requestParams] === undefined) {
+        delete requestParams[key as keyof typeof requestParams];
+      }
+    });
+
+    const response = await axios.post(
+      `${config.apiUrl}/tts/synthesize`,
+      requestParams,
+      {
+        headers: {
+          'Authorization': `Bearer ${config.apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'stream',
+        timeout: 60000
+      }
+    );
+    return response.data;
   }
 
   /**
@@ -434,7 +465,7 @@ export class AivisSpeechService {
     });
   }
 
-  private async streamPlay(stream: any): Promise<void> {
+  private async streamPlay(stream: any, gainDb = 0): Promise<void> {
     const system = platform();
 
     let players: string[] = [];
@@ -483,7 +514,8 @@ export class AivisSpeechService {
 
       if (system === 'darwin') {
         await new Promise<void>((resolve, reject) => {
-          const proc = spawn('afplay', [audioFilePath], { stdio: 'ignore' });
+          const afplayArgs = gainDb === 0 ? [audioFilePath] : ['-v', String(10 ** (gainDb / 20)), audioFilePath];
+          const proc = spawn('afplay', afplayArgs, { stdio: 'ignore' });
           proc.on('error', reject);
           proc.on('close', () => resolve());
         });
@@ -506,6 +538,7 @@ export class AivisSpeechService {
         '-f', 'mp3',
         '-nodisp', '-autoexit', '-loglevel', 'quiet',
         '-volume', '100',
+        ...(gainDb === 0 ? [] : ['-af', `volume=${gainDb}dB`]),
         '-i', '-'
       ];
     } else if (playerCmd === 'mpv' || playerCmd === 'mpv.exe') {
@@ -513,7 +546,9 @@ export class AivisSpeechService {
         '--no-video', '--really-quiet',
         '--demuxer-lavf-o=fflags=+nobuffer',
         '--audio-buffer=1', '--cache=yes', '--cache-secs=1',
-        '--demuxer-readahead-secs=1', '-'
+        '--demuxer-readahead-secs=1',
+        ...(gainDb === 0 ? [] : [`--af=lavfi=[volume=${gainDb}dB]`]),
+        '-'
       ];
     } else {
       cmd = ['-'];

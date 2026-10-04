@@ -16,12 +16,14 @@ https://github.com/user-attachments/assets/c42722bd-8f2f-4543-bdc6-71668db3751d
   Redisキューで順番に再生し、複数プロセス/複数同時呼び出しでも音声の重なりを防止
 - **npxで即実行**: インストール不要、`npx aivis-mcp` ですぐ使える
 - **環境変数は最小限**: 必須はAPIキーのみ、その他はCLI引数で設定可能
+- **ElevenLabs にも対応**: LLM に頼むだけで Aivis と ElevenLabs を切り替えられる
 
 ## 必要条件
 
 - Node.js 18.x以上
 - Aivis Cloud
-  APIキー（[Aivis Hub](https://hub.aivis-project.com/cloud-api/api-keys)から取得）
+  APIキー（[Aivis Hub](https://hub.aivis-project.com/cloud-api/api-keys)から取得）、または
+  ElevenLabs APIキー（[ElevenLabs](https://elevenlabs.io/app/settings/api-keys)から取得）
 - 音声プレイヤー（ffplay推奨、mpv、afplayも対応）
 - Redis（ローカルで起動）
 
@@ -100,6 +102,35 @@ codex mcp add aivis -- npx -y aivis-mcp
 
 </details>
 
+## ElevenLabs を使う
+
+MCPを登録したら、LLM に次のように伝えるだけで切り替わります。設定は `~/.config/aivis-mcp/config.json` に保存され、再起動は不要です。
+
+```text
+ElevenLabs を使いたい。APIキーは sk_xxx、声は（voice_id）で
+```
+
+LLM は次のMCPツールを使って設定します。
+
+| ツール | 役割 |
+|---|---|
+| `tts-get-settings` | 現在のサービス、声、モデルを表示（APIキーは伏せ字） |
+| `tts-configure` | サービス、APIキー、声、モデル、音量補正を変更して保存。無効なAPIキーや存在しないモデルは保存しない |
+| `tts-list-voices` | 声の候補を検索（ElevenLabs はアカウントのボイスライブラリ、Aivis は公開モデル） |
+| `elevenlabs-list-models` | ElevenLabs の日本語対応モデル一覧 |
+
+`aivis-speech` に `provider` / `voice_id` / `model_id` を渡すと、その発話だけ別のサービスや声で話せます。
+
+| 項目 | デフォルト | 補足 |
+|---|---|---|
+| モデル | `eleven_v4_turbo` | `elevenlabs-list-models` で他のモデルを確認できる |
+| 音量補正 | `-13` dB | ElevenLabs は Aivis より大きく出力されるため、再生時に下げている。PC再生のみに適用 |
+| SSML | 使わない | ElevenLabs に送る前に `<...>` 形式のタグを取り除く |
+
+> [!WARNING]
+> チャットに書いたAPIキーは会話ログに残ります。気になる場合は `npx aivis-mcp --init` か環境変数 `ELEVENLABS_API_KEY` で設定してください。
+> APIキーに Voices の読み取り権限がない場合、`tts-list-voices` は使えません。ElevenLabs の画面で voice_id を調べて直接伝えてください。
+
 ## CLI引数
 
 MCPサーバー起動時やCLIコマンドで使用できるオプション：
@@ -119,12 +150,17 @@ MCPサーバー起動時やCLIコマンドで使用できるオプション：
 | `--trailing-silence` | | 末尾無音（秒） | - |
 | `--line-break-silence` | | 改行無音（秒） | - |
 | `--api-url` | | APIエンドポイント | `https://api.aivis-project.com/v1` |
+| `--provider` | | 音声合成サービス（`aivis` / `elevenlabs`）。環境変数は `TTS_PROVIDER` | `aivis` |
+| `--elevenlabs-api-key` | | ElevenLabs のAPIキー。環境変数は `ELEVENLABS_API_KEY` | - |
+| `--voice-id` | | ElevenLabs の voice_id。環境変数は `ELEVENLABS_VOICE_ID` | - |
+| `--eleven-model` | | ElevenLabs の model_id。環境変数は `ELEVENLABS_MODEL_ID` | `eleven_v4_turbo` |
 | `--redis-url` | | Redis接続先 | `redis://127.0.0.1:6379` |
 | `--debug` | `-d` | デバッグモード | off |
 
 > [!NOTE]
 > すべてのCLI引数は環境変数でも設定可能です（例: `--rate` → `AIVIS_SPEAKING_RATE`）。
-> CLI引数 > 環境変数 > デフォルト値 の優先順位で適用されます。
+> CLI引数 > 環境変数 > `config.json` > デフォルト値 の優先順位で適用されます。
+> ElevenLabs の音量補正は環境変数 `ELEVENLABS_VOLUME_DB` でも指定できます。
 
 ## CLIコマンド
 
