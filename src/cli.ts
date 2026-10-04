@@ -3,7 +3,7 @@
 import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './config.js';
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { captureParaCodeVoiceTarget } from './services/para-code-voice.js';
-import { runHealth, runReboot, runMute, runUnmute, runMuteStatus } from './commands.js';
+import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio } from './commands.js';
 import { runDoctor } from './doctor.js';
 import { runInit } from './settings.js';
 
@@ -37,6 +37,7 @@ function printHelp(): void {
   console.log('  aivis --mute --mute-for 30m       30分間ミュート');
   console.log('  aivis --unmute                    ミュート解除');
   console.log('  aivis --mute-status               ミュート状態を確認');
+  console.log('  aivis --play-audio                標準入力のMP3をキューに積んで再生');
   console.log('  aivis --init                      初期設定（APIキー等を保存）');
   console.log('  aivis --doctor                    依存ツール診断');
   console.log('  aivis --version                   バージョン表示');
@@ -74,7 +75,7 @@ async function main() {
   }
 
   if (values.help || (positionals.length === 0 && !values.health && !values.reboot && !values.doctor
-    && !values.mute && !values.unmute && !values['mute-status'])) {
+    && !values.mute && !values.unmute && !values['mute-status'] && !values['play-audio'])) {
     printHelp();
     process.exit(0);
   }
@@ -101,6 +102,11 @@ async function main() {
 
   if (values.unmute) {
     await runUnmute(config);
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+  }
+
+  if (values['play-audio']) {
+    await runPlayAudio(config);
     process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
 

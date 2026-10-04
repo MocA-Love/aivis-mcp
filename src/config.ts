@@ -54,6 +54,7 @@ export const cliOptions = {
   unmute:                { type: 'boolean' as const, default: false },
   'mute-status':         { type: 'boolean' as const, default: false },
   worker:                { type: 'boolean' as const, default: false },
+  'play-audio':          { type: 'boolean' as const, default: false },
   provider:              { type: 'string' as const },
   'voice-id':            { type: 'string' as const },
   'eleven-model':        { type: 'string' as const },

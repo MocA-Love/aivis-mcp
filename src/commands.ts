@@ -1,8 +1,8 @@
 import { spawn, execSync } from 'child_process';
 import { platform } from 'os';
 import { createClient, type RedisClientType } from 'redis';
-import type { AppConfig } from './config.js';
-import { connectRedis, spawnWorker } from './services/redis-service.js';
+import { version, type AppConfig } from './config.js';
+import { connectRedis, ensureWorkerRunning, spawnWorker, WORKER_VERSION_KEY } from './services/redis-service.js';
 import { parseMuteDuration, setMute, clearMute, getMuteStatus } from './services/mute-service.js';
 
 function sleep(ms: number): Promise<void> {
@@ -229,5 +229,65 @@ export async function runMuteStatus(config: AppConfig): Promise<void> {
     console.error(`Error: Redisに接続できません (${config.redisUrl})`);
     process.exitCode = 1;
     if (client) await client.disconnect().catch(() => {});
+  }
+}
+
+/** 合成済みMP3のjob（`_audioBase64`）を読めるworkerの版か（2.4.0 以上）。 */
+function supportsAudioJobs(workerVersion: string): boolean {
+  const parts = workerVersion.split('.').map(part => parseInt(part, 10));
+  if (parts.length < 3 || parts.some(part => Number.isNaN(part))) {
+    return false;
+  }
+  const [major, minor] = parts;
+  return major > 2 || (major === 2 && minor >= 4);
+}
+
+/** `--play-audio` で受け取るMP3の上限（Para Code の音声取込と同じ 8MB）。 */
+const MAX_PLAY_AUDIO_BYTES = 8 * 1024 * 1024;
+
+/**
+ * 標準入力の合成済みMP3を、ほかの発話と同じキューに積んで鳴らす（Para Code が SSH 先の発話を手元で
+ * 鳴らすための口）。積めたら終了コード 0、入力が空・大きすぎるときは 2。ミュートはworkerが見る。
+ */
+export async function runPlayAudio(config: AppConfig): Promise<void> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const value of process.stdin) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    total += chunk.byteLength;
+    if (total > MAX_PLAY_AUDIO_BYTES) {
+      console.error('Error: 音声が大きすぎます');
+      process.exitCode = 2;
+      return;
+    }
+    chunks.push(chunk);
+  }
+  if (total === 0) {
+    console.error('Error: 標準入力に音声がありません');
+    process.exitCode = 2;
+    return;
+  }
+  const client = await connectRedis(config.redisUrl);
+  try {
+    await ensureWorkerRunning(client, config);
+    // 起こしたばかりのworkerが版を書くまで少し待つ
+    let workerVersion: string | null = null;
+    for (let i = 0; i < 10 && workerVersion === null; i++) {
+      workerVersion = await client.get(WORKER_VERSION_KEY);
+      if (workerVersion === null) {
+        await sleep(100);
+      }
+    }
+    if (workerVersion === null || !supportsAudioJobs(workerVersion)) {
+      // 古いworkerは合成済みMP3のjobを読めない。積まずに失敗を返す（Para Code は接続先で鳴らさせる）
+      console.error(`Error: 動いているworkerが 2.4.0 より古いか、版が分かりません（${workerVersion ?? '不明'}）。aivis-mcp --reboot で起動し直してください`);
+      process.exitCode = 3;
+      return;
+    }
+    await client.rPush(config.queueKey, JSON.stringify({ _audioBase64: Buffer.concat(chunks, total).toString('base64') }));
+    // 積めた印。呼び出し側は終了コードではなくこれで判断する（この後に止められても積んだ事実は変わらない）
+    process.stdout.write('queued\n');
+  } finally {
+    await client.disconnect().catch(() => undefined);
   }
 }
