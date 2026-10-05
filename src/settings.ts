@@ -33,6 +33,16 @@ export interface ElevenLabsSettings {
   pronunciationDictionaryId?: string;
   /** 発音辞書の版（無ければ最新の版を使う） */
   pronunciationDictionaryVersionId?: string;
+  /** 声（voice_id）ごとの調整。無いキーは送らない（ElevenLabs に保存した値を使う） */
+  voiceSettings?: Record<string, ElevenLabsVoiceSetting>;
+}
+
+/** ElevenLabs の声ごとの調整（どちらも 0〜1） */
+export interface ElevenLabsVoiceSetting {
+  /** voice_settings.stability（v3 系は 0 / 0.5 / 1 の最寄りに丸めて送る） */
+  stability?: number;
+  /** voice_settings.similarity_boost */
+  similarityBoost?: number;
 }
 
 /** Aivis だけに効く設定（APIキーとモデルは互換のため最上位に置いたまま） */
@@ -129,7 +139,7 @@ function mergeNested<T extends object>(current: T | undefined, patch: NestedPatc
 }
 
 /** 読んだ設定に変更を重ねたもの（書かない）。 */
-function applySettingsPatch(current: UserSettings, patch: SettingsPatch): UserSettings {
+export function applySettingsPatch(current: UserSettings, patch: SettingsPatch): UserSettings {
   const next: UserSettings = { ...current };
   for (const [key, value] of Object.entries(patch)) {
     if (key === 'elevenlabs' || key === 'aivis' || value === undefined) continue;
@@ -185,8 +195,16 @@ export class SettingsLockError extends Error {}
  * 同時に書いても互いの変更を消さないように。音量の表と同じ方式）。
  */
 export async function updateSettings(patch: SettingsPatch): Promise<UserSettings> {
+  return modifySettings(current => applySettingsPatch(current, patch));
+}
+
+/**
+ * `config.json.lock` を持ったまま設定を読み、`modify` が返したものを書き戻す（読んだ値を見て決める変更向け）。
+ * 壊れた config.json は書かずに投げる（{@link updateSettings} と同じ）。
+ */
+export async function modifySettings(modify: (current: UserSettings) => UserSettings): Promise<UserSettings> {
   return withFileLock(configFile(), () => {
-    const next = applySettingsPatch(loadSettingsForUpdate(), patch);
+    const next = modify(loadSettingsForUpdate());
     saveSettings(next);
     return next;
   }, { lockError: lockPath => new SettingsLockError(`設定ファイルのロック（${lockPath}）が空きません。ほかのプロセスが書いています`) });

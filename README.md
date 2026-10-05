@@ -115,8 +115,8 @@ LLM は次のMCPツールを使って設定します。
 
 | ツール | 役割 |
 |---|---|
-| `tts-get-settings` | 現在のサービス、声、モデル、音量の覚え直し方（窓と最短秒数）、前の発話の文脈、辞書を表示（APIキーは伏せ字） |
-| `tts-configure` | サービス、APIキー、声、モデル、音量補正、文脈を付ける時間、辞書を変更して保存。無効なAPIキーや存在しないモデル・辞書は保存しない |
+| `tts-get-settings` | 現在のサービス、声、モデル、音量の覚え直し方（窓と最短秒数）、前の発話の文脈、辞書、声ごとの調整を表示（APIキーは伏せ字） |
+| `tts-configure` | サービス、APIキー、声、モデル、音量補正、文脈を付ける時間、辞書、声ごとの調整を変更して保存。無効なAPIキーや存在しないモデル・辞書は保存しない |
 | `tts-list-voices` | 声の候補を検索（ElevenLabs はアカウントのボイスライブラリ、Aivis は公開モデル） |
 | `tts-list-dictionaries` | ElevenLabs の発音辞書（アーカイブ済みは除く）と Aivis のユーザー辞書の一覧 |
 | `elevenlabs-list-models` | ElevenLabs の日本語対応モデル一覧 |
@@ -182,6 +182,36 @@ aivis-mcp --clear-dictionary --provider aivis
 - ElevenLabs で別の辞書を設定すると、前の辞書の版は消す（`--version-id` を省けば最新の版を使う）。`--version-id` は ElevenLabs だけ
 - `config.json` の書き込みは、`config.json.lock` を持って読み直してから一時ファイル経由で置き換える（`tts-configure` と同時に書いても互いの変更を消さない）。ロックが 5 秒空かなければ失敗にする。読んだ `config.json` が JSON として壊れている・読めないときも、書かずに失敗にする（既存の設定を消さない）
 - `aivis` コマンドでも同じ引数で使える
+
+### 声ごとの調整（ElevenLabs）
+
+`config.json` の `elevenlabs.voiceSettings` に voice_id ごとの `stability` / `similarityBoost`（どちらも 0〜1）を書くと、その声の合成で `voice_settings` に `stability` / `similarity_boost` として入れます。書いていないキーは送らないので、ElevenLabs に保存してある値が使われます。話速から決める `speed` はこれまでどおり一緒に送ります。worker は発話ごとに設定を読み直すので、`--reboot` は要りません。
+
+```json
+{
+  "elevenlabs": {
+    "voiceSettings": {
+      "<voice_id>": { "stability": 0.4, "similarityBoost": 0.8 }
+    }
+  }
+}
+```
+
+`eleven_v3` 系のモデルは stability に 0 / 0.5 / 1 しか受け付けないので、最寄りの値に丸めて送ります（ちょうど中間は大きい方）。similarity_boost は丸めません。範囲外・数でない値と、voice_id の形でない鍵は使わず、標準エラーに 1 回だけ警告を出します。
+
+LLM からは `tts-configure` の `elevenlabs_voice_settings`（`voice_id` を省くと今の声。`stability` / `similarity_boost` は指定したキーだけ変え、`null` で消す）で設定し、`tts-get-settings` の `elevenlabs.voice_settings` で確かめます（`current_voice_sent` は今の声・モデルで実際に送る値）。
+
+#### Para Code などから設定する CLI
+
+```bash
+aivis-mcp --set-voice-settings --voice <voice_id> [--stability <0..1>] [--similarity <0..1>]
+aivis-mcp --clear-voice-settings --voice <voice_id>
+```
+
+- `--set-voice-settings` には `--stability` と `--similarity` の少なくとも一方が要ります。指定したキーだけを置き換え、もう一方は残します
+- `--clear-voice-settings` はその声の調整をまるごと消します（ElevenLabs に保存した値に戻る）。調整の無い声を消しても `ok`
+- voice_id は辞書の ID と同じ形（英数字と `-` `_`、128 文字まで）だけを受け付けます。API は呼びません
+- 出力・終了コード・`config.json.lock`・壊れた `config.json` を書かない取り決めは、上の `--set-dictionary` と同じです
 
 > [!WARNING]
 > チャットに書いたAPIキーは会話ログに残ります。気になる場合は `npx aivis-mcp --init` か環境変数 `ELEVENLABS_API_KEY` で設定してください。
@@ -270,6 +300,43 @@ aivis --import-gains gains.json --overwrite
 
 書き込みは一時ファイルに書いて fsync してから置き換えます（`gain.json` がシンボリックリンクなら実体を書き換えます）。worker の覚え直しと読み込みが重ならないよう、どちらも `gain.json.lock` を排他で作ってから読み書きします。10 秒より古いロックは持ち主が落ちたとみなして消します。
 
+### Para Code などから表を読む・直す CLI
+
+```bash
+aivis-mcp --list-gains --json
+aivis-mcp --reset-gain --key <provider:voice:model>
+aivis-mcp --set-gain-learning [--window <1..50>] [--min-seconds <0.5..30>]
+aivis-mcp --export-gains <file> [--voice <id>…] [--model <id>] --json
+aivis-mcp --import-gains <file> [--overwrite] --json
+```
+
+`--list-gains --json` は標準出力に JSON を 1 つだけ書きます（`--json` を付けなければ人が読む一覧）。
+
+```json
+{"version":1,"target":-20,"learnWindow":9,"minLearnSeconds":2.5,"entries":[{"key":"elevenlabs:<voice_id>:eleven_v3","provider":"elevenlabs","voice":"<voice_id>","model":"eleven_v3","gainDb":-3.1,"sampleCount":4,"updatedAt":1790000000000}]}
+```
+
+| 項目 | 意味 |
+|---|---|
+| `entries` | 覚えた行と、最初の値の行を合わせたもの（鍵の順）。表に無い組（同じモデルの平均や 0dB で鳴らす組）は出ない |
+| `gainDb` | 今使っている値。覚えた行は直近の窓の中央値（最後に覚え直したときの値）、最初の値だけの行はその値 |
+| `sampleCount` | 保存している測定の数（最大 50。窓に入る数ではない）。最初の値だけの行は 0。`learnWindow` と比べると覚え直しの進み具合が分かる |
+| `updatedAt` | 最後に覚え直した時刻（epoch ミリ秒）。最初の値だけの行・時刻の無い行は `null` |
+| `learnWindow` / `minLearnSeconds` | 環境変数 > `config.json` > 既定 で決めた値（このコマンドを動かしたプロセスの環境変数で読む。worker を起こしたプロセスと違うと、worker の値とずれることがある） |
+
+`--reset-gain` はその行の測定を捨てます（行ごと消すので、最初の値がある組はその値に、無い組は同じモデルの平均か 0dB に戻ります）。`gain.json.lock` を持って読み書きし、行が無い・表が無いときは何も書かずに `ok` です。`gain.json` が JSON として壊れているときは書きません。
+
+`--set-gain-learning` は `config.json` の `gain.learnWindow` / `gain.minLearnSeconds` を書きます（少なくとも一方。範囲は上の表と同じ）。表の値はその声を次に覚え直すまで変わりません。
+
+`--reset-gain` / `--set-gain-learning` の出力と終了コードは `--set-dictionary` と同じです（成功は標準出力に `ok`、失敗は標準エラーに `error: <理由>` と終了コード 1）。`--export-gains` / `--import-gains` に `--json` を付けると、成功時は標準出力に次の 1 行だけを書き、失敗時は標準出力に何も書かず標準エラーに `error: <理由>` を書いて終了コード 1 で終わります（`--import-gains` の `--voice` の警告は標準エラーに出ます）。
+
+```json
+{"ok":true,"written":3}
+{"ok":true,"added":2,"updated":0,"skipped":1,"evicted":0,"dropped":0}
+```
+
+`updated` は受け取った値で上書きした行、`skipped` は自分の値を残した行、`evicted` は取り込んだ行に押し出されて消えた自分の行、`dropped` は表の上限で入らなかった取り込みの行です。
+
 ### 2.4 からの読み替え
 
 2.4 までの `config.json` の `elevenlabs.volumeDb`（-13 が既定の絶対値）は、2.5 で初めて読んだときに 1 回だけ「今の値 − (-13)」の上乗せへ読み替え、移行済みの印（`volumeMigrated`）を残します。-13 のままなら上乗せは 0 です。
@@ -297,6 +364,8 @@ npx aivis-mcp --export-gains gains.json   # 音量の表を書き出す（上の
 npx aivis-mcp --import-gains gains.json   # 音量の表を読み込んで足す
 npx aivis-mcp --set-dictionary --provider aivis --id <uuid>   # 辞書を使う（上の「辞書」）
 npx aivis-mcp --clear-dictionary --provider aivis             # 辞書を使わない
+npx aivis-mcp --set-voice-settings --voice <voice_id> --stability 0.5   # 声ごとの調整（上の「声ごとの調整」）
+npx aivis-mcp --list-gains                                   # 音量の表を見る
 ```
 
 > [!IMPORTANT]

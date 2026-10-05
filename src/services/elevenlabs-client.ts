@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type { AppConfig } from '../config.js';
+import { voiceSettingsForRequest } from './voice-settings.js';
 
 export interface ElevenLabsVoiceSummary {
   voice_id: string;
@@ -57,16 +58,24 @@ export interface ElevenLabsStreamResponse {
 /** 合成の要求の本文（送る前に組み立てる。テストでも使う）。 */
 export function buildElevenLabsBody(
   config: AppConfig,
-  params: { text: string; model_id?: string; speaking_rate?: unknown },
+  params: { text: string; voice_id?: string; model_id?: string; speaking_rate?: unknown },
   extras: ElevenLabsRequestExtras = {},
 ): Record<string, unknown> {
   const speed = toElevenLabsSpeed(params.speaking_rate);
+  const modelId = params.model_id || config.elevenLabsModelId;
   const body: Record<string, unknown> = {
     text: stripSsmlTags(params.text),
-    model_id: params.model_id || config.elevenLabsModelId,
+    model_id: modelId,
+  };
+  // 声ごとの調整は値のあるキーだけ送る（送らないキーは ElevenLabs に保存した値が使われる）
+  const voiceSettings: Record<string, number> = {
+    ...voiceSettingsForRequest(config.elevenLabsVoiceSettings, params.voice_id || config.elevenLabsVoiceId, modelId),
   };
   if (speed !== undefined) {
-    body.voice_settings = { speed };
+    voiceSettings.speed = speed;
+  }
+  if (Object.keys(voiceSettings).length > 0) {
+    body.voice_settings = voiceSettings;
   }
   if (extras.previous_request_ids !== undefined && extras.previous_request_ids.length > 0) {
     body.previous_request_ids = [...extras.previous_request_ids];

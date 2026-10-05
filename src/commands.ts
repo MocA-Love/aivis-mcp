@@ -347,9 +347,13 @@ const EXPORT_GAINS_USAGE = '--export-gains <file> [--voice <voice_id>…] [--mod
 const IMPORT_GAINS_USAGE = '--import-gains <file> [--overwrite]';
 
 /** `--export-gains` / `--import-gains` の値。無い・別のオプションに見える（`-` で始まる）ときは使い方を出す。 */
-function gainFileArgument(value: ArgValue, flag: string, usage: string): string | undefined {
+function gainFileArgument(value: ArgValue, flag: string, usage: string, json = false): string | undefined {
   if (typeof value === 'string' && value !== '' && !value.startsWith('-')) {
     return value;
+  }
+  if (json) {
+    console.error(`error: ${flag} にはファイルのパスを渡してください（- で始まるパスは ./ を付けてください）。使い方: ${usage} --json`);
+    return undefined;
   }
   console.error(`${flag} にはファイルのパスを渡してください（- で始まるパスは ./ を付けてください）`);
   console.error(`使い方: ${usage}`);
@@ -361,24 +365,25 @@ function gainFileArgument(value: ArgValue, flag: string, usage: string): string 
  * 値が無くても true を返す（MCP サーバーとして起動したまま止まらないように）。
  */
 export async function runGainTransfer(values: Record<string, ArgValue>): Promise<boolean> {
+  const json = values.json === true;
   if (values['export-gains'] !== undefined) {
-    const output = gainFileArgument(values['export-gains'], '--export-gains', EXPORT_GAINS_USAGE);
+    const output = gainFileArgument(values['export-gains'], '--export-gains', EXPORT_GAINS_USAGE, json);
     if (output === undefined) {
       process.exitCode = 1;
       return true;
     }
     const voices = Array.isArray(values.voice) ? values.voice : [];
-    runExportGains(output, voices, typeof values.model === 'string' ? values.model : undefined);
+    runExportGains(output, voices, typeof values.model === 'string' ? values.model : undefined, json);
     return true;
   }
   if (values['import-gains'] !== undefined) {
     warnStrayVoiceOption(values);
-    const input = gainFileArgument(values['import-gains'], '--import-gains', IMPORT_GAINS_USAGE);
+    const input = gainFileArgument(values['import-gains'], '--import-gains', IMPORT_GAINS_USAGE, json);
     if (input === undefined) {
       process.exitCode = 1;
       return true;
     }
-    await runImportGains(input, values.overwrite === true);
+    await runImportGains(input, values.overwrite === true, json);
     return true;
   }
   return false;
@@ -392,24 +397,43 @@ export function warnStrayVoiceOption(values: Record<string, ArgValue>): void {
   console.error(`[aivis-mcp] --voice は --export-gains の絞り込み用で、ここでは使いません（値 ${values.voice.join(', ')} は読み上げる文にも入りません）。ElevenLabs の声は --voice-id で指定します`);
 }
 
-/** `--export-gains <file> [--voice <id>…] [--model <id>]`: 音量の表を書き出す。 */
-export function runExportGains(outputPath: string, voices: readonly string[], model: string | undefined): void {
+function oneLine(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ');
+}
+
+/**
+ * `--export-gains <file> [--voice <id>…] [--model <id>] [--json]`: 音量の表を書き出す。
+ * `--json` なら標準出力に `{"ok":true,"written":N}` だけを出し、失敗は標準エラーに `error: <理由>`（どちらも終了コードで成否が分かる）。
+ */
+export function runExportGains(outputPath: string, voices: readonly string[], model: string | undefined, json = false): void {
   try {
     const count = exportGains(outputPath, { voices, model });
+    if (json) {
+      console.log(JSON.stringify({ ok: true, written: count }));
+      return;
+    }
     console.log(`音量の表を ${count} 行書き出しました: ${outputPath}`);
     if (count === 0 && (voices.length > 0 || model !== undefined)) {
       console.log('一致する行がありません。Aivis の行は鍵が aivis:<model_uuid>:default なので、--voice にモデル UUID、--model に default を渡します');
     }
   } catch (error) {
-    console.error(`書き出せませんでした: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(json ? `error: ${oneLine(error)}` : `書き出せませんでした: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   }
 }
 
-/** `--import-gains <file> [--overwrite]`: 音量の表を読み込んで足す。 */
-export async function runImportGains(inputPath: string, overwrite: boolean): Promise<void> {
+/**
+ * `--import-gains <file> [--overwrite] [--json]`: 音量の表を読み込んで足す。
+ * `--json` なら標準出力に `{"ok":true,"added":N,"updated":N,"skipped":N,"evicted":N,"dropped":N}` だけを出す
+ * （updated は上書きした行、skipped は自分の値を残した行、dropped は表の上限で入らなかった行）。
+ */
+export async function runImportGains(inputPath: string, overwrite: boolean, json = false): Promise<void> {
   try {
     const result = await importGains(inputPath, overwrite);
+    if (json) {
+      console.log(JSON.stringify({ ok: true, added: result.added, updated: result.overwritten, skipped: result.kept, evicted: result.evicted, dropped: result.dropped }));
+      return;
+    }
     console.log(`音量の表を読み込みました: 追加 ${result.added} 行、上書き ${result.overwritten} 行、自分の値を残した ${result.kept} 行（${gainFilePath()}）`);
     if (result.dropped > 0 || result.evicted > 0) {
       console.log(`表の上限（${MAX_LEARNED_ENTRIES} 行）を超えたため、取り込んだ ${result.dropped} 行が入らず、自分の表の古い ${result.evicted} 行が消えました`);
@@ -418,8 +442,12 @@ export async function runImportGains(inputPath: string, overwrite: boolean): Pro
       console.log('受け取った値で上書きするには --overwrite を付けてください');
     }
   } catch (error) {
-    const prefix = error instanceof GainImportError || error instanceof GainLockError ? '読み込みを取りやめました' : '読み込めませんでした';
-    console.error(`${prefix}: ${error instanceof Error ? error.message : String(error)}`);
+    if (json) {
+      console.error(`error: ${oneLine(error)}`);
+    } else {
+      const prefix = error instanceof GainImportError || error instanceof GainLockError ? '読み込みを取りやめました' : '読み込めませんでした';
+      console.error(`${prefix}: ${error instanceof Error ? error.message : String(error)}`);
+    }
     process.exitCode = 1;
   }
 }
