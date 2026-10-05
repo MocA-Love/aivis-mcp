@@ -128,6 +128,8 @@ interface VoiceRoute {
   readonly obtain: () => Promise<ParaCodeVoiceTarget | undefined>;
   /** SSH 先のペインで、Para Code が手元の PC で鳴らす前提か */
   readonly expectLocalPlayback: boolean;
+  /** ミュート中なら送らないと控えの ticket で分かっている（依頼を省く） */
+  readonly unsendableWhenMuted: boolean;
 }
 
 /** 合成の流れ 1 本。 */
@@ -154,6 +156,8 @@ const SYNTHESIS_SETTLE_MS = 5_000;
 const PLAYER_STOP_WAIT_MS = PLAYER_KILL_GRACE_MS + 1_000;
 /** 合成するジョブの全体の上限に足す、Para Code の返事を待つ分。 */
 const SYNTH_EXTRA_LIMIT_MS = 30_000;
+/** 控えの ticket を使うのに残っていてほしい時間。 */
+const FALLBACK_MIN_REMAINING_MS = 15_000;
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -788,6 +792,10 @@ export class PlaybackWorker {
       return () => (value ??= make());
     };
     const fallback = isParaCodeVoiceTarget(params._paraCodeVoiceTarget) ? params._paraCodeVoiceTarget : undefined;
+    // 期限間近の控えは使わない（送っている途中で切れると Para Code に断られる）
+    const fallbackUsable = () => fallback !== undefined && fallback.expiresAt - Date.now() >= FALLBACK_MIN_REMAINING_MS;
+    // ミュート中に送らないと控えで分かる（手元で鳴らす ticket で、Para Code がミュートの印を解さない）
+    const unsendableWhenMuted = fallback !== undefined && fallback.localPlayback === true && fallback.muteAware !== true;
     const requester = params._voiceRequester;
     if (isVoiceRequester(requester)) {
       // 積んだ MCP サーバーに、鳴らし始めるいま ticket を頼む。返事が無ければ（MCP サーバーが終わっている・
@@ -795,20 +803,45 @@ export class PlaybackWorker {
       const waitMs = requester.remote === true ? this.timings.voiceTicketRemoteWaitMs : this.timings.voiceTicketWaitMs;
       return {
         obtain: memo(async () => {
-          const fresh = await requestVoiceTicket(this.command, this.subscriber, requester, job.id, waitMs);
+          // 前の依頼で時間切れの直後に届いた ticket があれば、それを使う（頼み直さない）
+          const late = this.takeLateTicket(requester.id);
+          if (late !== undefined) {
+            return late;
+          }
+          const fresh = await requestVoiceTicket(this.command, this.subscriber, requester, job.id, waitMs, target => this.keepLateTicket(requester.id, target));
           if (fresh !== undefined) {
             return fresh;
           }
-          return fallback !== undefined && fallback.expiresAt > Date.now() ? fallback : undefined;
+          return fallbackUsable() ? fallback : undefined;
         }),
         expectLocalPlayback: requester.localPlayback || fallback?.localPlayback === true,
+        unsendableWhenMuted,
       };
     }
     if (fallback !== undefined) {
       // 一回きりの aivis コマンドが積む時に取った ticket
-      return { obtain: memo(async () => (fallback.expiresAt > Date.now() ? fallback : undefined)), expectLocalPlayback: fallback.localPlayback === true };
+      return { obtain: memo(async () => (fallbackUsable() ? fallback : undefined)), expectLocalPlayback: fallback.localPlayback === true, unsendableWhenMuted };
     }
     return undefined;
+  }
+
+  /** 時間切れの直後に届いた ticket（頼み先ごとに 1 枚。次の依頼で使う）。 */
+  private readonly lateTickets = new Map<string, ParaCodeVoiceTarget>();
+
+  private keepLateTicket(requesterId: string, target: ParaCodeVoiceTarget): void {
+    this.lateTickets.set(requesterId, target);
+    if (this.lateTickets.size > 64) {
+      const oldest = this.lateTickets.keys().next().value;
+      if (oldest !== undefined) {
+        this.lateTickets.delete(oldest);
+      }
+    }
+  }
+
+  private takeLateTicket(requesterId: string): ParaCodeVoiceTarget | undefined {
+    const target = this.lateTickets.get(requesterId);
+    this.lateTickets.delete(requesterId);
+    return target !== undefined && target.expiresAt - Date.now() >= FALLBACK_MIN_REMAINING_MS ? target : undefined;
   }
 
   private async process(job: Job, queueKey: string, ctx: JobContext): Promise<Outcome | 'requeue'> {
@@ -1238,7 +1271,8 @@ export class PlaybackWorker {
     route: VoiceRoute | undefined,
     options: { gainKey: string | undefined; tagged: boolean; deadline: number },
   ): Promise<Outcome> {
-    if (route === undefined) {
+    if (route === undefined || route.unsendableWhenMuted) {
+      // 送らないと分かっている件は、ticket を頼まない（無駄に取らない）
       return { status: 'muted' };
     }
     const target = await this.waitBounded(route.obtain(), ctx, options.deadline);

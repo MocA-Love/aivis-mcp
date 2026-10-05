@@ -62,4 +62,38 @@ describe('Para Code の ticket と health', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test('[再々レビュー LOW 3] 覚えた instanceId で取れなければ、その依頼は諦めて捨て、次の依頼で health から取り直す', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-pc-'));
+    let instance = 'i1';
+    let health = 0;
+    try {
+      await withServer((request, response) => {
+        if (request.url === '/paradis-mcp/health') {
+          health++;
+          response.end(JSON.stringify({ instanceId: instance }));
+          return;
+        }
+        response.writeHead(201, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({ ticket: 't', expiresAt: Date.now() + 600_000, instanceId: instance }));
+      }, async port => {
+        const portFile = path.join(dir, 'port.json');
+        fs.writeFileSync(portFile, JSON.stringify({ port }));
+        const env = { PARA_CODE_TERMINAL_PANE_ID: 'pane-token', PARA_CODE_MCP_PORT_FILE: portFile };
+        const cache = {};
+        expect(await captureParaCodeVoiceTarget(env, cache)).toMatchObject({ instanceId: 'i1' });
+        expect(await captureParaCodeVoiceTarget(env, cache)).toMatchObject({ instanceId: 'i1' });
+        expect(health).toBe(1);
+        // Para Code が起動し直した
+        instance = 'i2';
+        expect(await captureParaCodeVoiceTarget(env, cache)).toBeUndefined();
+        expect(health).toBe(1);
+        expect(await captureParaCodeVoiceTarget(env, cache)).toMatchObject({ instanceId: 'i2' });
+        expect(health).toBe(2);
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
+

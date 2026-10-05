@@ -75,7 +75,8 @@ describe('Para Code への送り出し', () => {
       // ヘッダーは来たが accepted も rejected も無く、本文にも答えが無い（不明）。二重に鳴らさない
       { respond: response => response.end('{}'), expected: 'remote' },
       { respond: response => response.end(JSON.stringify({ localPlayback: false })), expected: 'local' },
-      { respond: response => { response.writeHead(401); response.end(); }, expected: 'local' },
+      // ticket が通らない（期限切れ・使用済み）は拒否ではなく、送れなかった
+      { respond: response => { response.writeHead(401); response.end(); }, expected: 'unavailable' },
       { respond: response => { response.writeHead(503); response.end(); }, expected: 'local' },
       { respond: response => { response.writeHead(200, { 'X-Para-Local-Playback': 'rejected' }); response.end(); }, expected: 'local' },
     ];

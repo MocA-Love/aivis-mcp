@@ -148,10 +148,12 @@ export async function captureParaCodeVoiceTarget(env: NodeJS.ProcessEnv = proces
       // 覚えている instanceId があれば health を飛ばす（ticket の応答の instanceId で確かめる）
       if (cache?.port === record.port && cache.instanceId !== undefined) {
         const target = await requestParaCodeVoiceTicket(record.port, cache.instanceId, token, timeoutMs);
-        if (target !== undefined) {
-          return target;
+        if (target === undefined) {
+          // Para Code が起動し直したなどで古いかもしれない。捨てて、次の依頼で health から取り直す
+          // （この依頼は諦める。呼び出し側は控えの ticket を使う。health まで続けると最大 4.5 秒かかる）
+          cache.instanceId = undefined;
         }
-        cache.instanceId = undefined;
+        return target;
       }
       // 生存確認を経路の応答で代え、instanceId は health から取る
       instanceId = await requestParaCodeInstanceId(record.port, timeoutMs);

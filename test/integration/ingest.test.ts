@@ -288,7 +288,7 @@ describeWithRedis('--ingest（別ポートの redis-server）', () => {
       await waitFor(() => ownMessages.some(m => m.id === 'old1' && m.status === 'queued') ? true : undefined);
       clock += 16 * 60_000;
       await own_session.pollStatuses();
-      expect(ownMessages.find(m => m.id === 'old1' && m.status === 'failed')).toEqual({ type: 'status', id: 'old1', status: 'failed', reason: 'untracked' });
+      expect(ownMessages.find(m => m.id === 'old1' && m.status === 'failed')).toEqual({ type: 'status', id: 'old1', status: 'failed', reason: 'untracked', withdrawn: true });
     } finally {
       own.end();
       await own_session.closedPromise;
@@ -502,8 +502,8 @@ describeWithRedis('--ingest（別ポートの redis-server）', () => {
     await waitFor(() => messages.filter(m => m.type === 'withdrawn').length === 3 ? true : undefined);
     expect(messages.filter(m => m.type === 'withdrawn')).toEqual([
       { type: 'withdrawn', id: 'prev1', removed: true },
-      { type: 'withdrawn', id: 'prev2', removed: false },
-      { type: 'withdrawn', id: 'prev1', removed: false },
+      { type: 'withdrawn', id: 'prev2', removed: false, taken: true },
+      { type: 'withdrawn', id: 'prev1', removed: false, notQueued: true },
     ]);
     // ほかのジョブは巻き込まない。外した件の Stream と知らせは消える
     expect((await client.lRange(NORMAL_QUEUE_KEY, 0, -1)).map(item => JSON.parse(item).id)).toEqual(['other']);

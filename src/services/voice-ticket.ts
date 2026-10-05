@@ -204,38 +204,68 @@ export class VoiceTicketResponder {
  * worker 側。鳴らし始めるときに、積んだ MCP サーバーへ ticket を頼む。返事が無い（MCP サーバーが
  * 終わっている・`waitMs` を過ぎた）・取れなかったときは undefined。
  */
+/** 時間切れの後も返事を待って拾う時間（拾った ticket は捨てずに `onLate` へ渡す）。 */
+export const LATE_REPLY_GRACE_MS = 500;
+
 export async function requestVoiceTicket(
   publisher: RedisClientType,
   subscriber: RedisClientType,
   requester: VoiceRequester,
   jobId: string,
   waitMs = VOICE_TICKET_WAIT_MS,
+  onLate?: (target: ParaCodeVoiceTarget) => void,
 ): Promise<ParaCodeVoiceTarget | undefined> {
   const channel = VOICE_TICKET_REPLY_PREFIX + jobId;
   let resolveReply!: (value: ParaCodeVoiceTarget | undefined) => void;
   const reply = new Promise<ParaCodeVoiceTarget | undefined>(resolve => { resolveReply = resolve; });
+  let timedOut = false;
   const listener = (message: string) => {
+    let target: ParaCodeVoiceTarget | undefined;
     try {
       const parsed = JSON.parse(message) as { target?: unknown };
-      resolveReply(isParaCodeVoiceTarget(parsed.target) ? parsed.target : undefined);
+      target = isParaCodeVoiceTarget(parsed.target) ? parsed.target : undefined;
     } catch {
-      resolveReply(undefined);
+      target = undefined;
     }
+    if (timedOut) {
+      // 時間切れの直後に届いた。1 回限りの ticket を無駄にしないよう、呼び出し側に取り置いてもらう
+      if (target !== undefined) {
+        onLate?.(target);
+      }
+      return;
+    }
+    resolveReply(target);
   };
+  let subscribed = false;
   let timer: NodeJS.Timeout | undefined;
   try {
     await withTimeout(subscriber.subscribe(channel, listener), waitMs);
+    subscribed = true;
     const receivers = await withTimeout(publisher.publish(VOICE_TICKET_REQUEST_PREFIX + requester.id, JSON.stringify({ id: jobId })), waitMs);
     if (Number(receivers) === 0) {
       // 頼み先が購読していない（MCP サーバーが終わっている）
       return undefined;
     }
-    const timeout = new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), waitMs); });
-    return await Promise.race([reply, timeout]);
+    const timeout = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), waitMs); });
+    const result = await Promise.race([reply, timeout]);
+    if (result !== 'timeout') {
+      return result;
+    }
+    timedOut = true;
+    if (onLate !== undefined) {
+      // 少しだけ聞き続けてから外す（返事を待たずに戻る）
+      setTimeout(() => {
+        void withTimeout(subscriber.unsubscribe(channel, listener), 1000).catch(() => undefined);
+      }, LATE_REPLY_GRACE_MS);
+      subscribed = false;
+    }
+    return undefined;
   } catch {
     return undefined;
   } finally {
     clearTimeout(timer);
-    await withTimeout(subscriber.unsubscribe(channel, listener), 1000).catch(() => undefined);
+    if (subscribed) {
+      await withTimeout(subscriber.unsubscribe(channel, listener), 1000).catch(() => undefined);
+    }
   }
 }

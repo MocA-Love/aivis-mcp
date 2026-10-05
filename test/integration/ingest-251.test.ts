@@ -6,7 +6,7 @@ import type { RedisClientType } from 'redis';
 import { createIngestClient, IngestSession } from '../../src/ingest/ingest.js';
 import { PlaybackWorker } from '../../src/worker/playback-worker.js';
 import { encodeAudio, encodeControl, FrameDecoder } from '../../src/streaming/frame-protocol.js';
-import { HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY, PLAY_LOCK_KEY, statusKey, WORKER_LOCK_KEY } from '../../src/queue/keys.js';
+import { audioStreamKey, HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY, PLAY_LOCK_KEY, statusKey, WORKER_LOCK_KEY } from '../../src/queue/keys.js';
 import { connect, describeWithRedis, startTestRedis, waitFor, type TestRedis } from '../helpers/redis.js';
 import { startRedisProxy, type RedisProxy } from '../helpers/redis-proxy.js';
 import { FakeBackend } from '../helpers/fake-backend.js';
@@ -251,6 +251,62 @@ describeWithRedis('--ingest の 2.5.1 の直し（別ポートの redis-server�
     await own.ingest.pollStatuses();
     const removedEnd = await waitFor(() => own.messages.find(message => message.id === 'u2' && message.status === 'failed'), 5000);
     expect(removedEnd).toMatchObject({ reason: 'untracked', withdrawn: true });
+  });
+
+  test('[追加 1] withdraw は「外せた」「積まれていない」「取り出し済み」を分ける', async () => {
+    const own = await session();
+    own.input.write(encodeControl({ type: 'open', id: 'in-queue' }));
+    own.input.write(encodeControl({ type: 'open', id: 'taken' }));
+    await waitFor(() => ['in-queue', 'taken'].every(id => own.statusesOf(id).includes('queued')) ? true : undefined);
+    // taken は worker が取り出した
+    const raw = (await client.lRange(NORMAL_QUEUE_KEY, 0, -1)).find(item => JSON.parse(item).id === 'taken')!;
+    await client.lRem(NORMAL_QUEUE_KEY, 1, raw);
+    await client.rPush(statusKey('taken'), JSON.stringify({ s: 'dequeued', t: Date.now(), w: 'w1' }));
+    // never は前の子が Stream だけ作り、積む要求が届かなかった
+    await client.xAdd(audioStreamKey('never'), '*', { o: '1' });
+    for (const id of ['in-queue', 'taken', 'never']) {
+      own.input.write(encodeControl({ type: 'withdraw', id }));
+    }
+    await waitFor(() => own.messages.filter(message => message.type === 'withdrawn').length === 3 ? true : undefined);
+    expect(own.messages.filter(message => message.type === 'withdrawn').map(({ at: _at, ...rest }) => rest)).toEqual([
+      { type: 'withdrawn', id: 'in-queue', removed: true },
+      { type: 'withdrawn', id: 'taken', removed: false, taken: true },
+      { type: 'withdrawn', id: 'never', removed: false, notQueued: true },
+    ]);
+    expect(await client.exists(audioStreamKey('never'))).toBe(0);
+    expect(await client.exists(statusKey('taken'))).toBe(1);
+  });
+
+  test('[追加 2] adopt で前の --ingest が積んだ件を引き継ぎ、期限の延長と知らせの中継を行う', async () => {
+    const previous = await session();
+    previous.input.write(encodeControl({ type: 'open', id: 'orphan' }));
+    previous.input.write(encodeAudio('orphan', mp3Frames(20)));
+    previous.input.write(encodeControl({ type: 'end', id: 'orphan' }));
+    await waitFor(() => previous.statusesOf('orphan').includes('queued') ? true : undefined);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    // 前の子が落ちた（入力を止める。追跡はもう行われない）
+    previous.input.pause();
+    const next = await session();
+    next.input.write(encodeControl({ type: 'adopt', id: 'orphan' }));
+    next.input.write(encodeControl({ type: 'adopt', id: 'nobody' }));
+    await waitFor(() => next.messages.filter(message => message.type === 'adopted').length === 2 ? true : undefined);
+    expect(next.messages.filter(message => message.type === 'adopted').map(({ at: _at, ...rest }) => rest)).toEqual([
+      { type: 'adopted', id: 'orphan', adopted: true },
+      { type: 'adopted', id: 'nobody', adopted: false },
+    ]);
+    // 期限の延長を引き継ぐ（延長の間隔を待たずに、内部の延長を直接呼ぶ）
+    await client.expire(audioStreamKey('orphan'), 5);
+    await client.expire(statusKey('orphan'), 5);
+    await (next.ingest as unknown as { touch(): Promise<void> }).touch();
+    expect(await client.ttl(audioStreamKey('orphan'))).toBeGreaterThan(100);
+    expect(await client.ttl(statusKey('orphan'))).toBeGreaterThan(100);
+    // worker が鳴らすと、新しい子が playing と done を返す
+    const backend = new FakeBackend();
+    startWorker(backend);
+    await waitFor(() => next.statusesOf('orphan').includes('done') ? true : undefined);
+    expect(next.statusesOf('orphan')).toEqual(['adopted', 'playing', 'done']);
+    expect(backend.voices[0].bytes.length).toBe(417 * 20);
+    previous.input.resume();
   });
 });
 

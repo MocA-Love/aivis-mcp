@@ -3,7 +3,8 @@
  *
  * - ticket の応答に `ingress: "stream-v1"` があるときだけ、合成を受け取りながら chunked で送る。
  *   応答のヘッダー `X-Para-Local-Playback: accepted` が来たら、この機械では鳴らさない（引き受け）。
- *   4xx・5xx か `X-Para-Local-Playback: rejected` は明示の拒否で、この機械で鳴らす。
+ *   401・403 は ticket が通らなかった（期限切れ・使用済み）ので unavailable。ほかの 4xx・5xx か
+ *   `X-Para-Local-Playback: rejected` は明示の拒否で、この機械で鳴らす。
  *   ヘッダーはあるがどちらでもない（不明）ときは、本文の `localPlayback` で決め、無ければ鳴らさない。
  *   ヘッダーが 1 つも来ないまま接続に失敗したときだけ自分で鳴らす。
  *   引き受けの後でも、本文が `{"localPlayback":false}` なら、最終の判定（outcome）は自分で鳴らす。
@@ -171,6 +172,8 @@ class ChunkedForward extends ForwardBase {
   private headersReceived = false;
   /** 明示の拒否（4xx・5xx・rejected）を受けた */
   private rejected = false;
+  /** ticket が通らなかった（401・403） */
+  private ticketRejected = false;
   private readonly maxBytes: number;
   private totalTimer: NodeJS.Timeout | undefined;
 
@@ -236,6 +239,9 @@ class ChunkedForward extends ForwardBase {
     if (this.target.localPlayback !== true) {
       return 'local';
     }
+    if (this.ticketRejected) {
+      return 'unavailable';
+    }
     if (!this.headersReceived || this.rejected) {
       return 'local';
     }
@@ -278,7 +284,11 @@ class ChunkedForward extends ForwardBase {
       this.headersReceived = true;
       const status = response.statusCode ?? 0;
       const header = String(response.headers[LOCAL_PLAYBACK_HEADER] ?? '').toLowerCase();
-      if (status >= 400 || header === 'rejected') {
+      if (status === 401 || status === 403) {
+        // ticket が通らなかった（期限切れ・使用済み）。Para Code が断ったのではなく、送れなかった
+        this.ticketRejected = true;
+        this.decide('unavailable');
+      } else if (status >= 400 || header === 'rejected') {
         this.rejected = true;
         this.decide('local');
       } else if (header === 'accepted' && this.target.localPlayback === true) {
@@ -364,7 +374,13 @@ class BufferedForward extends ForwardBase {
       this.finish('local');
       return;
     }
-    void this.post(audio).then(playedLocally => this.finish(playedLocally && this.target.localPlayback === true ? 'remote' : 'local'));
+    void this.post(audio).then(result => {
+      if (this.target.localPlayback !== true) {
+        this.finish('local');
+      } else {
+        this.finish(result === 'played' ? 'remote' : result === 'ticket-rejected' ? 'unavailable' : 'local');
+      }
+    });
   }
 
   abort(): void {
@@ -376,11 +392,11 @@ class BufferedForward extends ForwardBase {
     this.finish('local');
   }
 
-  /** 送れたら Para Code が手元の PC で鳴らしたか（応答の `localPlayback`）を返す。 */
-  private async post(audio: Buffer): Promise<boolean> {
+  /** 送れたら Para Code が手元の PC で鳴らしたか（応答の `localPlayback`）を返す。ticket が通らなければ ticket-rejected。 */
+  private async post(audio: Buffer): Promise<'played' | 'not-played' | 'ticket-rejected'> {
     const current = await (this.options.isCurrentInstance ?? defaultIsCurrentInstance)(this.target).catch(() => false);
     if (!current) {
-      return false;
+      return 'not-played';
     }
     // 手元で鳴らすときは、Para Code が手元の列へ積み終えるまで応答を待つ。SSH を運ばれる時間も見込む
     const response = await requestSmall({
@@ -395,10 +411,13 @@ class BufferedForward extends ForwardBase {
         'Content-Length': audio.byteLength,
       },
     }, this.target.localPlayback === true ? 30_000 : 3_000, audio);
-    if (response === undefined || response.statusCode < 200 || response.statusCode >= 300 || response.body.length === 0) {
-      return false;
+    if (response !== undefined && (response.statusCode === 401 || response.statusCode === 403)) {
+      return 'ticket-rejected';
     }
-    return bodyLocalPlayback(response.body) === true;
+    if (response === undefined || response.statusCode < 200 || response.statusCode >= 300 || response.body.length === 0) {
+      return 'not-played';
+    }
+    return bodyLocalPlayback(response.body) === true ? 'played' : 'not-played';
   }
 }
 

@@ -132,12 +132,32 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 { "type": "withdraw", "id": "…" }
 ```
 
-まだ worker が取り出していないジョブを列から外します。返事は `{"type":"withdrawn","id":…,"removed":true|false}`。`removed` が `true` のときだけ、親はその件を自分で鳴らしてかまいません。
+まだ worker が取り出していないジョブを列から外します。返事は `withdrawn` で、外せなかったときは理由を付けます。
 
+| 返事 | 意味 | 親が自分で鳴らしてよいか |
+|---|---|---|
+| `{"type":"withdrawn","id":…,"removed":true}` | 列から外した | よい |
+| `{"type":"withdrawn","id":…,"removed":false,"notQueued":true}` | 列にも知らせ（`aivis-mcp:status:<id>`）にも痕跡が無い。積む要求が Redis に届いていない。残っていた Stream は消した | よい |
+| `{"type":"withdrawn","id":…,"removed":false,"taken":true}` | 列に無く、知らせはある。worker が取り出した・鳴っている・終わった | よくない（worker が鳴らす・鳴らした） |
+| `{"type":"withdrawn","id":…,"removed":false}` | Redis に確かめられなかった | よくない |
+
+- 判定（列から外す・Stream と知らせを消す・痕跡を調べる）は 1 つのスクリプトで行います。worker の取り出し・列へ戻すのと入れ違いません。同じ子が先に送った `open` の積む要求は、判定より先に Redis に届いています
 - この子が積んだジョブだけでなく、前の `--ingest`（落ちて起動し直す前の子）が積んだジョブも、`aivis-mcp:q2:high` と `aivis-mcp:q2:normal` を読んで ID が一致する要素を探し、その要素だけを外します。ほかのジョブは巻き込みません
-- 列から外すのと、その件の Stream（`aivis-mcp:audio:<id>`）と知らせ（`aivis-mcp:status:<id>`）を消すのは、1 つのスクリプトでまとめて行います（worker の取り出し・列へ戻すのと入れ違いません）。以後その件の `status` は返しません
-- 判断は「いま列にあるか」だけで決めます。worker が取り出している件（列に無い件）は `removed: false` で、その件は worker が鳴らします（二重にはなりません）。worker が一度取り出してから列へ戻した件（hold・優先の入れ替えなど）は、列にあるので外せます
-- 鳴り始めた（`playing` を返した）件は `removed: false` です
+- 外せた件・積まれていなかった件には、以後 `status` を返しません。worker が一度取り出してから列へ戻した件（hold・優先の入れ替えなど）は、列にあるので外せます
+- 知らせは期限 300 秒なので、終わってから 5 分以上経った件は `notQueued` になります。親は終わりの知らせを受けた件に withdraw を送らないでください
+
+### `adopt`
+
+```json
+{ "type": "adopt", "id": "…" }
+```
+
+前の `--ingest`（落ちた・入れ替えた子）が積んだ件の追跡を、この子が引き継ぎます。返事は `{"type":"adopted","id":…,"adopted":true|false}` です。
+
+- 列か知らせに痕跡がある件だけ引き継ぎます（`adopted: true`）。どちらにも無い ID は `adopted: false` です。この子がすでに追っている件は `adopted: true` のままです
+- 引き継いだ件は、この子が Stream と知らせの期限を延ばし、知らせを頭から読み直して `playing` と終わり（`done` `skipped` `held` `muted` `failed`）を返します。`queued` は返しません。見失った・追跡の上限の判断もこの子が行います
+- 音声の続き（音声の枠・`end`）は送れません。書きかけの流れは、worker が届いた分で終えるか打ち切ります。鳴らさずに済ませたいなら `withdraw` を送ってください
+- `abort` と `withdraw` は、引き継いだ件にも使えます
 
 ### `ping`
 
@@ -156,7 +176,8 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 | `status` | `{"id":…, "status":…, "reason"?:…, "withdrawn"?: true}` | ジョブの進み具合（下の表） |
 | `hold` | `{"owner":…, "active":…}` | `hold` を反映した |
 | `gain` | `{"requestId":…, "target":-20, "maxBoostDb":8, "defaultDb":0, "entries":{鍵: dB}, "volumeOffsetDb":…, "elevenLabsVolumeOffsetDb":…}` | `gain?` の返事。`entries` に無い鍵は、同じ provider・同じモデルの平均、それも無ければ `defaultDb` |
-| `withdrawn` | `{"id":…, "removed":…}` | `withdraw` の返事 |
+| `withdrawn` | `{"id":…, "removed":…, "notQueued"?: true, "taken"?: true}` | `withdraw` の返事 |
+| `adopted` | `{"id":…, "adopted":…}` | `adopt` の返事 |
 | `pong` | `{"requestId":…}` | `ping` の返事 |
 | `error` | `{"reason":…, …}` | 枠や要求が正しくない。`reason` は `protocol`（1 回だけ出し、以後の入力は捨てて終わる）・`unknown-type`・`unknown-stream`・`invalid-owner`・`redis-unavailable`・`redis-error`（`hold` を Redis に書けなかった） |
 
@@ -179,6 +200,7 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 | 知らせ | いつ |
 |---|---|
 | `withdraw` の返事の `removed: true` | 列から外せた |
+| `withdraw` の返事の `notQueued: true` | 積む要求が Redis に届いていなかった |
 | `failed`・`worker-unavailable`・`withdrawn: true` | worker の lock が 30 秒続けて無く、列から外せた（LREM が 1） |
 | `failed`・`redis-error`・`withdrawn: true` | 積めていないと確かめた（Stream を作れなかった・積む要求が通っていなかった）。または流れの途中で書き込みに失敗し、まだ取り出されていなかったので列から外せた |
 | `failed`・`too-large`・`withdrawn: true` | 大きすぎて中断し、まだ取り出されていなかったので列から外せた |
@@ -191,7 +213,7 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 | `reason` | いつ |
 |---|---|
 | `lost` | worker が取り出した（内部の知らせ `dequeued`）後か `playing` の後に、worker の lock が 30 秒無い。取り出した worker から lock がほかの worker に移り、取り出した worker が再生 lock も持たないまま 30 秒経つ。`playing` の後 180 秒終わりが来ない。`dequeued` も来ないまま列から消えて 30 秒経つ（再生 lock を worker 以外が持つ間は数えない）。`dequeued` から `playing` までの再生 lock の待ちは数えない。worker が列へ戻した（内部の知らせ `requeued`）件は、また列で待つ件として扱う。この件の Stream は消さず期限切れに任せる |
-| `untracked` | `open` から 15 分（hold の間は数えない）経っても終わりが来ない（追うのをやめる） |
+| `untracked` | `open` から 15 分（hold の間は数えない）経っても終わりが来ない（追うのをやめる）。まだ列にあれば外し、外せたときは `withdrawn: true` を付ける |
 
 `withdraw` の返事で `removed: true` だった件には、`status` は返しません。
 
@@ -239,7 +261,8 @@ SSH 先などの aivis-mcp が Para Code の `/paradis-mcp/mobile-voice` へ合�
 | Para Code の応答 | 接続先の扱い |
 |---|---|
 | ヘッダー `X-Para-Local-Playback: accepted` | 引き受けた。接続先では鳴らさない |
-| 4xx・5xx、またはヘッダー `X-Para-Local-Playback: rejected` | 明示の拒否。接続先で鳴らす |
+| 401・403 | ticket が通らなかった（期限切れ・使用済み）。手元で鳴らす前提の発話は接続先で鳴らさず `failed`（`ticket-unavailable`） |
+| ほかの 4xx・5xx、またはヘッダー `X-Para-Local-Playback: rejected` | 明示の拒否。接続先で鳴らす |
 | 2xx で上のどちらのヘッダーも無い（不明） | 本文の `localPlayback` で決める。`false` なら接続先で鳴らし、`true` か本文が読めなければ鳴らさない |
 | 応答のヘッダーが 1 つも来ないまま接続に失敗した | 接続先で鳴らす |
 | 引き受けの後、本文が `{"localPlayback":false}` | 接続先で鳴らす（届けた音声を Stream から、収まらなかったときは合成し直して） |
@@ -251,7 +274,9 @@ Para Code は、本文を受け取り終えたら、手元で鳴らせたかを�
 
 - MCP サーバー（ペインごとに常駐する）から積んだ発話は、worker が鳴らし始める（転送を始める）時に ticket を頼みます。worker は `aivis-mcp:voice-ticket:req:<requester>` に `{"id":<jobId>}` を publish し、MCP サーバーが `aivis-mcp:voice-ticket:res:<jobId>` に返します。worker が待つのは、手元のペインで 1.5 秒、SSH 先のペイン（ジョブの `_voiceRequester.remote`）で 3.5 秒です（MCP サーバーが戻り経路越しに health と ticket を取る分）。MCP サーバーは戻り経路の先の instanceId を覚え、2 回目からは health を取りません
 - MCP サーバーは積む時にも 1 枚取り、控えとしてジョブ（`_paraCodeVoiceTarget`）に載せます。MCP サーバーが先に終わっても鳴らせるようにするためです。頼まれたときは、その控えがまだ 60 秒以上使えればそれを返し、新しくは取りません（使われない ticket でペインごとの上限を埋めないため）。60 秒を切っていれば新しく取ります
-- worker は、返事が無い（購読している MCP サーバーがいない・時間切れ）・取れなかったときは、控えがまだ使えればそれを使います
+- worker は、返事が無い（購読している MCP サーバーがいない・時間切れ）・取れなかったときは、控えの残りが 15 秒以上あればそれを使います
+- 時間切れの直後（0.5 秒以内）に届いた返事の ticket は、worker が取り置き、同じ MCP サーバーの次の発話で頼まずに使います
+- MCP サーバーは覚えた instanceId で ticket を取れなかったら（Para Code が起動し直したなど）、その依頼は諦めて覚えた値を捨て、次の依頼で health から取り直します（1 回の依頼が health と ticket の両方で最大 4.5 秒かからないように）
 - 返事が worker に届かなかった新しい ticket（時間切れの後に取れた）は捨てず、MCP サーバーが次の依頼か次の控えに回します
 - MCP サーバーは終わるとき、答えている途中の依頼に最大 2 秒答えてから終わります
 - ペインのトークンは Redis に出しません。Redis に載るのは 1 回限り・10 分の ticket（控え）だけです。pub/sub の返事は Redis に残りません
@@ -266,6 +291,7 @@ Para Code は、本文を受け取り終えたら、手元で鳴らせたかを�
 
 - ticket が `localPlayback: true`（Para Code が手元の PC で鳴らす）のときは、ticket に `muteAware: true` があるときだけ送り、ヘッダー `X-Para-Muted: 1` を付けます。Para Code はこのヘッダーを受けたら手元では鳴らさず、モバイルへだけ流してください。`muteAware` が無い（古い Para Code）ときは、手元で鳴ってしまうので送らずに `muted` で終えます
 - `localPlayback` の無い ticket（手元のペイン、モバイルへの転送だけ）は、ヘッダーを付けずに送ります
+- 控えの ticket で送らないと分かる件（`localPlayback: true` で `muteAware` が無い）は、MCP サーバーに ticket を頼みません
 - Para Code へ送れないとき（ticket が取れない）は、合成もしません
 
 ### hold と送り出し

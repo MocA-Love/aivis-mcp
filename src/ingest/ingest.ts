@@ -13,7 +13,7 @@ import { buildGainTable, loadLearnedGains, MAX_BOOST_DB, TARGET_LUFS } from '../
 import { validatePreludePath } from '../audio/prelude.js';
 import { MAX_UTTERANCE_MS } from '../streaming/playback-policy.js';
 import { AudioStreamWriter, MAX_STREAM_BYTES, STREAM_TTL_SECONDS } from '../queue/audio-stream.js';
-import { enqueueJob, isJobRegistered, withdrawJob, withdrawJobById } from '../queue/enqueue.js';
+import { enqueueJob, findQueuedJob, isJobRegistered, withdrawJob, withdrawJobByIdDetailed } from '../queue/enqueue.js';
 import { anyHoldActive, clearHold, isValidHoldOwner, setHold } from '../queue/hold.js';
 import { isValidStreamId, type Job, type JobPriority, type PreludeSpec } from '../queue/jobs.js';
 import {
@@ -75,6 +75,8 @@ interface TrackedJob {
   dequeuedBy: string | undefined;
   /** 中断（abort）を受け付けた */
   abortRequested: boolean;
+  /** 前の --ingest から引き継いだ（Stream はこの子が書いていない） */
+  adopted?: boolean;
 }
 
 export interface IngestIo {
@@ -341,6 +343,7 @@ export class IngestSession {
       case 'hold': return this.handleHold(message);
       case 'gain?': return this.handleGain(message);
       case 'withdraw': return this.handleWithdraw(message);
+      case 'adopt': return this.handleAdopt(message);
       case 'ping':
         this.send({ type: 'pong', requestId: message.requestId });
         return;
@@ -618,13 +621,18 @@ export class IngestSession {
     }
     const job = this.jobs.get(id);
     if (job?.started) {
-      this.send({ type: 'withdrawn', id, removed: false });
+      this.send({ type: 'withdrawn', id, removed: false, taken: true });
       return;
     }
-    // 列にあるときだけ外す（列から外す・Stream と知らせを消すまでを 1 つのスクリプトで行う）。
-    // worker が取り出していれば列に無いので false で、その件は worker が鳴らす。列へ戻されていれば外せる
-    const removed = await this.op(withdrawJobById(this.client, id)).catch(() => false);
-    if (removed) {
+    // 列にあれば外し、無ければ「積まれていない」と「取り出し済み」を分ける（1 つのスクリプトで判定する）。
+    // 同じ子の open の後ろに並ぶので、この子が送った積む要求は判定より先に Redis に届いている
+    let result: Awaited<ReturnType<typeof withdrawJobByIdDetailed>> | undefined;
+    try {
+      result = await this.op(withdrawJobByIdDetailed(this.client, id));
+    } catch {
+      result = undefined;
+    }
+    if (result === 'removed' || result === 'not-queued') {
       if (job) {
         this.jobs.delete(id);
         job.writer?.discard();
@@ -640,7 +648,70 @@ export class IngestSession {
       }
       this.rememberFinished(id);
     }
-    this.send({ type: 'withdrawn', id, removed });
+    if (result === 'removed') {
+      this.send({ type: 'withdrawn', id, removed: true });
+    } else if (result === 'not-queued') {
+      this.send({ type: 'withdrawn', id, removed: false, notQueued: true });
+    } else if (result === 'taken') {
+      this.send({ type: 'withdrawn', id, removed: false, taken: true });
+    } else {
+      // Redis に確かめられなかった。どちらとも言えない
+      this.send({ type: 'withdrawn', id, removed: false });
+    }
+  }
+
+  /**
+   * 前の `--ingest`（落ちた・入れ替えた子）が積んだ件の追跡を引き継ぐ。以後、Stream と知らせの期限の延長と、
+   * 知らせの読み取り・親への中継をこの子が行う。列にも知らせにも無い ID は引き継がない。
+   */
+  private async handleAdopt(message: Record<string, unknown>): Promise<void> {
+    const id = message.id;
+    if (!isValidStreamId(id)) {
+      this.send({ type: 'adopted', id: typeof id === 'string' ? id.slice(0, 64) : null, adopted: false });
+      return;
+    }
+    if (this.jobs.has(id)) {
+      this.send({ type: 'adopted', id, adopted: true });
+      return;
+    }
+    let queued: Awaited<ReturnType<typeof findQueuedJob>>;
+    let statuses: Awaited<ReturnType<typeof readStatuses>>;
+    try {
+      [queued, statuses] = await this.op(Promise.all([findQueuedJob(this.client, id), readStatuses(this.client, id, 0)]));
+    } catch {
+      this.send({ type: 'adopted', id, adopted: false });
+      return;
+    }
+    if (queued === undefined && statuses.entries.length === 0) {
+      this.send({ type: 'adopted', id, adopted: false });
+      return;
+    }
+    const first = statuses.entries[0];
+    const tracked: TrackedJob = {
+      id,
+      kind: queued?.type === 'sound' ? 'sound' : 'stream',
+      priority: queued?.priority ?? 'normal',
+      // 取り出し済みなら積んだ文字列は分からない（列から外す・位置を探すのには使えない値にしておく）
+      raw: queued?.raw ?? `adopted:${id}`,
+      writer: undefined,
+      openedAt: first?.at || this.now(),
+      statusIndex: 0,
+      started: false,
+      startedAt: undefined,
+      dequeued: false,
+      lostMs: 0,
+      lastLostCheck: undefined,
+      heldAtOpen: this.heldAccumMs,
+      registration: 'confirmed',
+      dequeuedBy: undefined,
+      abortRequested: false,
+      adopted: true,
+    };
+    this.finished.delete(id);
+    this.jobs.set(id, tracked);
+    this.send({ type: 'adopted', id, adopted: true });
+    // 知らせは頭から読み直し、playing と終わりを中継する（queued は返さない）
+    void this.pollStatuses();
   }
 
   private schedulePoll(): void {
@@ -665,8 +736,8 @@ export class IngestSession {
         }
         // hold の間は数えない
         if (this.now() - job.openedAt - (this.heldAccumMs - job.heldAtOpen) > TRACK_LIMIT_MS) {
-          // 積めたか分からないまま終える件は、列から外せたときだけ withdrawn を付ける（外せなければ鳴るかもしれない）
-          const withdrawn = job.registration === 'unknown'
+          // 追うのをやめる前に、まだ列にあれば外す。外せたときだけ withdrawn を付ける（外せなければ鳴るかもしれない）
+          const withdrawn = !job.started
             && await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
           this.finishJob(job, 'failed', 'untracked', withdrawn ? { withdrawn: true } : {});
           continue;
@@ -739,6 +810,9 @@ export class IngestSession {
     for (const job of this.jobs.values()) {
       if (job.writer) {
         await this.op(job.writer.touch()).catch(() => undefined);
+      } else if (job.adopted && job.kind === 'stream') {
+        // 引き継いだ件の Stream も延ばす（EXPIRE はキーを作らない）
+        await this.op(this.client.expire(audioStreamKey(job.id), STREAM_TTL_SECONDS)).catch(() => undefined);
       }
       await this.op(this.client.expire(statusKey(job.id), STATUS_TTL_SECONDS)).catch(() => undefined);
     }

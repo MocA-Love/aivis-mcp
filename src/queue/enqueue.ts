@@ -65,7 +65,13 @@ for _, key in ipairs({KEYS[1], KEYS[2]}) do
     end
   end
 end
-return 0`;
+-- 列に無い。知らせ（status）も無ければ、積む要求は届いていない（Stream だけ残っていれば消す）
+if redis.call('EXISTS', KEYS[4]) == 0 then
+  redis.call('DEL', KEYS[3])
+  return 2
+end
+-- 取り出し済み・鳴っている（または終わった）
+return 3`;
 
 /**
  * ID でジョブを探して列（q2:high・q2:normal）から外す。積んだのが別の `--ingest`（落ちた前の子など）でも外せる。
@@ -73,11 +79,44 @@ return 0`;
  * worker が取り出していれば（列に無ければ）false。
  */
 export async function withdrawJobById(client: RedisClientType, id: string): Promise<boolean> {
-  const removed = await client.eval(WITHDRAW_BY_ID_SCRIPT, {
+  return (await withdrawJobByIdDetailed(client, id)) === 'removed';
+}
+
+/**
+ * `withdrawJobById` と同じ。外せなかったときの理由も返す（1 つのスクリプトで判定する）。
+ * - removed: 列から外した（Stream と知らせも消した）
+ * - not-queued: 列にも知らせにも痕跡が無い（積む要求が届いていない）。残っていた Stream は消した
+ * - taken: 列に無く知らせはある（worker が取り出した・鳴っている・終わった）
+ */
+export type WithdrawResult = 'removed' | 'not-queued' | 'taken';
+
+export async function withdrawJobByIdDetailed(client: RedisClientType, id: string): Promise<WithdrawResult> {
+  const result = Number(await client.eval(WITHDRAW_BY_ID_SCRIPT, {
     keys: [HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY, audioStreamKey(id), statusKey(id)],
     arguments: [id],
-  });
-  return Number(removed) === 1;
+  }));
+  return result === 1 ? 'removed' : result === 2 ? 'not-queued' : 'taken';
+}
+
+/** 2.5 の列（high・normal）から ID でジョブを探す。見つかれば積んだ文字列と中身を返す。 */
+export async function findQueuedJob(client: RedisClientType, id: string): Promise<{ raw: string; priority: JobPriority; type: string } | undefined> {
+  const needle = `"id":"${id}"`;
+  for (const [key, priority] of [[HIGH_QUEUE_KEY, 'high'], [NORMAL_QUEUE_KEY, 'normal']] as const) {
+    for (const raw of await client.lRange(key, 0, -1)) {
+      if (!raw.includes(needle)) {
+        continue;
+      }
+      try {
+        const job = JSON.parse(raw) as { v?: unknown; id?: unknown; type?: unknown };
+        if (job.v === 2 && job.id === id) {
+          return { raw, priority, type: typeof job.type === 'string' ? job.type : 'stream' };
+        }
+      } catch {
+        // 壊れた要素は飛ばす
+      }
+    }
+  }
+  return undefined;
 }
 
 /** この機械のエージェントの発話（worker が合成しながら鳴らす）を積む。`id` を渡すとその ID で積む。 */

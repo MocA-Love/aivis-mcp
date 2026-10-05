@@ -562,5 +562,65 @@ describeWithRedis('worker の 2.5.1 の直し（別ポートの redis-server）'
     expect(voiceEnd).toBeDefined();
     expect(voiceEnd!.at).toBeLessThanOrEqual(releasedAt);
   });
+
+  test('[再々レビュー LOW 1] 残り 15 秒を切った控えは使わず、401 は明示の拒否ではなく ticket-unavailable', async () => {
+    const backend = new FakeBackend();
+    startWorker(backend, { timings: { voiceTicketRemoteWaitMs: 200 } });
+    const nearExpiry = uuidv4();
+    await enqueueSynthesis(client, {
+      text: 'リモート', provider: 'aivis',
+      _voiceRequester: { id: uuidv4(), localPlayback: true, remote: true },
+      _paraCodeVoiceTarget: sshTarget(1, { expiresAt: Date.now() + 10_000 }),
+    }, 'normal', nearExpiry);
+    expect(await finalStatus(nearExpiry)).toEqual({ status: 'failed', reason: 'ticket-unavailable' });
+    const paraCode = await fakeParaCode((request, response) => {
+      request.resume();
+      response.writeHead(401);
+      response.end();
+    });
+    const rejected = await enqueueSynthesis(client, { text: 'リモート', provider: 'aivis', _paraCodeVoiceTarget: sshTarget(paraCode.port) });
+    expect(await finalStatus(rejected.id)).toEqual({ status: 'failed', reason: 'ticket-unavailable' });
+    expect(backend.voices).toHaveLength(0);
+  });
+
+  test('[再々レビュー LOW 2] ミュート中に送らないと控えで分かる件は ticket を頼まない。時間切れの直後に届いた ticket は次に使う', async () => {
+    const subscriber = await connect(redis.url);
+    let captured = 0;
+    let delayMs = 0;
+    const paraCode = await fakeParaCode((request, response, bodies) => {
+      response.writeHead(200, { 'X-Para-Local-Playback': 'accepted' });
+      collectBody(request, bodies, () => response.end());
+    });
+    const responder = new VoiceTicketResponder(subscriber, client, uuidv4(), async () => {
+      captured++;
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      return sshTarget(paraCode.port, { ticket: `late-${captured}`, expiresAt: Date.now() + 600_000 });
+    }, () => true);
+    await responder.start();
+    cleanups.push(() => responder.stop());
+    const backend = new FakeBackend();
+    startWorker(backend, { timings: { voiceTicketRemoteWaitMs: 200 } });
+
+    await setMute(client, undefined);
+    const muted = uuidv4();
+    const fallback = sshTarget(paraCode.port, { ticket: 'fallback', expiresAt: Date.now() + 600_000 });
+    await enqueueSynthesis(client, { text: 'x', provider: 'aivis', _voiceRequester: responder.register(muted, fallback), _paraCodeVoiceTarget: fallback }, 'normal', muted);
+    expect(await finalStatus(muted)).toEqual({ status: 'muted' });
+    expect(captured).toBe(0);
+    expect(paraCode.requests).toHaveLength(0);
+    await client.del('aivis-mcp:muted');
+
+    // 返事が 200ms の待ちに 100ms 遅れる。その ticket は捨てずに、次の発話で頼まずに使う
+    delayMs = 300;
+    const first = uuidv4();
+    await enqueueSynthesis(client, { text: 'x', provider: 'aivis', _voiceRequester: responder.register(first) }, 'normal', first);
+    expect(await finalStatus(first)).toEqual({ status: 'failed', reason: 'ticket-unavailable' });
+    await new Promise(resolve => setTimeout(resolve, 400));
+    const second = uuidv4();
+    await enqueueSynthesis(client, { text: 'x', provider: 'aivis', _voiceRequester: responder.register(second) }, 'normal', second);
+    expect(await finalStatus(second)).toEqual({ status: 'done', reason: 'played-by-para-code' });
+    expect(captured).toBe(1);
+    expect(paraCode.requests[0].headers.authorization).toBe('Bearer late-1');
+  });
 });
 
