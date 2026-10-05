@@ -21,6 +21,7 @@ export function testConfig(redisUrl: string): AppConfig {
     elevenLabsApiUrl: 'http://127.0.0.1:9',
     elevenLabsModelId: 'eleven_v4_turbo',
     elevenLabsVolumeOffsetDb: 0,
+    elevenLabsContextWindowMinutes: 5,
     gainLearnWindow: 9,
     gainMinLearnSeconds: 2.5,
     volumeOffsetDb: 0,

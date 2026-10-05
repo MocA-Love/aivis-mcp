@@ -8,6 +8,7 @@ import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, 
 import { runIngest } from './ingest/ingest.js';
 import { enqueueSynthesis } from './queue/enqueue.js';
 import { withParaCodeVoiceTarget } from './services/para-code-voice.js';
+import { runDictionaryCommand } from './dictionary-command.js';
 import { runDoctor, checkDependencies } from './doctor.js';
 import { runInit } from './settings.js';
 
@@ -29,6 +30,9 @@ function printHelp(): void {
   console.log('  aivis-mcp --ingest                 Para Code 用の取込口（標準入出力の枠。docs/ingest-protocol.md）');
   console.log('  aivis-mcp --export-gains <file> [--voice <id>…] [--model <id>]  音量の表を書き出す（声・モデルで絞り込み）');
   console.log('  aivis-mcp --import-gains <file> [--overwrite]  音量の表を読み込んで足す（既定は自分の値を残す）');
+  console.log('  aivis-mcp --set-dictionary --provider elevenlabs --id <id> [--version-id <id>] ElevenLabs の発音辞書を使う');
+  console.log('  aivis-mcp --set-dictionary --provider aivis --id <uuid> Aivis のユーザー辞書を使う');
+  console.log('  aivis-mcp --clear-dictionary --provider <elevenlabs|aivis> 辞書を使わない');
   console.log('  aivis-mcp --init                   初期設定（APIキー等を保存）');
   console.log('  aivis-mcp --doctor                 依存ツール診断');
   console.log('  aivis-mcp --version                バージョン表示');
@@ -69,6 +73,13 @@ function printHelp(): void {
 
 async function main() {
   const { values, positionals } = parseCliArgs();
+
+  // --set-dictionary / --clear-dictionary（Para Code が呼ぶ。出力は ok の 1 行か、終了コード 1）。
+  // 設定を読む前に分ける（読み替えの警告などを出さない）
+  if (await runDictionaryCommand(values)) {
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+  }
+
   const config = resolveConfig(values);
 
   // --version

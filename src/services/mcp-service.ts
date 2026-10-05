@@ -3,17 +3,22 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
-import { buildSynthesisParams, type AppConfig } from '../config.js';
+import { buildSynthesisParams, MAX_ELEVENLABS_CONTEXT_MINUTES, type AppConfig } from '../config.js';
 import { getConfigPath, updateSettings, TTS_PROVIDERS, type TtsProvider } from '../settings.js';
 import { AivisSpeechService } from './aivis-speech-service.js';
 import { spawnWorker } from './redis-service.js';
 import {
   describeElevenLabsError,
   elevenLabsErrorCode,
+  getElevenLabsPronunciationDictionary,
   getElevenLabsVoice,
   listElevenLabsModels,
+  listElevenLabsPronunciationDictionaries,
   listElevenLabsVoices,
 } from './elevenlabs-client.js';
+import { getAivisUserDictionary, isElevenLabsId, isUuid, listAivisUserDictionaries } from './dictionaries.js';
+import { supportsElevenLabsContext } from './elevenlabs-context.js';
+import { dictionaryPatch } from '../dictionary-command.js';
 
 const MCP_MODEL_ID = 'aivis-speech';
 const MCP_MODEL_NAME = 'Aivis Speech';
@@ -159,7 +164,11 @@ export class MCPService {
         elevenlabs_voice_id: z.string().min(1).optional().describe('ElevenLabs の voice_id'),
         elevenlabs_model_id: z.string().min(1).optional().describe('ElevenLabs の model_id（例: eleven_v4_turbo）'),
         volume_offset_db: z.number().min(-30).max(8).optional().describe('すべての声に足す音量の上乗せ（dB、デフォルト0）。声は自動で同じ大きさに揃えるので、全体がうるさい・小さいと言われたときだけ使う'),
-        elevenlabs_volume_db: z.number().min(-30).max(8).optional().describe('ElevenLabs の声だけに足す音量の上乗せ（dB、デフォルト0）。2.4 までの -13 基準の値は自動で読み替え済み')
+        elevenlabs_volume_db: z.number().min(-30).max(8).optional().describe('ElevenLabs の声だけに足す音量の上乗せ（dB、デフォルト0）。2.4 までの -13 基準の値は自動で読み替え済み'),
+        elevenlabs_context_window_minutes: z.number().min(0).max(MAX_ELEVENLABS_CONTEXT_MINUTES).optional().describe('同じ声・同じモデルの前の発話が何分以内なら、その文脈を付けて声の調子をつなげるか（デフォルト5、0で付けない。eleven_v3 系には付かない）'),
+        elevenlabs_pronunciation_dictionary_id: z.string().optional().describe('ElevenLabs の発音辞書の ID（tts-list-dictionaries で調べる）。空文字で辞書を使わない'),
+        elevenlabs_pronunciation_dictionary_version_id: z.string().optional().describe('発音辞書の版の ID。省略・空文字なら合成のたびに最新の版を使う'),
+        aivis_user_dictionary_uuid: z.string().optional().describe('Aivis のユーザー辞書の UUID（tts-list-dictionaries で調べる）。空文字で辞書を使わない')
       },
       async (params) => {
         try {
@@ -197,6 +206,15 @@ export class MCPService {
           return errorResult(`声の検索に失敗しました: ${describeElevenLabsError(error)}`);
         }
       }
+    );
+
+    this.mcpServer.tool(
+      'tts-list-dictionaries',
+      'ElevenLabs の発音辞書（アーカイブ済みは除く）と Aivis のユーザー辞書の一覧を返す。使う辞書は tts-configure で設定する。',
+      {
+        provider: z.enum(TTS_PROVIDERS as [TtsProvider, ...TtsProvider[]]).optional().describe('一方だけ調べる（未指定時は両方）')
+      },
+      async (params) => jsonResult(await this.listDictionaries(this.loadConfig(), params.provider))
     );
 
     this.mcpServer.tool(
@@ -246,17 +264,35 @@ export class MCPService {
         source: 'this-server',
         note: '動いている worker が見つからないので、この MCP サーバーで読んだ値を出しています。実際に効くのは worker の値で、worker を起こしたプロセスの環境変数 AIVIS_GAIN_LEARN_WINDOW / AIVIS_GAIN_MIN_LEARN_SECONDS があればそちらが勝ちます',
       };
+    const workerContext = worker?.elevenLabsContextWindowMinutes;
+    const contextMinutes = workerContext ?? config.elevenLabsContextWindowMinutes;
+    const context: Record<string, unknown> = {
+      window_minutes: contextMinutes,
+      enabled: contextMinutes > 0 && supportsElevenLabsContext(config.elevenLabsModelId),
+      source: workerContext !== undefined ? 'worker' : 'this-server',
+      description: '同じ声・同じモデルの前の発話がこの分数以内なら、前の発話の request ID（取れていなければ前の文）を付けて声の調子をつなげる。どのペインからの発話かは問わない',
+    };
+    if (!supportsElevenLabsContext(config.elevenLabsModelId)) {
+      context.note = 'eleven_v3 系のモデルは前の発話の文脈を受け付けないので付けません';
+    } else if (workerContext === undefined) {
+      context.note = '動いている worker の値が見つからないので、この MCP サーバーで読んだ値を出しています。worker を起こしたプロセスの環境変数 AIVIS_ELEVENLABS_CONTEXT_MINUTES があればそちらが勝ちます';
+    }
     return {
       provider: config.provider,
       aivis: {
         api_key: maskSecret(config.apiKey),
         model_uuid: config.modelUuid,
+        user_dictionary_uuid: config.aivisUserDictionaryUuid ?? null,
       },
       elevenlabs: {
         api_key: maskSecret(config.elevenLabsApiKey),
         voice_id: config.elevenLabsVoiceId ?? null,
         model_id: config.elevenLabsModelId,
         volume_offset_db: config.elevenLabsVolumeOffsetDb,
+        context,
+        pronunciation_dictionary: config.elevenLabsPronunciationDictionaryId === undefined
+          ? null
+          : { id: config.elevenLabsPronunciationDictionaryId, version_id: config.elevenLabsPronunciationDictionaryVersionId ?? 'latest' },
       },
       volume_offset_db: config.volumeOffsetDb,
       gain,
@@ -273,6 +309,10 @@ export class MCPService {
     elevenlabs_model_id?: string;
     elevenlabs_volume_db?: number;
     volume_offset_db?: number;
+    elevenlabs_context_window_minutes?: number;
+    elevenlabs_pronunciation_dictionary_id?: string;
+    elevenlabs_pronunciation_dictionary_version_id?: string;
+    aivis_user_dictionary_uuid?: string;
   }) {
     const current = this.loadConfig();
     const candidate: AppConfig = {
@@ -285,8 +325,14 @@ export class MCPService {
       elevenLabsModelId: params.elevenlabs_model_id ?? current.elevenLabsModelId,
       elevenLabsVolumeOffsetDb: params.elevenlabs_volume_db ?? current.elevenLabsVolumeOffsetDb,
       volumeOffsetDb: params.volume_offset_db ?? current.volumeOffsetDb,
+      elevenLabsContextWindowMinutes: params.elevenlabs_context_window_minutes ?? current.elevenLabsContextWindowMinutes,
     };
     const warnings: string[] = [];
+
+    const dictionaryError = await this.checkDictionaries(candidate, params, warnings);
+    if (dictionaryError !== undefined) {
+      return errorResult(dictionaryError);
+    }
 
     const touchesElevenLabs = candidate.provider === 'elevenlabs'
       || params.elevenlabs_api_key !== undefined
@@ -334,7 +380,17 @@ export class MCPService {
       warnings.push('Aivis のAPIキーが未設定のため、このままでは読み上げできません。');
     }
 
-    updateSettings({
+    // 空文字は「使わない」。辞書を替えたら、前の辞書の版は消す（版を省けば最新の版を使う）
+    const elevenId = params.elevenlabs_pronunciation_dictionary_id?.trim();
+    const elevenVersion = params.elevenlabs_pronunciation_dictionary_version_id?.trim();
+    const elevenDictionary = elevenId !== undefined
+      ? dictionaryPatch('elevenlabs', elevenId || undefined, elevenVersion || undefined).elevenlabs
+      : elevenVersion !== undefined
+        ? { pronunciationDictionaryVersionId: elevenVersion || null }
+        : undefined;
+    const aivisUuid = params.aivis_user_dictionary_uuid?.trim();
+    const aivisDictionary = aivisUuid === undefined ? undefined : dictionaryPatch('aivis', aivisUuid || undefined).aivis;
+    await updateSettings({
       provider: params.provider,
       apiKey: params.aivis_api_key,
       modelUuid: params.aivis_model_uuid,
@@ -346,7 +402,10 @@ export class MCPService {
         volumeOffsetDb: params.elevenlabs_volume_db,
         // 2.5 の値として保存したので、2.4 の値からの読み替えはもうしない
         volumeMigrated: params.elevenlabs_volume_db !== undefined ? true : undefined,
+        contextWindowMinutes: params.elevenlabs_context_window_minutes,
+        ...elevenDictionary,
       },
+      aivis: aivisDictionary,
     });
 
     // 環境変数やCLI引数は config.json より優先されるので、保存しても反映されない項目を知らせる
@@ -360,11 +419,111 @@ export class MCPService {
     if (effective.elevenLabsModelId !== candidate.elevenLabsModelId) overridden.push('elevenlabs_model_id (ELEVENLABS_MODEL_ID / --eleven-model)');
     if (effective.elevenLabsVolumeOffsetDb !== candidate.elevenLabsVolumeOffsetDb) overridden.push('elevenlabs_volume_db (ELEVENLABS_VOLUME_DB)');
     if (effective.volumeOffsetDb !== candidate.volumeOffsetDb) overridden.push('volume_offset_db (AIVIS_VOLUME_OFFSET_DB)');
+    if (effective.elevenLabsContextWindowMinutes !== candidate.elevenLabsContextWindowMinutes) overridden.push('elevenlabs_context_window_minutes (AIVIS_ELEVENLABS_CONTEXT_MINUTES)');
     if (overridden.length > 0) {
       warnings.push(`環境変数またはCLI引数が優先されるため、次の項目は保存した値が使われません: ${overridden.join(', ')}`);
     }
 
     return jsonResult({ saved: true, settings: await this.describeSettings(effective), warnings });
+  }
+
+  /**
+   * 辞書の指定を確かめる。形が違う・見つからない・アーカイブ済みなら保存を止める理由を返す。
+   * 確かめられなかった（ネットワーク・権限）ときは警告に足して保存する。
+   */
+  private async checkDictionaries(
+    candidate: AppConfig,
+    params: { elevenlabs_pronunciation_dictionary_id?: string; elevenlabs_pronunciation_dictionary_version_id?: string; aivis_user_dictionary_uuid?: string },
+    warnings: string[],
+  ): Promise<string | undefined> {
+    const elevenId = params.elevenlabs_pronunciation_dictionary_id?.trim();
+    const versionId = params.elevenlabs_pronunciation_dictionary_version_id?.trim();
+    if (versionId !== undefined && versionId !== '' && !isElevenLabsId(versionId)) {
+      return `保存しませんでした。発音辞書の版の ID "${versionId}" の形が違います。`;
+    }
+    if (versionId !== undefined && versionId !== '' && (elevenId === undefined ? candidate.elevenLabsPronunciationDictionaryId === undefined : elevenId === '')) {
+      return '保存しませんでした。版だけでは使えません。elevenlabs_pronunciation_dictionary_id も指定してください。';
+    }
+    if (elevenId !== undefined && elevenId !== '') {
+      if (!isElevenLabsId(elevenId)) {
+        return `保存しませんでした。発音辞書の ID "${elevenId}" の形が違います。`;
+      }
+      if (!candidate.elevenLabsApiKey) {
+        return 'ElevenLabs のAPIキーが未設定です。elevenlabs_api_key も指定してください。';
+      }
+      try {
+        const dictionary = await getElevenLabsPronunciationDictionary(candidate, elevenId);
+        if (dictionary.archived_time_unix !== undefined) {
+          return `保存しませんでした。発音辞書 "${dictionary.name || elevenId}" はアーカイブ済みです。`;
+        }
+      } catch (error) {
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        if (elevenLabsErrorCode(error) === 'invalid_api_key') {
+          return `保存しませんでした。${describeElevenLabsError(error)}`;
+        }
+        if (status === 404 || status === 400) {
+          return `保存しませんでした。発音辞書 "${elevenId}" が見つかりません: ${describeElevenLabsError(error)}`;
+        }
+        warnings.push(`発音辞書の存在確認をスキップしました（${describeElevenLabsError(error)}）。取れないときは辞書なしで合成します。`);
+      }
+    }
+    const aivisUuid = params.aivis_user_dictionary_uuid?.trim();
+    if (aivisUuid !== undefined && aivisUuid !== '') {
+      if (!isUuid(aivisUuid)) {
+        return `保存しませんでした。Aivis のユーザー辞書の UUID "${aivisUuid}" の形が違います。`;
+      }
+      if (!candidate.apiKey) {
+        warnings.push('Aivis のAPIキーが未設定なので、ユーザー辞書の存在を確かめていません。');
+      } else {
+        try {
+          await getAivisUserDictionary(candidate, aivisUuid);
+        } catch (error) {
+          const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+          if (status === 404 || status === 422) {
+            return `保存しませんでした。Aivis のユーザー辞書 "${aivisUuid}" が見つかりません (${status})。`;
+          }
+          warnings.push(`Aivis のユーザー辞書の存在確認をスキップしました（${status === undefined ? (error instanceof Error ? error.message : String(error)) : status}）。`);
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private async listDictionaries(config: AppConfig, provider: TtsProvider | undefined): Promise<Record<string, unknown>> {
+    const result: Record<string, unknown> = {};
+    if (provider === undefined || provider === 'elevenlabs') {
+      if (!config.elevenLabsApiKey) {
+        result.elevenlabs = { error: 'ElevenLabs のAPIキーが未設定です' };
+      } else {
+        try {
+          result.elevenlabs = {
+            selected: config.elevenLabsPronunciationDictionaryId ?? null,
+            dictionaries: (await listElevenLabsPronunciationDictionaries(config)).map(dictionary => ({
+              id: dictionary.id,
+              name: dictionary.name,
+              latest_version_id: dictionary.latest_version_id,
+              rules_count: dictionary.rules_count,
+              description: dictionary.description,
+            })),
+          };
+        } catch (error) {
+          result.elevenlabs = { error: describeElevenLabsError(error) };
+        }
+      }
+    }
+    if (provider === undefined || provider === 'aivis') {
+      if (!config.apiKey) {
+        result.aivis = { error: 'Aivis のAPIキーが未設定です' };
+      } else {
+        try {
+          result.aivis = { selected: config.aivisUserDictionaryUuid ?? null, dictionaries: await listAivisUserDictionaries(config) };
+        } catch (error) {
+          const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+          result.aivis = { error: status === undefined ? `Aivis API に接続できません: ${error instanceof Error ? error.message : String(error)}` : `Aivis API エラー (${status})` };
+        }
+      }
+    }
+    return result;
   }
 
   async start(): Promise<void> {

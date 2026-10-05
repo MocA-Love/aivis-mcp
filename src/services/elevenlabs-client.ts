@@ -39,16 +39,27 @@ export function stripSsmlTags(text: string): string {
   return text.replace(/<\/?[a-zA-Z][^<>]*>/g, '').trim();
 }
 
-export async function synthesizeElevenLabsStream(
-  config: AppConfig,
-  params: { text: string; voice_id?: string; model_id?: string; speaking_rate?: unknown },
-  signal?: AbortSignal,
-): Promise<NodeJS.ReadableStream> {
-  const voiceId = params.voice_id || config.elevenLabsVoiceId;
-  if (!voiceId) {
-    throw new Error('ElevenLabs の voice_id が設定されていません');
-  }
+/** 合成の要求に足す項目（前の発話の文脈・発音辞書）。 */
+export interface ElevenLabsRequestExtras {
+  readonly previous_request_ids?: readonly string[];
+  readonly previous_text?: string;
+  readonly pronunciation_dictionary_locators?: readonly { pronunciation_dictionary_id: string; version_id: string }[];
+}
 
+export interface ElevenLabsStreamResponse {
+  readonly stream: NodeJS.ReadableStream;
+  /** 応答ヘッダーの `request-id`（無ければ undefined） */
+  readonly requestId: string | undefined;
+  /** 実際に送った文（SSML 風のタグを除いたもの） */
+  readonly sentText: string;
+}
+
+/** 合成の要求の本文（送る前に組み立てる。テストでも使う）。 */
+export function buildElevenLabsBody(
+  config: AppConfig,
+  params: { text: string; model_id?: string; speaking_rate?: unknown },
+  extras: ElevenLabsRequestExtras = {},
+): Record<string, unknown> {
   const speed = toElevenLabsSpeed(params.speaking_rate);
   const body: Record<string, unknown> = {
     text: stripSsmlTags(params.text),
@@ -57,6 +68,28 @@ export async function synthesizeElevenLabsStream(
   if (speed !== undefined) {
     body.voice_settings = { speed };
   }
+  if (extras.previous_request_ids !== undefined && extras.previous_request_ids.length > 0) {
+    body.previous_request_ids = [...extras.previous_request_ids];
+  } else if (extras.previous_text !== undefined && extras.previous_text !== '') {
+    body.previous_text = extras.previous_text;
+  }
+  if (extras.pronunciation_dictionary_locators !== undefined && extras.pronunciation_dictionary_locators.length > 0) {
+    body.pronunciation_dictionary_locators = extras.pronunciation_dictionary_locators.map(locator => ({ ...locator }));
+  }
+  return body;
+}
+
+export async function requestElevenLabsStream(
+  config: AppConfig,
+  params: { text: string; voice_id?: string; model_id?: string; speaking_rate?: unknown },
+  extras: ElevenLabsRequestExtras = {},
+  signal?: AbortSignal,
+): Promise<ElevenLabsStreamResponse> {
+  const voiceId = params.voice_id || config.elevenLabsVoiceId;
+  if (!voiceId) {
+    throw new Error('ElevenLabs の voice_id が設定されていません');
+  }
+  const body = buildElevenLabsBody(config, params, extras);
 
   const response = await axios.post(
     `${config.elevenLabsApiUrl}/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream`,
@@ -69,7 +102,89 @@ export async function synthesizeElevenLabsStream(
       signal,
     }
   );
-  return response.data;
+  const requestId = response.headers?.['request-id'];
+  return {
+    stream: response.data,
+    requestId: typeof requestId === 'string' && requestId !== '' ? requestId : undefined,
+    sentText: String(body.text),
+  };
+}
+
+export async function synthesizeElevenLabsStream(
+  config: AppConfig,
+  params: { text: string; voice_id?: string; model_id?: string; speaking_rate?: unknown },
+  signal?: AbortSignal,
+): Promise<NodeJS.ReadableStream> {
+  return (await requestElevenLabsStream(config, params, {}, signal)).stream;
+}
+
+/** ElevenLabs の発音辞書（一覧・解決用）。 */
+export interface ElevenLabsPronunciationDictionary {
+  readonly id: string;
+  readonly name: string;
+  readonly latest_version_id: string;
+  readonly rules_count?: number;
+  readonly description?: string;
+  /** アーカイブした時刻（Unix 秒）。アーカイブしていなければ undefined */
+  readonly archived_time_unix?: number;
+}
+
+function toPronunciationDictionary(raw: any): ElevenLabsPronunciationDictionary | undefined {
+  if (raw === null || typeof raw !== 'object' || typeof raw.id !== 'string' || typeof raw.latest_version_id !== 'string') {
+    return undefined;
+  }
+  return {
+    id: raw.id,
+    name: typeof raw.name === 'string' ? raw.name : '',
+    latest_version_id: raw.latest_version_id,
+    rules_count: typeof raw.latest_version_rules_num === 'number' ? raw.latest_version_rules_num : undefined,
+    description: typeof raw.description === 'string' && raw.description !== '' ? raw.description : undefined,
+    archived_time_unix: typeof raw.archived_time_unix === 'number' ? raw.archived_time_unix : undefined,
+  };
+}
+
+/** 発音辞書を 1 つ取る（最新の版とアーカイブの有無を見る）。 */
+export async function getElevenLabsPronunciationDictionary(
+  config: AppConfig,
+  dictionaryId: string,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<ElevenLabsPronunciationDictionary> {
+  const response = await axios.get(`${config.elevenLabsApiUrl}/v1/pronunciation-dictionaries/${encodeURIComponent(dictionaryId)}`, {
+    headers: headers(config.elevenLabsApiKey),
+    timeout: options.timeoutMs ?? 15000,
+    signal: options.signal,
+  });
+  const dictionary = toPronunciationDictionary(response.data);
+  if (dictionary === undefined) {
+    throw new Error('発音辞書の応答の形が想定と違います');
+  }
+  return dictionary;
+}
+
+/** アーカイブしていない発音辞書の一覧（最大 maxPages ページ）。 */
+export async function listElevenLabsPronunciationDictionaries(config: AppConfig, maxPages = 5): Promise<ElevenLabsPronunciationDictionary[]> {
+  const result: ElevenLabsPronunciationDictionary[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const response = await axios.get(`${config.elevenLabsApiUrl}/v1/pronunciation-dictionaries`, {
+      params: { page_size: 100, include_archived: false, cursor },
+      headers: headers(config.elevenLabsApiKey),
+      timeout: 15000,
+    });
+    const items: unknown[] = Array.isArray(response.data?.pronunciation_dictionaries) ? response.data.pronunciation_dictionaries : [];
+    for (const item of items) {
+      const dictionary = toPronunciationDictionary(item);
+      // include_archived=false を解さない相手でも、アーカイブ済みは出さない
+      if (dictionary !== undefined && dictionary.archived_time_unix === undefined) {
+        result.push(dictionary);
+      }
+    }
+    cursor = response.data?.has_more === true && typeof response.data?.next_cursor === 'string' ? response.data.next_cursor : undefined;
+    if (cursor === undefined) {
+      break;
+    }
+  }
+  return result;
 }
 
 export async function listElevenLabsVoices(

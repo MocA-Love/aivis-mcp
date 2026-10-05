@@ -5,6 +5,7 @@ import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { withParaCodeVoiceTarget } from './services/para-code-voice.js';
 import { enqueueSynthesis } from './queue/enqueue.js';
 import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, runRestoreLegacyQueue, runGainTransfer, warnStrayVoiceOption } from './commands.js';
+import { runDictionaryCommand } from './dictionary-command.js';
 import { runDoctor } from './doctor.js';
 import { runInit } from './settings.js';
 
@@ -41,6 +42,9 @@ function printHelp(): void {
   console.log('  aivis --restore-legacy-queue    2.5.0 以前へ戻すとき、移した古い列の発話を戻す');
   console.log('  aivis --export-gains <file> [--voice <id>…] [--model <id>]  音量の表を書き出す（声・モデルで絞り込み）');
   console.log('  aivis --import-gains <file> [--overwrite]  音量の表を読み込んで足す（既定は自分の値を残す）');
+  console.log('  aivis --set-dictionary --provider elevenlabs --id <id> [--version-id <id>] ElevenLabs の発音辞書を使う');
+  console.log('  aivis --set-dictionary --provider aivis --id <uuid> Aivis のユーザー辞書を使う');
+  console.log('  aivis --clear-dictionary --provider <elevenlabs|aivis> 辞書を使わない');
   console.log('  aivis --init                      初期設定（APIキー等を保存）');
   console.log('  aivis --doctor                    依存ツール診断');
   console.log('  aivis --version                   バージョン表示');
@@ -65,6 +69,13 @@ function printHelp(): void {
  */
 async function main() {
   const { values, positionals } = parseCliArgs();
+
+  // --set-dictionary / --clear-dictionary（Para Code が呼ぶ。出力は ok の 1 行か、終了コード 1）。
+  // 設定を読む前に分ける（読み替えの警告などを出さない）
+  if (await runDictionaryCommand(values)) {
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+  }
+
   const config = resolveConfig(values);
 
   if (values.version) {

@@ -115,9 +115,10 @@ LLM は次のMCPツールを使って設定します。
 
 | ツール | 役割 |
 |---|---|
-| `tts-get-settings` | 現在のサービス、声、モデル、音量の覚え直し方（窓と最短秒数）を表示（APIキーは伏せ字） |
-| `tts-configure` | サービス、APIキー、声、モデル、音量補正を変更して保存。無効なAPIキーや存在しないモデルは保存しない |
+| `tts-get-settings` | 現在のサービス、声、モデル、音量の覚え直し方（窓と最短秒数）、前の発話の文脈、辞書を表示（APIキーは伏せ字） |
+| `tts-configure` | サービス、APIキー、声、モデル、音量補正、文脈を付ける時間、辞書を変更して保存。無効なAPIキーや存在しないモデル・辞書は保存しない |
 | `tts-list-voices` | 声の候補を検索（ElevenLabs はアカウントのボイスライブラリ、Aivis は公開モデル） |
+| `tts-list-dictionaries` | ElevenLabs の発音辞書（アーカイブ済みは除く）と Aivis のユーザー辞書の一覧 |
 | `elevenlabs-list-models` | ElevenLabs の日本語対応モデル一覧 |
 
 `aivis-speech` に `provider` / `voice_id` / `model_id` を渡すと、その発話だけ別のサービスや声で話せます。
@@ -127,6 +128,60 @@ LLM は次のMCPツールを使って設定します。
 | モデル | `eleven_v4_turbo` | `elevenlabs-list-models` で他のモデルを確認できる |
 | 音量 | 自動 | 声とモデルの組ごとの表で -20 LUFS にそろえる（下の「音量」）。`tts-configure` の `elevenlabs_volume_db` は ElevenLabs だけに足す上乗せ（既定 0） |
 | SSML | 使わない | ElevenLabs に送る前に `<...>` 形式のタグを取り除く |
+
+### 前の発話の文脈（ElevenLabs）
+
+worker は、直前に合成した声の発話 1 件を覚えます。次の発話がそれと同じ voice_id・model_id で、前の発話を読み終えてから 5 分以内なら、前の発話の request ID（応答ヘッダー `request-id`。取れていなければ前の文）を `previous_request_ids` / `previous_text` として付け、声の調子をつなげます。どのペイン・どのエージェントからの発話かは問いません。SSH 先の worker が合成して Para Code へ送る発話も、その worker のメモリで同じに動きます。
+
+| 場面 | 文脈 |
+|---|---|
+| 直前の声の発話と同じ voice_id・model_id で、窓の中 | 付ける（request ID は 2 時間以内のものだけ。古ければ前の文） |
+| 間に別の声・別のモデル・Aivis の発話が挟まった | 付けない（直前の記録がその発話に置き換わる） |
+| 間に着信音（sound ジョブ・prelude）だけが挟まった | 付ける（声でない再生は記録を変えない） |
+| 間に取込の声（Para Code の通知・SSH 先から届いた合成済みの声。`--ingest` の stream ジョブ）が挟まった | 付けない（鳴らしたら記録を消す） |
+| 直前の発話の合成が失敗した・途中で止めた | 付けない（記録を消す。ElevenLabs は読み終えていない要求の ID を使えない） |
+| `eleven_v3` 系のモデル | 付けない（公式に非対応） |
+| 文脈を付けた要求が 4xx（401・403・429 を除く）で失敗 | 文脈なしで 1 回だけ合成し直す |
+
+`next_text` / `next_request_ids` は付けません。覚えるのは worker のメモリだけで、worker が入れ替わったら消えます。
+
+窓は環境変数 `AIVIS_ELEVENLABS_CONTEXT_MINUTES` > `config.json` の `elevenlabs.contextWindowMinutes` > 既定 5 分 の順に効きます（`tts-configure` の `elevenlabs_context_window_minutes` でも変えられます）。0 で付けません。範囲は 0〜1440 で、外れた値は既定に戻して警告します。
+
+### 辞書
+
+`config.json` に辞書を書くと、合成のたびに要求へ付けます。worker は発話ごとに設定を読み直すので、`--reboot` は要りません。
+
+| 指定 | 付け方 |
+|---|---|
+| `elevenlabs.pronunciationDictionaryId`（省略可で `elevenlabs.pronunciationDictionaryVersionId`） | `pronunciation_dictionary_locators` に 1 つ。版を書かなければ、合成のたびに最新の版を取り（60 秒覚える）、取れない・アーカイブ済みなら辞書なしで合成する |
+| `aivis.userDictionaryUuid` | Aivis の `user_dictionary_uuid` |
+
+```json
+{
+  "elevenlabs": { "pronunciationDictionaryId": "<dictionary_id>" },
+  "aivis": { "userDictionaryUuid": "<uuid>" }
+}
+```
+
+LLM からは `tts-list-dictionaries` で一覧を見て、`tts-configure` の `elevenlabs_pronunciation_dictionary_id`（と `elevenlabs_pronunciation_dictionary_version_id`）・`aivis_user_dictionary_uuid` で設定します。空文字を渡すと解除します。アーカイブ済み・見つからない辞書は保存しません。
+
+#### Para Code などから設定する CLI
+
+```bash
+aivis-mcp --set-dictionary --provider elevenlabs --id <dictionary_id> [--version-id <version_id>]
+aivis-mcp --set-dictionary --provider aivis --id <uuid>
+aivis-mcp --clear-dictionary --provider elevenlabs
+aivis-mcp --clear-dictionary --provider aivis
+```
+
+取り決め（呼ぶ側はこれだけを当てにしてよい）:
+
+- 成功したら標準出力に `ok` の 1 行だけを書き、終了コード 0 で終わる
+- 失敗したら標準出力には何も書かず、標準エラーに `error: <理由>` の 1 行を書き、終了コード 1 で終わる。設定は書き換えない
+- API は呼ばない。ID の形（ElevenLabs は英数字と `-` `_`、Aivis は UUID）だけを確かめる
+- ElevenLabs で別の辞書を設定すると、前の辞書の版は消す（`--version-id` を省けば最新の版を使う）。`--version-id` は ElevenLabs だけ
+- `config.json` の書き込みは、`config.json.lock` を持って読み直してから一時ファイル経由で置き換える（`tts-configure` と同時に書いても互いの変更を消さない）。ロックが 5 秒空かなければ失敗にする。読んだ `config.json` が JSON として壊れている・読めないときも、書かずに失敗にする（既存の設定を消さない）
+- `aivis` コマンドでも同じ引数で使える
 
 > [!WARNING]
 > チャットに書いたAPIキーは会話ログに残ります。気になる場合は `npx aivis-mcp --init` か環境変数 `ELEVENLABS_API_KEY` で設定してください。
@@ -240,6 +295,8 @@ npx aivis-mcp --reboot     # 全プロセス再起動
 npx aivis-mcp --version    # バージョン表示
 npx aivis-mcp --export-gains gains.json   # 音量の表を書き出す（上の「音量」）
 npx aivis-mcp --import-gains gains.json   # 音量の表を読み込んで足す
+npx aivis-mcp --set-dictionary --provider aivis --id <uuid>   # 辞書を使う（上の「辞書」）
+npx aivis-mcp --clear-dictionary --provider aivis             # 辞書を使わない
 ```
 
 > [!IMPORTANT]

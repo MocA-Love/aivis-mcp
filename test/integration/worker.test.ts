@@ -20,6 +20,8 @@ import type { AppConfig } from '../../src/config.js';
 import { connect, describeWithRedis, startTestRedis, waitFor, type TestRedis } from '../helpers/redis.js';
 import { FakeBackend } from '../helpers/fake-backend.js';
 import { mp3Frames, testConfig } from '../helpers/fixtures.js';
+import { createSynthesizer, type SynthesizeFunction } from '../../src/audio/synthesize.js';
+import type { ElevenLabsRequestExtras } from '../../src/services/elevenlabs-client.js';
 
 describeWithRedis('worker（別ポートの redis-server）', () => {
   let redis: TestRedis;
@@ -58,7 +60,7 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function startWorker(backend: FakeBackend, options: { version?: string; synthesize?: () => Promise<NodeJS.ReadableStream>; measure?: () => Promise<{ integratedLufs: number; durationSeconds: number }>; loadConfig?: () => AppConfig } = {}): PlaybackWorker {
+  function startWorker(backend: FakeBackend, options: { version?: string; synthesize?: SynthesizeFunction; measure?: () => Promise<{ integratedLufs: number; durationSeconds: number }>; loadConfig?: () => AppConfig } = {}): PlaybackWorker {
     const worker = new PlaybackWorker({
       redisUrl: redis.url,
       version: options.version ?? '2.5.0',
@@ -241,10 +243,10 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     const first = await enqueueSynthesis(client, { text: '一つ目', provider: 'aivis', model_uuid: 'model-c' });
     expect(await finalStatus(first.id)).toEqual({ status: 'done' });
     // worker が実際に使っている値を、lock と同じ寿命で Redis に置く（tts-get-settings が見る）
-    expect(await readWorkerGainSettings(client)).toEqual({ learnWindow: 9, minLearnSeconds: 2.5, version: '2.5.0' });
+    expect(await readWorkerGainSettings(client)).toEqual({ learnWindow: 9, minLearnSeconds: 2.5, version: '2.5.0', elevenLabsContextWindowMinutes: 5 });
     expect(await client.pTTL(WORKER_GAIN_SETTINGS_KEY)).toBeGreaterThan(0);
     const speech = new AivisSpeechService(testConfig(redis.url));
-    expect(await speech.workerGainSettings()).toEqual({ learnWindow: 9, minLearnSeconds: 2.5, version: '2.5.0' });
+    expect(await speech.workerGainSettings()).toEqual({ learnWindow: 9, minLearnSeconds: 2.5, version: '2.5.0', elevenLabsContextWindowMinutes: 5 });
     const unreachable = new AivisSpeechService(testConfig('redis://127.0.0.1:9'));
     expect(await unreachable.workerGainSettings()).toBeUndefined();
     // 打ち切った後に繋がった接続も、決着したら閉じる
@@ -467,5 +469,65 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     expect(await finalStatus('stolen')).toEqual({ status: 'failed', reason: 'play-lock-lost' });
     expect(backend.voices[0].killed).toBe(true);
   });
-});
 
+  test('ElevenLabs の文脈: 着信音（sound ジョブ・prelude）が挟まってもつなぎ、Aivis の声が挟まったらつながない', async () => {
+    const sent: { text: string; extras: ElevenLabsRequestExtras }[] = [];
+    const synthesize = createSynthesizer({
+      requestElevenLabs: async (_config, params, extras) => {
+        sent.push({ text: params.text, extras: extras ?? {} });
+        return { stream: Readable.from([mp3Frames(20)]), requestId: `req-${sent.length}`, sentText: params.text };
+      },
+    });
+    const config: AppConfig = { ...testConfig(redis.url), elevenLabsApiKey: 'k', elevenLabsVoiceId: 'voiceA' };
+    const eleven = (text: string) => ({ text, provider: 'elevenlabs' });
+    const first = await enqueueSynthesis(client, eleven('一つ目'));
+    await enqueueJob(client, { v: 2, type: 'sound', id: 'chime', priority: 'normal', source: 'ingest', enqueuedAt: Date.now(), prelude: { path: preludeFile, volume: 1 } });
+    const second = await enqueueSynthesis(client, eleven('二つ目'));
+    const aivis = await enqueueSynthesis(client, { text: 'Aivis', provider: 'aivis' });
+    const third = await enqueueSynthesis(client, eleven('三つ目'));
+    const backend = new FakeBackend();
+    const worker = new PlaybackWorker({ redisUrl: redis.url, version: '2.5.0', loadConfig: () => config, backend, synthesize: async (cfg, params, signal) => {
+      if (params.provider === 'aivis') {
+        // Aivis の合成も同じ合成関数を通す（記録を置き換える）。音は手元で返す
+        await synthesize({ ...cfg, apiUrl: 'http://127.0.0.1:9' }, params, signal).catch(() => undefined);
+        return Readable.from([mp3Frames(20)]);
+      }
+      return synthesize(cfg, params, signal);
+    }, gainFile });
+    workers.push(worker);
+    runs.push(worker.run());
+    for (const id of [first.id, 'chime', second.id, aivis.id, third.id]) {
+      expect(await finalStatus(id)).toEqual({ status: 'done' });
+    }
+    expect(sent.map(item => [item.text, item.extras])).toEqual([
+      ['一つ目', {}],
+      ['二つ目', { previous_request_ids: ['req-1'] }],
+      ['三つ目', {}],
+    ]);
+  });
+
+  test('ElevenLabs の文脈: 取込の声（stream ジョブ）が挟まったらつながない', async () => {
+    const sent: { text: string; extras: ElevenLabsRequestExtras }[] = [];
+    const synthesize = createSynthesizer({
+      requestElevenLabs: async (_config, params, extras) => {
+        sent.push({ text: params.text, extras: extras ?? {} });
+        return { stream: Readable.from([mp3Frames(20)]), requestId: `req-${sent.length}`, sentText: params.text };
+      },
+    });
+    const config: AppConfig = { ...testConfig(redis.url), elevenLabsApiKey: 'k', elevenLabsVoiceId: 'voiceA' };
+    const eleven = (text: string) => ({ text, provider: 'elevenlabs' });
+    const first = await enqueueSynthesis(client, eleven('一つ目'));
+    await streamJob('ingested-voice');
+    const second = await enqueueSynthesis(client, eleven('二つ目'));
+    const third = await enqueueSynthesis(client, eleven('三つ目'));
+    startWorker(new FakeBackend(), { loadConfig: () => config, synthesize });
+    for (const id of [first.id, 'ingested-voice', second.id, third.id]) {
+      expect(await finalStatus(id)).toEqual({ status: 'done' });
+    }
+    expect(sent.map(item => [item.text, item.extras])).toEqual([
+      ['一つ目', {}],
+      ['二つ目', {}],
+      ['三つ目', { previous_request_ids: ['req-2'] }],
+    ]);
+  });
+});

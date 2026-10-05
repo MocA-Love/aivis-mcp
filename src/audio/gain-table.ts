@@ -426,6 +426,91 @@ function removeStaleLock(lockPath: string, staleMs: number): boolean {
   }
 }
 
+/** ロックのファイルを排他で作る。作れたら true、ほかが持っていたら false */
+function acquireLockFile(lockPath: string, token: string): boolean {
+  try {
+    const fd = fs.openSync(lockPath, 'wx', 0o644);
+    try {
+      fs.writeSync(fd, token, null, 'utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+      throw error;
+    }
+    return false;
+  }
+}
+
+function releaseLockFile(lockPath: string, token: string): void {
+  try {
+    // 古いとみなされて別のプロセスに取り直されていたら、そのロックは消さない
+    if (fs.readFileSync(lockPath, 'utf8') === token) {
+      fs.rmSync(lockPath, { force: true });
+    }
+  } catch {
+    // もう無い
+  }
+}
+
+function newLockToken(): string {
+  return `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * ファイルを読んで書き戻す間、`<file>.lock` を排他で作って持つ。持ち主が {@link GAIN_LOCK_STALE_MS} を
+ * 超えて残したロックは消して取り直す。音量の表（`gain.json`）と設定（`config.json`）で使う。
+ */
+export async function withFileLock<T>(
+  filePath: string,
+  body: () => T | Promise<T>,
+  options: { readonly staleMs?: number; readonly waitMs?: number; readonly lockError?: (lockPath: string) => Error } = {},
+): Promise<T> {
+  const staleMs = options.staleMs ?? GAIN_LOCK_STALE_MS;
+  const waitMs = options.waitMs ?? GAIN_LOCK_WAIT_MS;
+  const lockPath = gainLockPath(filePath);
+  const token = newLockToken();
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    if (acquireLockFile(lockPath, token)) {
+      break;
+    }
+    if (removeStaleLock(lockPath, staleMs)) {
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw options.lockError?.(lockPath) ?? new GainLockError(`ロック（${lockPath}）が空きません。ほかのプロセスが書いています`);
+    }
+    await new Promise(resolve => setTimeout(resolve, GAIN_LOCK_RETRY_MS));
+  }
+  try {
+    return await body();
+  } finally {
+    releaseLockFile(lockPath, token);
+  }
+}
+
+/**
+ * 待たずに 1 回だけロックを取りにいく同期版。取れなければ body を呼ばずに undefined を返す
+ * （同期で読む途中の、書けなくても困らない書き込み向け）。
+ */
+export function tryWithFileLockSync<T>(filePath: string, body: () => T, staleMs = GAIN_LOCK_STALE_MS): T | undefined {
+  const lockPath = gainLockPath(filePath);
+  const token = newLockToken();
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  if (!acquireLockFile(lockPath, token) && !(removeStaleLock(lockPath, staleMs) && acquireLockFile(lockPath, token))) {
+    return undefined;
+  }
+  try {
+    return body();
+  } finally {
+    releaseLockFile(lockPath, token);
+  }
+}
+
 /**
  * 表を読んで書き戻す間、`gain.json.lock` を排他で作って持つ（worker の覚え直しと `--import-gains` が
  * 互いの書き込みを消さないように）。持ち主が {@link GAIN_LOCK_STALE_MS} を超えて残したロックは消して取り直す。
@@ -435,46 +520,10 @@ export async function withGainFileLock<T>(
   body: () => T | Promise<T>,
   options: { readonly staleMs?: number; readonly waitMs?: number } = {},
 ): Promise<T> {
-  const staleMs = options.staleMs ?? GAIN_LOCK_STALE_MS;
-  const waitMs = options.waitMs ?? GAIN_LOCK_WAIT_MS;
-  const lockPath = gainLockPath(filePath);
-  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-  const deadline = Date.now() + waitMs;
-  for (;;) {
-    try {
-      const fd = fs.openSync(lockPath, 'wx', 0o644);
-      try {
-        fs.writeSync(fd, token, null, 'utf8');
-      } finally {
-        fs.closeSync(fd);
-      }
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        throw error;
-      }
-    }
-    if (removeStaleLock(lockPath, staleMs)) {
-      continue;
-    }
-    if (Date.now() >= deadline) {
-      throw new GainLockError(`音量の表のロック（${lockPath}）が空きません。ほかのプロセスが書いています`);
-    }
-    await new Promise(resolve => setTimeout(resolve, GAIN_LOCK_RETRY_MS));
-  }
-  try {
-    return await body();
-  } finally {
-    try {
-      // 古いとみなされて別のプロセスに取り直されていたら、そのロックは消さない
-      if (fs.readFileSync(lockPath, 'utf8') === token) {
-        fs.rmSync(lockPath, { force: true });
-      }
-    } catch {
-      // もう無い
-    }
-  }
+  return withFileLock(filePath, body, {
+    ...options,
+    lockError: lockPath => new GainLockError(`音量の表のロック（${lockPath}）が空きません。ほかのプロセスが書いています`),
+  });
 }
 
 /** 1 回分の測定を表に足して保存する（表のロックを持って読み書きする）。 */
