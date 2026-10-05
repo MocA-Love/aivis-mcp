@@ -309,6 +309,16 @@ describeWithRedis('--ingest の 2.5.1 の直し（別ポートの redis-server�
     previous.input.resume();
   });
 
+  test('[adopt unknown] Redis を読めず確かめられなかった adopt は adopted:false に unknown:true を付ける', async () => {
+    const proxy = await proxied();
+    const own = await session({ url: proxy.url, opTimeoutMs: 400 });
+    proxy.stall();
+    own.input.write(encodeControl({ type: 'adopt', id: 'cannot-tell' }));
+    const reply = await waitFor(() => own.messages.find(message => message.type === 'adopted'), 10_000);
+    const { at: _at, ...rest } = reply;
+    expect(rest).toEqual({ type: 'adopted', id: 'cannot-tell', adopted: false, unknown: true });
+  });
+
   test('[最終レビュー LOW] 引き継いだ件の abort は、列にあれば外して Stream も消し、取り出した後でも鳴り始める前なら止める', async () => {
     const previous = await session();
     for (const id of ['in-queue', 'taken']) {

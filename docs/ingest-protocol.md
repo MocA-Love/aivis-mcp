@@ -153,9 +153,10 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 { "type": "adopt", "id": "…" }
 ```
 
-前の `--ingest`（落ちた・入れ替えた子）が積んだ件の追跡を、この子が引き継ぎます。返事は `{"type":"adopted","id":…,"adopted":true|false}` です。
+前の `--ingest`（落ちた・入れ替えた子）が積んだ件の追跡を、この子が引き継ぎます。返事は `{"type":"adopted","id":…,"adopted":true|false,"unknown"?:true}` です。
 
 - 列か知らせに痕跡がある件だけ引き継ぎます（`adopted: true`）。どちらにも無い ID は `adopted: false` です。この子がすでに追っている件は `adopted: true` のままです
+- Redis を読めず、痕跡があるかを確かめられなかったときは `{"adopted":false,"unknown":true}` を返します。`unknown` のときは親は鳴らさず、`withdraw` を送って答え（`removed`・`notQueued`・`taken`）で確かめてください
 - 引き継いだ件は、この子が Stream と知らせの期限を延ばし、知らせを頭から読み直して `playing` と終わり（`done` `skipped` `held` `muted` `failed`）を返します。`queued` は返しません。見失った・追跡の上限の判断もこの子が行います
 - 音声の続き（音声の枠・`end`）は送れません。書きかけの流れは、worker が届いた分で終えるか打ち切ります。鳴らさずに済ませたいなら `withdraw` を送ってください
 - `abort` と `withdraw` は、引き継いだ件にも使えます。引き継いだ件には書く側がいないので、`abort` を受けた子が Stream に鳴らすのをやめる印 `c` を直接書きます（Stream が残っているときだけ）。worker が取り出した後でも、鳴らし始める前なら捨てます（`skipped`）。まだ列にあれば列から外し、そのとき Stream も消します
@@ -179,7 +180,7 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 | `hold` | `{"owner":…, "active":…}` | `hold` を反映した |
 | `gain` | `{"requestId":…, "target":-20, "maxBoostDb":8, "defaultDb":0, "entries":{鍵: dB}, "volumeOffsetDb":…, "elevenLabsVolumeOffsetDb":…}` | `gain?` の返事。`entries` に無い鍵は、同じ provider・同じモデルの平均、それも無ければ `defaultDb` |
 | `withdrawn` | `{"id":…, "removed":…, "notQueued"?: true, "taken"?: true}` | `withdraw` の返事 |
-| `adopted` | `{"id":…, "adopted":…}` | `adopt` の返事 |
+| `adopted` | `{"id":…, "adopted":…, "unknown"?: true}` | `adopt` の返事。`unknown` は Redis を読めず確かめられなかった |
 | `pong` | `{"requestId":…}` | `ping` の返事 |
 | `error` | `{"reason":…, …}` | 枠や要求が正しくない。`reason` は `protocol`（1 回だけ出し、以後の入力は捨てて終わる）・`unknown-type`・`unknown-stream`・`invalid-owner`・`redis-unavailable`・`redis-error`（`hold` を Redis に書けなかった） |
 

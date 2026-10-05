@@ -694,7 +694,8 @@ export class IngestSession {
     try {
       [queued, statuses] = await this.op(Promise.all([findQueuedJob(this.client, id), readStatuses(this.client, id, 0)]));
     } catch {
-      this.send({ type: 'adopted', id, adopted: false });
+      // 読めなかった（痕跡が無いとは確かめられていない）。親は鳴らさず、withdraw で確かめる
+      this.send({ type: 'adopted', id, adopted: false, unknown: true });
       return;
     }
     if (queued === undefined && statuses.entries.length === 0) {
