@@ -1,7 +1,7 @@
 import { spawn, execSync } from 'child_process';
 import { platform } from 'os';
 import { createClient, type RedisClientType } from 'redis';
-import { version, type AppConfig } from './config.js';
+import { version, type AppConfig, type ArgValue } from './config.js';
 import { connectRedis, ensureWorkerRunning, spawnWorker, WORKER_VERSION_KEY } from './services/redis-service.js';
 import { parseMuteDuration, setMute, clearMute, getMuteStatus } from './services/mute-service.js';
 import { enqueueAudio, restoreLegacyQueue } from './queue/enqueue.js';
@@ -9,7 +9,7 @@ import { compareVersions } from './queue/worker-lock.js';
 import { safeGainKeyHeader } from './worker/para-code-forward.js';
 import { HIGH_QUEUE_KEY, HOLD_PREFIX, NORMAL_QUEUE_KEY } from './queue/keys.js';
 import { detectPlayerKind, hasFfmpeg } from './audio/player.js';
-import { gainFilePath } from './audio/gain-table.js';
+import { gainFilePath, GainLockError, MAX_LEARNED_ENTRIES } from './audio/gain-table.js';
 import { exportGains, GainImportError, importGains } from './audio/gain-transfer.js';
 
 function sleep(ms: number): Promise<void> {
@@ -343,11 +343,62 @@ export async function runRestoreLegacyQueue(config: AppConfig): Promise<void> {
   }
 }
 
+const EXPORT_GAINS_USAGE = '--export-gains <file> [--voice <voice_id>…] [--model <model_id>]';
+const IMPORT_GAINS_USAGE = '--import-gains <file> [--overwrite]';
+
+/** `--export-gains` / `--import-gains` の値。無い・別のオプションに見える（`-` で始まる）ときは使い方を出す。 */
+function gainFileArgument(value: ArgValue, flag: string, usage: string): string | undefined {
+  if (typeof value === 'string' && value !== '' && !value.startsWith('-')) {
+    return value;
+  }
+  console.error(`${flag} にはファイルのパスを渡してください（- で始まるパスは ./ を付けてください）`);
+  console.error(`使い方: ${usage}`);
+  return undefined;
+}
+
+/**
+ * `--export-gains` / `--import-gains` が指定されていれば実行して true を返す（終了コードは `process.exitCode`）。
+ * 値が無くても true を返す（MCP サーバーとして起動したまま止まらないように）。
+ */
+export async function runGainTransfer(values: Record<string, ArgValue>): Promise<boolean> {
+  if (values['export-gains'] !== undefined) {
+    const output = gainFileArgument(values['export-gains'], '--export-gains', EXPORT_GAINS_USAGE);
+    if (output === undefined) {
+      process.exitCode = 1;
+      return true;
+    }
+    const voices = Array.isArray(values.voice) ? values.voice : [];
+    runExportGains(output, voices, typeof values.model === 'string' ? values.model : undefined);
+    return true;
+  }
+  if (values['import-gains'] !== undefined) {
+    const input = gainFileArgument(values['import-gains'], '--import-gains', IMPORT_GAINS_USAGE);
+    if (input === undefined) {
+      process.exitCode = 1;
+      return true;
+    }
+    await runImportGains(input, values.overwrite === true);
+    return true;
+  }
+  return false;
+}
+
+/** `--voice` は書き出しの絞り込みにしか使わない。ほかで来たら、値が読み上げる文から消えたことを知らせる。 */
+export function warnStrayVoiceOption(values: Record<string, ArgValue>): void {
+  if (values['export-gains'] !== undefined || !Array.isArray(values.voice) || values.voice.length === 0) {
+    return;
+  }
+  console.error(`[aivis-mcp] --voice は --export-gains の絞り込み用です。値（${values.voice.join(', ')}）は読み上げる文に入りません。ElevenLabs の声は --voice-id で指定します`);
+}
+
 /** `--export-gains <file> [--voice <id>…] [--model <id>]`: 音量の表を書き出す。 */
 export function runExportGains(outputPath: string, voices: readonly string[], model: string | undefined): void {
   try {
     const count = exportGains(outputPath, { voices, model });
     console.log(`音量の表を ${count} 行書き出しました: ${outputPath}`);
+    if (count === 0 && (voices.length > 0 || model !== undefined)) {
+      console.log('一致する行がありません。Aivis の行は鍵が aivis:<model_uuid>:default なので、--voice にモデル UUID、--model に default を渡します');
+    }
   } catch (error) {
     console.error(`書き出せませんでした: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
@@ -355,15 +406,18 @@ export function runExportGains(outputPath: string, voices: readonly string[], mo
 }
 
 /** `--import-gains <file> [--overwrite]`: 音量の表を読み込んで足す。 */
-export function runImportGains(inputPath: string, overwrite: boolean): void {
+export async function runImportGains(inputPath: string, overwrite: boolean): Promise<void> {
   try {
-    const result = importGains(inputPath, overwrite);
+    const result = await importGains(inputPath, overwrite);
     console.log(`音量の表を読み込みました: 追加 ${result.added} 行、上書き ${result.overwritten} 行、自分の値を残した ${result.kept} 行（${gainFilePath()}）`);
+    if (result.dropped > 0 || result.evicted > 0) {
+      console.log(`表の上限（${MAX_LEARNED_ENTRIES} 行）を超えたため、取り込んだ ${result.dropped} 行が入らず、自分の表の古い ${result.evicted} 行が消えました`);
+    }
     if (result.kept > 0) {
       console.log('受け取った値で上書きするには --overwrite を付けてください');
     }
   } catch (error) {
-    const prefix = error instanceof GainImportError ? '読み込みを取りやめました' : '読み込めませんでした';
+    const prefix = error instanceof GainImportError || error instanceof GainLockError ? '読み込みを取りやめました' : '読み込めませんでした';
     console.error(`${prefix}: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   }

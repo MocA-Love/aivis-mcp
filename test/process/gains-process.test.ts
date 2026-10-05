@@ -11,7 +11,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 
 function run(bin: 'index.js' | 'cli.js', args: string[], env: NodeJS.ProcessEnv): Promise<{ stdout: string; stderr: string; code: number | null }> {
   return new Promise(resolve => {
-    const child = spawn(process.execPath, [path.join(root, 'dist', bin), ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // 標準入力は開いたままにする（MCP サーバーとして起動してしまったら止まらないことを確かめるため）
+    const child = spawn(process.execPath, [path.join(root, 'dist', bin), ...args], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 10_000);
+    child.on('exit', () => clearTimeout(timer));
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', chunk => { stdout += chunk.toString(); });
@@ -72,5 +75,35 @@ describe('実プロセスの --export-gains / --import-gains', () => {
       expect(result.stdout).toContain('--export-gains <file>');
       expect(result.stdout).toContain('--import-gains <file> [--overwrite]');
     }
+  });
+
+  test('値が無い・別のオプションが続くときは使い方を出して 1 で終わる（MCP サーバーとして起動しない）', async () => {
+    const cases: string[][] = [
+      ['--export-gains'],
+      ['--export-gains', '--voice', 'voiceA'],
+      ['--export-gains=-x'],
+      ['--import-gains'],
+      ['--import-gains', '--overwrite'],
+    ];
+    for (const bin of ['index.js', 'cli.js'] as const) {
+      for (const args of cases) {
+        const result = await run(bin, args, env);
+        expect({ bin, args, code: result.code }).toEqual({ bin, args, code: 1 });
+        expect(result.stderr).toContain('使い方:');
+      }
+    }
+  });
+
+  test('一致する行が無い書き出しは、Aivis の指定のしかたを案内する', async () => {
+    const result = await run('cli.js', ['--export-gains', path.join(dir, 'none.json'), '--voice', 'unknown'], env);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('0 行書き出しました');
+    expect(result.stdout).toContain('--voice にモデル UUID');
+  });
+
+  test('書き出し先が自分の表なら拒む', async () => {
+    const result = await run('index.js', ['--export-gains', path.join(dir, 'gain.json'), '--voice', 'voiceA'], env);
+    expect(result.code).toBe(1);
+    expect(Object.keys(JSON.parse(fs.readFileSync(path.join(dir, 'gain.json'), 'utf8')).entries)).toHaveLength(3);
   });
 });

@@ -4,7 +4,7 @@ import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './co
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { withParaCodeVoiceTarget } from './services/para-code-voice.js';
 import { enqueueSynthesis } from './queue/enqueue.js';
-import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, runRestoreLegacyQueue, runExportGains, runImportGains } from './commands.js';
+import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, runRestoreLegacyQueue, runGainTransfer, warnStrayVoiceOption } from './commands.js';
 import { runDoctor } from './doctor.js';
 import { runInit } from './settings.js';
 
@@ -79,7 +79,7 @@ async function main() {
 
   if (values.help || (positionals.length === 0 && !values.health && !values.reboot && !values.doctor
     && !values.mute && !values.unmute && !values['mute-status'] && !values['play-audio'] && !values['restore-legacy-queue']
-    && typeof values['export-gains'] !== 'string' && typeof values['import-gains'] !== 'string')) {
+    && values['export-gains'] === undefined && values['import-gains'] === undefined)) {
     printHelp();
     process.exit(0);
   }
@@ -109,15 +109,10 @@ async function main() {
     process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
 
-  if (typeof values['export-gains'] === 'string') {
-    runExportGains(values['export-gains'], Array.isArray(values.voice) ? values.voice : [], typeof values.model === 'string' ? values.model : undefined);
+  if (await runGainTransfer(values)) {
     process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
-
-  if (typeof values['import-gains'] === 'string') {
-    runImportGains(values['import-gains'], values.overwrite === true);
-    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
-  }
+  warnStrayVoiceOption(values);
 
   if (values['play-audio']) {
     await runPlayAudio(config, typeof values['gain-key'] === 'string' ? values['gain-key'] : undefined);

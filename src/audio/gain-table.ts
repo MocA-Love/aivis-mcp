@@ -146,12 +146,13 @@ export function resolveGainDb(key: string | undefined, learned: Readonly<Record<
 
 /**
  * 測った大きさ（LUFS）を 1 回分の補正値として足し、直近 `window` 回の中央値を表の値にする。
- * 窓を減らしたときは古い測定を捨て、増やしたときはあるだけで中央値を取る。
+ * 測定は窓に関わらず上限（`MAX_LEARN_WINDOW` 回）まで残す。窓を減らしても後で増やせば古い測定を使え、
+ * 増やしたときは残っている分だけで中央値を取る。
  */
 export function learnSample(previous: LearnedGain | undefined, measuredLufs: number, now = Date.now(), window = LEARN_WINDOW): LearnedGain {
   const sample = round1(clampTableDb(TARGET_LUFS - measuredLufs));
-  const samples = [...(previous?.samples ?? []), sample].slice(-clampLearnWindow(window));
-  return { db: round1(median(samples)), samples, updatedAt: now };
+  const samples = [...(previous?.samples ?? []), sample].slice(-MAX_LEARN_WINDOW);
+  return { db: round1(median(samples.slice(-clampLearnWindow(window)))), samples, updatedAt: now };
 }
 
 /** 上限を超えた分を、更新の古いものから消す。 */
@@ -279,7 +280,8 @@ function pickSetting(
     if (value !== undefined && Number.isFinite(value) && isValid(value)) {
       return value;
     }
-    warn(`${candidate.source} の ${name}=${String(candidate.value)} は範囲外です（${range}）。既定の ${fallback} を使います`);
+    const reason = value === undefined || !Number.isFinite(value) ? '数ではありません' : '範囲外です';
+    warn(`${candidate.source} の ${name}=${String(candidate.value)} は${reason}（${range}）。既定の ${fallback} を使います`);
     return fallback;
   }
   return fallback;
@@ -348,14 +350,93 @@ export function saveLearnedGains(entries: Readonly<Record<string, LearnedGain>>,
   writeFileAtomic(filePath, JSON.stringify(body, null, 2) + '\n', 0o644);
 }
 
-/** 1 回分の測定を表に足して保存する。 */
-export function recordMeasurement(key: string, measuredLufs: number, filePath = gainFilePath(), window = LEARN_WINDOW): LearnedGain {
-  const entries = loadLearnedGains(filePath);
-  const next = learnSample(entries[key], measuredLufs, Date.now(), window);
-  const merged: Record<string, LearnedGain> = Object.assign(Object.create(null), entries);
-  merged[key] = next;
-  saveLearnedGains(merged, filePath);
-  return next;
+/** ロックを持ったままの時間がこれを超えたら、持ち主が落ちたとみなして消す。 */
+export const GAIN_LOCK_STALE_MS = 10_000;
+/** ロックが空くのを待つ上限。 */
+export const GAIN_LOCK_WAIT_MS = 5_000;
+const GAIN_LOCK_RETRY_MS = 50;
+
+/** ロックが空かなかった。 */
+export class GainLockError extends Error {}
+
+/** 表のロックの置き場（シンボリックリンクなら実体の隣。リンク経由と実体経由で同じロックを使う）。 */
+export function gainLockPath(filePath = gainFilePath()): string {
+  let target = filePath;
+  try {
+    target = fs.realpathSync(filePath);
+  } catch {
+    // まだ無いファイルはそのまま
+  }
+  return `${target}.lock`;
+}
+
+/**
+ * 表を読んで書き戻す間、`gain.json.lock` を排他で作って持つ（worker の覚え直しと `--import-gains` が
+ * 互いの書き込みを消さないように）。持ち主が {@link GAIN_LOCK_STALE_MS} を超えて残したロックは消して取り直す。
+ */
+export async function withGainFileLock<T>(
+  filePath: string,
+  body: () => T | Promise<T>,
+  options: { readonly staleMs?: number; readonly waitMs?: number } = {},
+): Promise<T> {
+  const staleMs = options.staleMs ?? GAIN_LOCK_STALE_MS;
+  const waitMs = options.waitMs ?? GAIN_LOCK_WAIT_MS;
+  const lockPath = gainLockPath(filePath);
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx', 0o644);
+      try {
+        fs.writeSync(fd, token, null, 'utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw error;
+      }
+    }
+    try {
+      if (Date.now() - fs.statSync(lockPath).mtimeMs > staleMs) {
+        fs.rmSync(lockPath, { force: true });
+        continue;
+      }
+    } catch {
+      // 調べている間に消えた。すぐ取り直す
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new GainLockError(`音量の表のロック（${lockPath}）が空きません。ほかのプロセスが書いています`);
+    }
+    await new Promise(resolve => setTimeout(resolve, GAIN_LOCK_RETRY_MS));
+  }
+  try {
+    return await body();
+  } finally {
+    try {
+      // 古いとみなされて別のプロセスに取り直されていたら、そのロックは消さない
+      if (fs.readFileSync(lockPath, 'utf8') === token) {
+        fs.rmSync(lockPath, { force: true });
+      }
+    } catch {
+      // もう無い
+    }
+  }
+}
+
+/** 1 回分の測定を表に足して保存する（表のロックを持って読み書きする）。 */
+export async function recordMeasurement(key: string, measuredLufs: number, filePath = gainFilePath(), window = LEARN_WINDOW): Promise<LearnedGain> {
+  return withGainFileLock(filePath, () => {
+    const entries = loadLearnedGains(filePath);
+    const next = learnSample(entries[key], measuredLufs, Date.now(), window);
+    const merged: Record<string, LearnedGain> = Object.assign(Object.create(null), entries);
+    merged[key] = next;
+    saveLearnedGains(merged, filePath);
+    return next;
+  });
 }
 
 /** 2.4 まで ElevenLabs に掛けていた固定の補正（`volume_db` の既定）。 */

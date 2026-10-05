@@ -4,7 +4,7 @@ import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './co
 import { MCPService } from './services/mcp-service.js';
 import { AivisSpeechService } from './services/aivis-speech-service.js';
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
-import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, runRestoreLegacyQueue, runExportGains, runImportGains } from './commands.js';
+import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, runRestoreLegacyQueue, runGainTransfer, warnStrayVoiceOption } from './commands.js';
 import { runIngest } from './ingest/ingest.js';
 import { enqueueSynthesis } from './queue/enqueue.js';
 import { withParaCodeVoiceTarget } from './services/para-code-voice.js';
@@ -125,15 +125,10 @@ async function main() {
     return;
   }
 
-  if (typeof values['export-gains'] === 'string') {
-    runExportGains(values['export-gains'], Array.isArray(values.voice) ? values.voice : [], typeof values.model === 'string' ? values.model : undefined);
+  if (await runGainTransfer(values)) {
     process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
-
-  if (typeof values['import-gains'] === 'string') {
-    runImportGains(values['import-gains'], values.overwrite === true);
-    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
-  }
+  warnStrayVoiceOption(values);
 
   if (values['play-audio']) {
     await runPlayAudio(config, typeof values['gain-key'] === 'string' ? values['gain-key'] : undefined);

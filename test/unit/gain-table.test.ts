@@ -38,21 +38,32 @@ describe('gain table', () => {
     for (const lufs of [-30, -22, -21, -19, -10, -20, -20, -20, -26]) {
       entry = learnSample(entry, lufs);
     }
-    // 直近 9 回 = [10→clamp 8, 2, 1, -1, -10, 0, 0, 0, 6]（最初の測定 4 は窓から外れる）。並べると真ん中は 0
-    expect(entry.samples).toEqual([8, 2, 1, -1, -10, 0, 0, 0, 6]);
+    // 測定は 10 回とも残す。中央値は直近 9 回 [10→clamp 8, 2, 1, -1, -10, 0, 0, 0, 6] から取り（最初の 4 は外れる）、並べると真ん中は 0
+    expect(entry.samples).toEqual([4, 8, 2, 1, -1, -10, 0, 0, 0, 6]);
     expect(entry.db).toBe(0);
     expect(median([1, 2, 3, 4])).toBe(2.5);
     expect(median([])).toBe(0);
   });
 
-  test('窓を減らしたら古い測定を捨て、増やしたらあるだけで中央値を取る', () => {
+  test('窓を減らしても測定は残し、中央値だけ窓の回数で取る。増やしたらあるだけで中央値を取る', () => {
     const previous = { db: 0, samples: [1, 2, 3, 4, 5, 6, 7, 8, 9], updatedAt: 1 };
-    // 窓 3: 直近 2 回 + 今回（-20 → 0）
-    expect(learnSample(previous, -20, 2, 3)).toEqual({ db: 8, samples: [8, 9, 0], updatedAt: 2 });
+    // 窓 3: 中央値は直近 2 回 + 今回（-20 → 0）の [8, 9, 0] から取り、測定は全部残す
+    expect(learnSample(previous, -20, 2, 3)).toEqual({ db: 8, samples: [1, 2, 3, 4, 5, 6, 7, 8, 9, 0], updatedAt: 2 });
     // 窓 15: 10 回分しかないので 10 回で中央値
     const grown = learnSample(previous, -20, 2, 15);
     expect(grown.samples).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 0]);
     expect(grown.db).toBe(4.5);
+  });
+
+  test('覚え直しを続けると、測定は窓より多く上限の 50 回まで残る', () => {
+    let entry = learnSample(undefined, -20);
+    for (let i = 1; i < 60; i++) {
+      entry = learnSample(entry, -20 - (i % 5));
+    }
+    expect(entry.samples).toHaveLength(50);
+    // 中央値は直近 9 回から: 末尾 9 回は i=51..59 → 補正 1,2,3,4,0,1,2,3,4 → 中央値 2
+    expect(entry.samples.slice(-9)).toEqual([1, 2, 3, 4, 0, 1, 2, 3, 4]);
+    expect(entry.db).toBe(2);
   });
 
   test('感情タグ入り・2.5 秒未満・途中で止まったものは覚え直しに使わない', () => {
@@ -93,13 +104,13 @@ describe('gain table', () => {
     expect(afplayVolume(-20)).toBeCloseTo(0.1, 5);
   });
 
-  test('表はファイルに書いて読み直せる。壊れていれば空', () => {
+  test('表はファイルに書いて読み直せる。壊れていれば空', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-gain-'));
     const file = path.join(dir, 'nested', 'gain.json');
     try {
       expect({ ...loadLearnedGains(file) }).toEqual({});
-      recordMeasurement('aivis:x:default', -25, file);
-      recordMeasurement('aivis:x:default', -23, file);
+      await recordMeasurement('aivis:x:default', -25, file);
+      await recordMeasurement('aivis:x:default', -23, file);
       expect({ ...loadLearnedGains(file) }).toEqual({ 'aivis:x:default': { db: 4, samples: [5, 3], updatedAt: expect.any(Number) } });
       fs.writeFileSync(file, '{broken');
       expect({ ...loadLearnedGains(file) }).toEqual({});

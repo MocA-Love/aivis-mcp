@@ -6,6 +6,7 @@ import { hasParaCodeVoiceEnv, withParaCodeVoiceTarget, type ParaCodeVoiceTarget 
 import { RESPONDER_CLOSE_GRACE_MS, VoiceTicketResponder, type VoiceRequester } from './voice-ticket.js';
 import { enqueueSynthesis } from '../queue/enqueue.js';
 import { PlaybackWorker } from '../worker/playback-worker.js';
+import { readWorkerGainSettings, type WorkerGainSettings } from '../queue/worker-gain-settings.js';
 import { createAudioBackend } from '../audio/player.js';
 import { measureLoudness } from '../audio/loudness.js';
 import { synthesizeStream } from '../audio/synthesize.js';
@@ -55,6 +56,37 @@ export class AivisSpeechService {
       }
     } catch (error) {
       console.error('Queue enqueue error:', error instanceof Error ? error.message : error);
+    }
+  }
+
+  /**
+   * 動いている worker が覚え直しに使っている窓と最短秒数。Redis に届かない・worker がいないときは undefined
+   * （Redis を起こしたり待ち続けたりしない。設定を見せるだけなので 1 秒で諦める）。
+   */
+  async workerGainSettings(): Promise<WorkerGainSettings | undefined> {
+    const client = this.redisClient.isOpen
+      ? undefined
+      : createClient({ url: this.config.redisUrl, socket: { connectTimeout: 1000, reconnectStrategy: false } });
+    client?.on('error', () => undefined);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const work = (async () => {
+        if (client !== undefined) {
+          await client.connect();
+        }
+        return readWorkerGainSettings((client ?? this.redisClient) as RedisClientType);
+      })();
+      return await Promise.race([
+        work,
+        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 1000); }),
+      ]);
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+      if (client?.isOpen) {
+        await client.disconnect().catch(() => undefined);
+      }
     }
   }
 

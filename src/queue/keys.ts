@@ -19,6 +19,8 @@ export const DEQUEUE_ORDER = [HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY, MIGRATED_LEGACY_
 export const WORKER_LOCK_KEY = 'aivis-mcp:worker-lock';
 /** 動いている worker の版（worker が lock と同じ寿命で書く）。 */
 export const WORKER_VERSION_KEY = 'aivis-mcp:worker-version';
+/** 動いている worker が音量の覚え直しに使っている窓と最短秒数（worker が lock と同じ寿命で書く）。 */
+export const WORKER_GAIN_SETTINGS_KEY = 'aivis-mcp:worker-gain-settings';
 /** 再生の lock（2.4 と同じキー。版の違う worker 同士でも重ならないように）。 */
 export const PLAY_LOCK_KEY = 'aivis-mcp:play-lock';
 

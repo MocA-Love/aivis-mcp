@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { LEARN_WINDOW, MIN_LEARN_SECONDS, resolveGainLearningSettings } from '../../src/audio/gain-table.js';
 import { resolveConfig } from '../../src/config.js';
+import { warnStrayVoiceOption } from '../../src/commands.js';
 
 describe('覚え直しの窓と最短秒数', () => {
   test('既定は窓 9・2.5 秒', () => {
@@ -25,7 +26,9 @@ describe('覚え直しの窓と最短秒数', () => {
     }, message => warnings.push(message));
     expect(bad).toEqual({ learnWindow: 9, minLearnSeconds: 2.5 });
     expect(warnings).toHaveLength(2);
-    expect(warnings[0]).toContain('env の learnWindow=51');
+    expect(warnings[0]).toContain('env の learnWindow=51 は範囲外です');
+    resolveGainLearningSettings({ learnWindow: [{ source: 'config', value: 'abc' }], minLearnSeconds: [] }, message => warnings.push(message));
+    expect(warnings[2]).toContain('config の learnWindow=abc は数ではありません');
 
     for (const value of [0, 2.5, 'abc', Number.NaN, '7x']) {
       expect(resolveGainLearningSettings({ learnWindow: [{ source: 's', value }], minLearnSeconds: [] }, () => undefined).learnWindow).toBe(9);
@@ -82,5 +85,21 @@ describe('覚え直しの窓と最短秒数', () => {
         console.error = original;
       }
     });
+  });
+
+  test('--export-gains 以外で --voice が来たら、値が文から消えたことを知らせる', () => {
+    const original = console.error;
+    const messages: string[] = [];
+    console.error = (message: string) => { messages.push(message); };
+    try {
+      warnStrayVoiceOption({ voice: ['hello'] });
+      warnStrayVoiceOption({ voice: ['hello'], 'export-gains': 'out.json' });
+      warnStrayVoiceOption({});
+    } finally {
+      console.error = original;
+    }
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('hello');
+    expect(messages[0]).toContain('--voice-id');
   });
 });
