@@ -4,7 +4,7 @@
 
 import type { RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
-import { audioStreamKey, HIGH_QUEUE_KEY, LEGACY_QUEUE_KEY, MIGRATED_LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, queueKeyFor, statusKey } from './keys.js';
+import { audioStreamKey, HIGH_QUEUE_KEY, LEGACY_QUEUE_KEY, MIGRATED_LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, queueKeyFor, statusKey, takenKey } from './keys.js';
 import type { Job, JobPriority, SynthJob } from './jobs.js';
 import { encodeStatus, STATUS_TTL_SECONDS } from './status.js';
 
@@ -58,15 +58,16 @@ for _, key in ipairs({KEYS[1], KEYS[2]}) do
       local ok, job = pcall(cjson.decode, raw)
       if ok and type(job) == 'table' and job['v'] == 2 and job['id'] == ARGV[1] then
         if redis.call('LREM', key, 1, raw) == 1 then
-          redis.call('DEL', KEYS[3], KEYS[4])
+          redis.call('DEL', KEYS[3], KEYS[4], KEYS[5])
           return 1
         end
       end
     end
   end
 end
--- 列に無い。知らせ（status）も無ければ、積む要求は届いていない（Stream だけ残っていれば消す）
-if redis.call('EXISTS', KEYS[4]) == 0 then
+-- 列に無い。知らせ（status）も取り出した印（taken、知らせより長く残る）も無ければ、積む要求は届いていない
+-- （Stream だけ残っていれば消す）
+if redis.call('EXISTS', KEYS[4]) == 0 and redis.call('EXISTS', KEYS[5]) == 0 then
   redis.call('DEL', KEYS[3])
   return 2
 end
@@ -86,13 +87,13 @@ export async function withdrawJobById(client: RedisClientType, id: string): Prom
  * `withdrawJobById` と同じ。外せなかったときの理由も返す（1 つのスクリプトで判定する）。
  * - removed: 列から外した（Stream と知らせも消した）
  * - not-queued: 列にも知らせにも痕跡が無い（積む要求が届いていない）。残っていた Stream は消した
- * - taken: 列に無く知らせはある（worker が取り出した・鳴っている・終わった）
+ * - taken: 列に無く、知らせか取り出した印（30 分残る）がある（worker が取り出した・鳴っている・終わった）
  */
 export type WithdrawResult = 'removed' | 'not-queued' | 'taken';
 
 export async function withdrawJobByIdDetailed(client: RedisClientType, id: string): Promise<WithdrawResult> {
   const result = Number(await client.eval(WITHDRAW_BY_ID_SCRIPT, {
-    keys: [HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY, audioStreamKey(id), statusKey(id)],
+    keys: [HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY, audioStreamKey(id), statusKey(id), takenKey(id)],
     arguments: [id],
   }));
   return result === 1 ? 'removed' : result === 2 ? 'not-queued' : 'taken';

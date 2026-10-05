@@ -5,9 +5,11 @@
  */
 
 import type { RedisClientType } from 'redis';
-import { statusKey } from './keys.js';
+import { statusKey, takenKey } from './keys.js';
 
 export const STATUS_TTL_SECONDS = 300;
+/** 取り出した印（`aivis-mcp:taken:<id>`）を残す時間。知らせより長く残す。 */
+export const TAKEN_TTL_SECONDS = 30 * 60;
 
 export type JobStatus = 'queued' | 'dequeued' | 'requeued' | 'playing' | 'done' | 'skipped' | 'held' | 'muted' | 'failed';
 
@@ -52,10 +54,14 @@ export function decodeStatus(raw: string): StatusEntry | undefined {
 export async function pushStatus(client: RedisClientType, id: string, status: JobStatus, reason?: string, worker?: string): Promise<void> {
   const key = statusKey(id);
   // 期限の無いキーを残さないよう、積むのと期限を 1 回（MULTI）で送る
-  await client.multi()
+  const multi = client.multi()
     .rPush(key, encodeStatus({ status, reason, at: Date.now(), ...(worker === undefined ? {} : { worker }) }))
-    .expire(key, STATUS_TTL_SECONDS)
-    .exec();
+    .expire(key, STATUS_TTL_SECONDS);
+  if (status === 'dequeued') {
+    // 取り出した印は知らせより長く残す（知らせが切れた後の withdraw が「積まれていない」と答えないように）
+    multi.set(takenKey(id), '1', { EX: TAKEN_TTL_SECONDS });
+  }
+  await multi.exec();
 }
 
 /** `from` 番目以降の知らせを読む。`next` は次に読み始める位置。 */

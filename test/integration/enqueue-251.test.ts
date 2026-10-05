@@ -1,6 +1,7 @@
 import type { RedisClientType } from 'redis';
-import { enqueueJob, restoreLegacyQueue, withdrawJobById } from '../../src/queue/enqueue.js';
-import { audioStreamKey, LEGACY_QUEUE_KEY, MIGRATED_LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, statusKey } from '../../src/queue/keys.js';
+import { enqueueJob, restoreLegacyQueue, withdrawJobById, withdrawJobByIdDetailed } from '../../src/queue/enqueue.js';
+import { audioStreamKey, LEGACY_QUEUE_KEY, MIGRATED_LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, statusKey, takenKey } from '../../src/queue/keys.js';
+import { pushStatus } from '../../src/queue/status.js';
 import { connect, describeWithRedis, startTestRedis, type TestRedis } from '../helpers/redis.js';
 
 describeWithRedis('列の操作（別ポートの redis-server）', () => {
@@ -35,6 +36,17 @@ describeWithRedis('列の操作（別ポートの redis-server）', () => {
     expect(await client.exists([audioStreamKey('x1'), statusKey('x1')])).toBe(0);
     expect(await client.get(statusKey('other'))).toBe('keep');
     expect(await withdrawJobById(client, 'x1')).toBe(false);
+  });
+
+  test('[最終レビュー LOW] 知らせの期限が切れた後の withdraw も、取り出した印があれば taken と答える', async () => {
+    await enqueueJob(client, { v: 2, type: 'stream', id: 'gone', priority: 'normal', source: 'ingest', enqueuedAt: Date.now() });
+    // worker が取り出した（BRPOP と dequeued）
+    await client.rPop(NORMAL_QUEUE_KEY);
+    await pushStatus(client, 'gone', 'dequeued', undefined, 'w1');
+    expect(await client.ttl(takenKey('gone'))).toBeGreaterThan(29 * 60);
+    // 知らせ（5 分）が期限切れになった
+    await client.del(statusKey('gone'));
+    expect([await withdrawJobByIdDetailed(client, 'gone'), await withdrawJobByIdDetailed(client, 'never')]).toEqual(['taken', 'not-queued']);
   });
 
   test('[再レビュー LOW] --restore-legacy-queue は移した古い列を順を保って戻す', async () => {

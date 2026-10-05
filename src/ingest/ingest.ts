@@ -12,10 +12,10 @@ import { version, type AppConfig } from '../config.js';
 import { buildGainTable, loadLearnedGains, MAX_BOOST_DB, TARGET_LUFS } from '../audio/gain-table.js';
 import { validatePreludePath } from '../audio/prelude.js';
 import { MAX_UTTERANCE_MS } from '../streaming/playback-policy.js';
-import { AudioStreamWriter, MAX_STREAM_BYTES, STREAM_TTL_SECONDS } from '../queue/audio-stream.js';
+import { AudioStreamWriter, cancelStreamById, MAX_STREAM_BYTES, STREAM_TTL_SECONDS } from '../queue/audio-stream.js';
 import { enqueueJob, findQueuedJob, isJobRegistered, withdrawJob, withdrawJobByIdDetailed } from '../queue/enqueue.js';
-import { anyHoldActive, clearHold, isValidHoldOwner, setHold } from '../queue/hold.js';
-import { isValidStreamId, type Job, type JobPriority, type PreludeSpec } from '../queue/jobs.js';
+import { anyHoldActive, clearHold, holdStartedAt, isValidHoldOwner, loadHoldIntervals, setHold } from '../queue/hold.js';
+import { heldOverlapMs, isValidStreamId, type Job, type JobPriority, type PreludeSpec } from '../queue/jobs.js';
 import {
   audioStreamKey, PLAY_LOCK_KEY, preludeDirsKey, PRELUDE_DIRS_TTL_SECONDS, queueKeyFor, statusKey, WORKER_LOCK_KEY,
 } from '../queue/keys.js';
@@ -563,15 +563,30 @@ export class IngestSession {
     const writer = job.writer;
     // 入力の途中なら中断の印、end の後なら「鳴らすのをやめる」印を書く（worker は鳴らし始める前なら捨てる）。
     // 書き込みの完了は待たない（Redis が詰まっていても、後ろの枠を止めない）
-    const marked = writer === undefined ? Promise.resolve() : (writer.isClosed ? writer.cancel(reason) : writer.abort(reason));
+    // 引き継いだ件は書く側がいないので、Stream に「鳴らすのをやめる印」を直接書く（取り出した後・鳴り始める前でも効く）
+    const marked = writer !== undefined
+      ? (writer.isClosed ? writer.cancel(reason) : writer.abort(reason))
+      : (job.adopted && job.kind === 'stream' ? cancelStreamById(this.client, job.id, reason).then(() => undefined) : Promise.resolve());
     this.runInBackground(async () => {
       await this.op(marked).catch(() => undefined);
       // まだ取り出されていなければ列から外す（鳴り始めた後なら worker が届いた分で終える）
-      if (!job.started && job.raw && this.jobs.has(job.id) && await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false)) {
+      if (!job.started && job.raw && this.jobs.has(job.id) && await this.withdrawTracked(job)) {
         await this.op(pushStatus(this.client, job.id, 'skipped', reason)).catch(() => undefined);
         this.finishJob(job, 'skipped', reason);
       }
     });
+  }
+
+  /**
+   * 追っている件を列から外す（LREM が 1 のときだけ true）。引き継いだ件は書く側がいないので、外せたら
+   * Stream もここで消す（この子の件は finishJob が writer 越しに消す）。
+   */
+  private async withdrawTracked(job: TrackedJob): Promise<boolean> {
+    const removed = await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
+    if (removed && job.adopted && job.kind === 'stream') {
+      await this.op(this.client.del(audioStreamKey(job.id))).catch(() => undefined);
+    }
+    return removed;
   }
 
   private async handleHold(message: Record<string, unknown>): Promise<void> {
@@ -687,6 +702,13 @@ export class IngestSession {
       return;
     }
     const first = statuses.entries[0];
+    const openedAt = first?.at || this.now();
+    // 引き継ぐ前（前の子が追っていた間）の hold の時間も追跡の上限から除く。累積は Redis の hold の記録から読む
+    const heldBeforeAdopt = await this.heldMsBetween(openedAt, this.now());
+    if (this.jobs.has(id)) {
+      this.send({ type: 'adopted', id, adopted: true });
+      return;
+    }
     const tracked: TrackedJob = {
       id,
       kind: queued?.type === 'sound' ? 'sound' : 'stream',
@@ -694,14 +716,14 @@ export class IngestSession {
       // 取り出し済みなら積んだ文字列は分からない（列から外す・位置を探すのには使えない値にしておく）
       raw: queued?.raw ?? `adopted:${id}`,
       writer: undefined,
-      openedAt: first?.at || this.now(),
+      openedAt,
       statusIndex: 0,
       started: false,
       startedAt: undefined,
       dequeued: false,
       lostMs: 0,
       lastLostCheck: undefined,
-      heldAtOpen: this.heldAccumMs,
+      heldAtOpen: this.heldAccumMs - heldBeforeAdopt,
       registration: 'confirmed',
       dequeuedBy: undefined,
       abortRequested: false,
@@ -712,6 +734,19 @@ export class IngestSession {
     this.send({ type: 'adopted', id, adopted: true });
     // 知らせは頭から読み直し、playing と終わりを中継する（queued は返さない）
     void this.pollStatuses();
+  }
+
+  /** `from` から `to` までに hold が掛かっていた時間（Redis の hold の記録から。読めなければ 0）。 */
+  private async heldMsBetween(from: number, to: number): Promise<number> {
+    try {
+      const [intervals, since] = await this.op(Promise.all([loadHoldIntervals(this.client), holdStartedAt(this.client)]));
+      if (since !== undefined) {
+        intervals.push([since, to]);
+      }
+      return heldOverlapMs(intervals, from, to);
+    } catch {
+      return 0;
+    }
   }
 
   private schedulePoll(): void {
@@ -737,8 +772,7 @@ export class IngestSession {
         // hold の間は数えない
         if (this.now() - job.openedAt - (this.heldAccumMs - job.heldAtOpen) > TRACK_LIMIT_MS) {
           // 追うのをやめる前に、まだ列にあれば外す。外せたときだけ withdrawn を付ける（外せなければ鳴るかもしれない）
-          const withdrawn = !job.started
-            && await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
+          const withdrawn = !job.started && await this.withdrawTracked(job);
           this.finishJob(job, 'failed', 'untracked', withdrawn ? { withdrawn: true } : {});
           continue;
         }
@@ -874,7 +908,7 @@ export class IngestSession {
         continue;
       }
       if (workerGone) {
-        if (await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false)) {
+        if (await this.withdrawTracked(job)) {
           await this.op(pushStatus(this.client, job.id, 'failed', 'worker-unavailable')).catch(() => undefined);
           this.finishJob(job, 'failed', 'worker-unavailable', { withdrawn: true });
           continue;

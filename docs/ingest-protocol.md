@@ -137,14 +137,15 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 | 返事 | 意味 | 親が自分で鳴らしてよいか |
 |---|---|---|
 | `{"type":"withdrawn","id":…,"removed":true}` | 列から外した | よい |
-| `{"type":"withdrawn","id":…,"removed":false,"notQueued":true}` | 列にも知らせ（`aivis-mcp:status:<id>`）にも痕跡が無い。積む要求が Redis に届いていない。残っていた Stream は消した | よい |
-| `{"type":"withdrawn","id":…,"removed":false,"taken":true}` | 列に無く、知らせはある。worker が取り出した・鳴っている・終わった | よくない（worker が鳴らす・鳴らした） |
+| `{"type":"withdrawn","id":…,"removed":false,"notQueued":true}` | 列にも知らせ（`aivis-mcp:status:<id>`）にも取り出した印（`aivis-mcp:taken:<id>`）にも痕跡が無い。積む要求が Redis に届いていない。残っていた Stream は消した | よい |
+| `{"type":"withdrawn","id":…,"removed":false,"taken":true}` | 列に無く、知らせか取り出した印がある。worker が取り出した・鳴っている・終わった | よくない（worker が鳴らす・鳴らした） |
 | `{"type":"withdrawn","id":…,"removed":false}` | Redis に確かめられなかった | よくない |
 
 - 判定（列から外す・Stream と知らせを消す・痕跡を調べる）は 1 つのスクリプトで行います。worker の取り出し・列へ戻すのと入れ違いません。同じ子が先に送った `open` の積む要求は、判定より先に Redis に届いています
 - この子が積んだジョブだけでなく、前の `--ingest`（落ちて起動し直す前の子）が積んだジョブも、`aivis-mcp:q2:high` と `aivis-mcp:q2:normal` を読んで ID が一致する要素を探し、その要素だけを外します。ほかのジョブは巻き込みません
 - 外せた件・積まれていなかった件には、以後 `status` を返しません。worker が一度取り出してから列へ戻した件（hold・優先の入れ替えなど）は、列にあるので外せます
-- 知らせは期限 300 秒なので、終わってから 5 分以上経った件は `notQueued` になります。親は終わりの知らせを受けた件に withdraw を送らないでください
+- 知らせは期限 300 秒です。worker は取り出したときに、知らせとは別に取り出した印 `aivis-mcp:taken:<id>`（期限 30 分）を残し、知らせが切れた後でも取り出した件には `taken` と答えます。終わってから 30 分以上経った件は `notQueued` になります。親は終わりの知らせを受けた件に withdraw を送らないでください
+- 落ちた子（前の `--ingest`）が積んだ件の withdraw は、子が落ちてから 5 分以内に送ってください。落ちた子はもう知らせと Stream の期限を延ばさないので、まだ取り出されていない件の知らせは 5 分で切れ、Stream も 180 秒で切れます（worker は Stream の無い件を `stream-missing` で捨てます）
 
 ### `adopt`
 
@@ -157,7 +158,8 @@ hold が 1 つでもあると、worker は列から取り出さず、鳴って�
 - 列か知らせに痕跡がある件だけ引き継ぎます（`adopted: true`）。どちらにも無い ID は `adopted: false` です。この子がすでに追っている件は `adopted: true` のままです
 - 引き継いだ件は、この子が Stream と知らせの期限を延ばし、知らせを頭から読み直して `playing` と終わり（`done` `skipped` `held` `muted` `failed`）を返します。`queued` は返しません。見失った・追跡の上限の判断もこの子が行います
 - 音声の続き（音声の枠・`end`）は送れません。書きかけの流れは、worker が届いた分で終えるか打ち切ります。鳴らさずに済ませたいなら `withdraw` を送ってください
-- `abort` と `withdraw` は、引き継いだ件にも使えます
+- `abort` と `withdraw` は、引き継いだ件にも使えます。引き継いだ件には書く側がいないので、`abort` を受けた子が Stream に鳴らすのをやめる印 `c` を直接書きます（Stream が残っているときだけ）。worker が取り出した後でも、鳴らし始める前なら捨てます（`skipped`）。まだ列にあれば列から外し、そのとき Stream も消します
+- 追跡の上限（15 分、hold の間は数えない）は、最初の知らせの時刻から数えます。引き継ぐ前に掛かっていた hold の時間も、Redis の hold の記録（`aivis-mcp:hold-log` と `aivis-mcp:hold-since`）から読んで除きます
 
 ### `ping`
 
@@ -262,6 +264,7 @@ SSH 先などの aivis-mcp が Para Code の `/paradis-mcp/mobile-voice` へ合�
 |---|---|
 | ヘッダー `X-Para-Local-Playback: accepted` | 引き受けた。接続先では鳴らさない |
 | 401・403 | ticket が通らなかった（期限切れ・使用済み）。手元で鳴らす前提の発話は接続先で鳴らさず `failed`（`ticket-unavailable`） |
+| 404（ticket に `localPlayback: true` があるときだけ） | 401・403 と同じく ticket が通らなかったとみなし、接続先で鳴らさない。今の Para Code は通らない ticket に 404 を返すため（次の版から 401）。`localPlayback` の無い ticket の 404 は、下の「ほかの 4xx」として扱う |
 | ほかの 4xx・5xx、またはヘッダー `X-Para-Local-Playback: rejected` | 明示の拒否。接続先で鳴らす |
 | 2xx で上のどちらのヘッダーも無い（不明） | 本文の `localPlayback` で決める。`false` なら接続先で鳴らし、`true` か本文が読めなければ鳴らさない |
 | 応答のヘッダーが 1 つも来ないまま接続に失敗した | 接続先で鳴らす |

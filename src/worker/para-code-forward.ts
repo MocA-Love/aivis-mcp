@@ -3,7 +3,7 @@
  *
  * - ticket の応答に `ingress: "stream-v1"` があるときだけ、合成を受け取りながら chunked で送る。
  *   応答のヘッダー `X-Para-Local-Playback: accepted` が来たら、この機械では鳴らさない（引き受け）。
- *   401・403 は ticket が通らなかった（期限切れ・使用済み）ので unavailable。ほかの 4xx・5xx か
+ *   401・403（手元で鳴らす ticket では 404 も）は ticket が通らなかった（期限切れ・使用済み）ので unavailable。ほかの 4xx・5xx か
  *   `X-Para-Local-Playback: rejected` は明示の拒否で、この機械で鳴らす。
  *   ヘッダーはあるがどちらでもない（不明）ときは、本文の `localPlayback` で決め、無ければ鳴らさない。
  *   ヘッダーが 1 つも来ないまま接続に失敗したときだけ自分で鳴らす。
@@ -103,6 +103,14 @@ function bodyLocalPlayback(body: Buffer): boolean | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * ticket が通らなかった応答か。401・403 に加え、手元で鳴らす ticket（localPlayback）では 404 も含める
+ * （今の Para Code は使用済み・期限切れの ticket に 404 を返す。次の版から 401）。
+ */
+function isTicketRejectedStatus(status: number, target: ParaCodeVoiceTarget): boolean {
+  return status === 401 || status === 403 || (status === 404 && target.localPlayback === true);
 }
 
 export function startParaCodeForward(
@@ -284,7 +292,7 @@ class ChunkedForward extends ForwardBase {
       this.headersReceived = true;
       const status = response.statusCode ?? 0;
       const header = String(response.headers[LOCAL_PLAYBACK_HEADER] ?? '').toLowerCase();
-      if (status === 401 || status === 403) {
+      if (isTicketRejectedStatus(status, this.target)) {
         // ticket が通らなかった（期限切れ・使用済み）。Para Code が断ったのではなく、送れなかった
         this.ticketRejected = true;
         this.decide('unavailable');
@@ -411,7 +419,7 @@ class BufferedForward extends ForwardBase {
         'Content-Length': audio.byteLength,
       },
     }, this.target.localPlayback === true ? 30_000 : 3_000, audio);
-    if (response !== undefined && (response.statusCode === 401 || response.statusCode === 403)) {
+    if (response !== undefined && isTicketRejectedStatus(response.statusCode, this.target)) {
       return 'ticket-rejected';
     }
     if (response === undefined || response.statusCode < 200 || response.statusCode >= 300 || response.body.length === 0) {

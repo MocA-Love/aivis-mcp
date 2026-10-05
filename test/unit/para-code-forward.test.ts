@@ -92,6 +92,28 @@ describe('Para Code への送り出し', () => {
     }
   });
 
+  test('[最終レビュー MEDIUM] localPlayback の ticket では 404 も ticket が通らなかったとみなし、接続先で鳴らさない', async () => {
+    const cases: { readonly extra: Partial<ParaCodeVoiceTarget>; readonly expected: string }[] = [
+      { extra: { ingress: 'stream-v1', localPlayback: true }, expected: 'unavailable' },
+      { extra: { localPlayback: true }, expected: 'unavailable' },
+      // localPlayback の無い ticket（手元の Para Code）は今どおり
+      { extra: { ingress: 'stream-v1' }, expected: 'local' },
+      { extra: {}, expected: 'local' },
+    ];
+    const results: string[] = [];
+    for (const { extra } of cases) {
+      await withServer((request, response, received) => {
+        collect(request, received, () => { response.writeHead(404); response.end(); });
+      }, async port => {
+        const forward = startParaCodeForward(target(port, extra), { isCurrentInstance: current });
+        forward.push(Buffer.from([1]));
+        forward.end();
+        results.push(await forward.outcome);
+      });
+    }
+    expect(results).toEqual(cases.map(({ expected }) => expected));
+  });
+
   test('stream-v1: ヘッダーの後に止まったら諦める（鳴らし直さない）', async () => {
     await withServer((_request, response) => {
       response.writeHead(200, { 'X-Para-Local-Playback': 'accepted' });

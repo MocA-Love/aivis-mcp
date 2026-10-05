@@ -218,6 +218,24 @@ export class AudioStreamWriter {
   }
 }
 
+const CANCEL_IF_EXISTS_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+redis.call('XADD', KEYS[1], '*', 'c', ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return 1`;
+
+/**
+ * 書く側（writer）がいない Stream（前の `--ingest` から引き継いだ件）に、鳴らすのをやめる印 `c` を直接書く。
+ * Stream が無ければ作らない（worker が消した後にキーを作り直さない）。書けたら true。
+ */
+export async function cancelStreamById(client: RedisClientType, id: string, reason = 'aborted'): Promise<boolean> {
+  const result = await client.eval(CANCEL_IF_EXISTS_SCRIPT, {
+    keys: [audioStreamKey(id)],
+    arguments: [reason.slice(0, 64) || 'aborted', String(STREAM_TTL_SECONDS)],
+  });
+  return Number(result) === 1;
+}
+
 export type StreamEvent =
   | { readonly kind: 'data'; readonly data: Buffer }
   | { readonly kind: 'end' }

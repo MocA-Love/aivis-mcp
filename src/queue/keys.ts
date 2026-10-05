@@ -25,6 +25,11 @@ export const PLAY_LOCK_KEY = 'aivis-mcp:play-lock';
 export const AUDIO_STREAM_PREFIX = 'aivis-mcp:audio:';
 export const STATUS_PREFIX = 'aivis-mcp:status:';
 export const HOLD_PREFIX = 'aivis-mcp:hold:';
+/**
+ * worker が取り出した印（期限 30 分）。知らせ（期限 5 分）が切れた後も、withdraw が「積まれていない」と
+ * 取り違えないように残す。
+ */
+export const TAKEN_PREFIX = 'aivis-mcp:taken:';
 /** hold を置いた・消したときの知らせ。 */
 export const HOLD_CHANNEL = 'aivis-mcp:hold-events';
 /** 終わった hold の区間（ジョブの期限から hold の時間を除くため）。 */
@@ -56,6 +61,10 @@ export function audioStreamKey(id: string): string {
 
 export function statusKey(id: string): string {
   return STATUS_PREFIX + id;
+}
+
+export function takenKey(id: string): string {
+  return TAKEN_PREFIX + id;
 }
 
 export function holdKey(owner: string): string {

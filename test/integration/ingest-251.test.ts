@@ -308,5 +308,37 @@ describeWithRedis('--ingest の 2.5.1 の直し（別ポートの redis-server�
     expect(backend.voices[0].bytes.length).toBe(417 * 20);
     previous.input.resume();
   });
-});
 
+  test('[最終レビュー LOW] 引き継いだ件の abort は、列にあれば外して Stream も消し、取り出した後でも鳴り始める前なら止める', async () => {
+    const previous = await session();
+    for (const id of ['in-queue', 'taken']) {
+      previous.input.write(encodeControl({ type: 'open', id }));
+      previous.input.write(encodeAudio(id, mp3Frames(20)));
+      previous.input.write(encodeControl({ type: 'end', id }));
+      await waitFor(() => previous.statusesOf(id).includes('queued') ? true : undefined);
+    }
+    await new Promise(resolve => setTimeout(resolve, 300));
+    previous.input.pause();
+    const next = await session();
+    for (const id of ['in-queue', 'taken']) {
+      next.input.write(encodeControl({ type: 'adopt', id }));
+    }
+    await waitFor(() => next.messages.filter(message => message.type === 'adopted').length === 2 ? true : undefined);
+    // まだ列にある件: 列から外し、Stream も消す
+    next.input.write(encodeControl({ type: 'abort', id: 'in-queue' }));
+    await waitFor(() => next.statusesOf('in-queue').includes('skipped') ? true : undefined);
+    expect(await client.exists(audioStreamKey('in-queue'))).toBe(0);
+    // 取り出した後・鳴り始める前の件: 再生 lock をほかが持つ間に worker が取り出す
+    await client.set(PLAY_LOCK_KEY, 'someone-else', { PX: 60_000 });
+    const backend = new FakeBackend();
+    startWorker(backend);
+    await waitFor(async () => (await client.lRange(statusKey('taken'), 0, -1)).some(raw => JSON.parse(raw).s === 'dequeued') ? true : undefined);
+    next.input.write(encodeControl({ type: 'abort', id: 'taken' }));
+    await waitFor(async () => (await client.xRange(audioStreamKey('taken'), '-', '+')).some(entry => 'c' in entry.message) ? true : undefined);
+    await client.del(PLAY_LOCK_KEY);
+    await waitFor(() => next.statusesOf('taken').includes('skipped') ? true : undefined, 15_000);
+    // worker は再生 lock を取った時点で playing を知らせるが、Stream の c を見て鳴らさずに捨てる
+    expect([next.statusesOf('taken'), backend.voices.length]).toEqual([['adopted', 'playing', 'skipped'], 0]);
+    previous.input.resume();
+  });
+});
