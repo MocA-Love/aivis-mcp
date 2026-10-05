@@ -14,6 +14,7 @@ import { readStatuses } from '../../src/queue/status.js';
 import type { Job, StreamJob } from '../../src/queue/jobs.js';
 import { setMute } from '../../src/services/mute-service.js';
 import { loadLearnedGains } from '../../src/audio/gain-table.js';
+import type { AppConfig } from '../../src/config.js';
 import { connect, describeWithRedis, startTestRedis, waitFor, type TestRedis } from '../helpers/redis.js';
 import { FakeBackend } from '../helpers/fake-backend.js';
 import { mp3Frames, testConfig } from '../helpers/fixtures.js';
@@ -55,11 +56,11 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function startWorker(backend: FakeBackend, options: { version?: string; synthesize?: () => Promise<NodeJS.ReadableStream>; measure?: () => Promise<{ integratedLufs: number; durationSeconds: number }> } = {}): PlaybackWorker {
+  function startWorker(backend: FakeBackend, options: { version?: string; synthesize?: () => Promise<NodeJS.ReadableStream>; measure?: () => Promise<{ integratedLufs: number; durationSeconds: number }>; loadConfig?: () => AppConfig } = {}): PlaybackWorker {
     const worker = new PlaybackWorker({
       redisUrl: redis.url,
       version: options.version ?? '2.5.0',
-      loadConfig: () => testConfig(redis.url),
+      loadConfig: options.loadConfig ?? (() => testConfig(redis.url)),
       backend,
       synthesize: options.synthesize ?? (async () => Readable.from([mp3Frames(20)])),
       measure: options.measure,
@@ -213,16 +214,41 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
   test('エージェントの声は合成しながら Stream に流して鳴らし、覚え直す', async () => {
     const backend = new FakeBackend({ canMeasure: true });
     const worker = startWorker(backend, {
-      synthesize: async () => Readable.from([mp3Frames(30), mp3Frames(40)]),
-      measure: async () => ({ integratedLufs: -25, durationSeconds: 1.9 }),
+      synthesize: async () => Readable.from([mp3Frames(60), mp3Frames(60)]),
+      measure: async () => ({ integratedLufs: -25, durationSeconds: 3.1 }),
     });
     const job = await enqueueSynthesis(client, { text: 'こんにちは', provider: 'aivis', model_uuid: 'model-b' });
     expect(await finalStatus(job.id)).toEqual({ status: 'done' });
-    expect(backend.voices[0].bytes.length).toBe(417 * 70);
+    expect(backend.voices[0].bytes.length).toBe(417 * 120);
     await worker.flushMeasurements();
     expect({ ...loadLearnedGains(gainFile) }).toEqual({ 'aivis:model-b:default': { db: 5, samples: [5], updatedAt: expect.any(Number) } });
     // 鳴らし終えた Stream は消す
     expect(await client.exists(`aivis-mcp:audio:${job.id}`)).toBe(0);
+  });
+
+  test('窓と最短秒数は発話ごとに設定を読み直して使う', async () => {
+    const backend = new FakeBackend({ canMeasure: true });
+    let current: Partial<AppConfig> = { gainMinLearnSeconds: 2.5, gainLearnWindow: 9 };
+    let lufs = -25;
+    const worker = startWorker(backend, {
+      synthesize: async () => Readable.from([mp3Frames(80)]),
+      measure: async () => ({ integratedLufs: lufs, durationSeconds: 2.1 }),
+      loadConfig: () => ({ ...testConfig(redis.url), ...current }),
+    });
+    // 2.1 秒は既定の 2.5 秒より短いので覚えない
+    const first = await enqueueSynthesis(client, { text: '一つ目', provider: 'aivis', model_uuid: 'model-c' });
+    expect(await finalStatus(first.id)).toEqual({ status: 'done' });
+    await worker.flushMeasurements();
+    expect({ ...loadLearnedGains(gainFile) }).toEqual({});
+    // 設定を 2 秒・窓 2 に変えると、起こし直さずに次の発話から効く
+    current = { gainMinLearnSeconds: 2, gainLearnWindow: 2 };
+    for (const value of [-25, -23, -21]) {
+      lufs = value;
+      const job = await enqueueSynthesis(client, { text: '次', provider: 'aivis', model_uuid: 'model-c' });
+      expect(await finalStatus(job.id)).toEqual({ status: 'done' });
+      await worker.flushMeasurements();
+    }
+    expect({ ...loadLearnedGains(gainFile) }).toEqual({ 'aivis:model-c:default': { db: 2, samples: [3, 1], updatedAt: expect.any(Number) } });
   });
 
   test('感情タグ入りの発話は覚え直しに使わない', async () => {

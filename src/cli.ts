@@ -4,7 +4,7 @@ import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './co
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { withParaCodeVoiceTarget } from './services/para-code-voice.js';
 import { enqueueSynthesis } from './queue/enqueue.js';
-import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, runRestoreLegacyQueue } from './commands.js';
+import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, runRestoreLegacyQueue, runExportGains, runImportGains } from './commands.js';
 import { runDoctor } from './doctor.js';
 import { runInit } from './settings.js';
 
@@ -39,6 +39,8 @@ function printHelp(): void {
   console.log('  aivis --play-audio                標準入力のMP3をキューに積んで再生');
   console.log('  aivis --play-audio --gain-key <provider:voice:model>  音量の表の鍵を添えて積む');
   console.log('  aivis --restore-legacy-queue    2.5.0 以前へ戻すとき、移した古い列の発話を戻す');
+  console.log('  aivis --export-gains <file> [--voice <id>…] [--model <id>]  音量の表を書き出す（声・モデルで絞り込み）');
+  console.log('  aivis --import-gains <file> [--overwrite]  音量の表を読み込んで足す（既定は自分の値を残す）');
   console.log('  aivis --init                      初期設定（APIキー等を保存）');
   console.log('  aivis --doctor                    依存ツール診断');
   console.log('  aivis --version                   バージョン表示');
@@ -76,7 +78,8 @@ async function main() {
   }
 
   if (values.help || (positionals.length === 0 && !values.health && !values.reboot && !values.doctor
-    && !values.mute && !values.unmute && !values['mute-status'] && !values['play-audio'] && !values['restore-legacy-queue'])) {
+    && !values.mute && !values.unmute && !values['mute-status'] && !values['play-audio'] && !values['restore-legacy-queue']
+    && typeof values['export-gains'] !== 'string' && typeof values['import-gains'] !== 'string')) {
     printHelp();
     process.exit(0);
   }
@@ -103,6 +106,16 @@ async function main() {
 
   if (values.unmute) {
     await runUnmute(config);
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+  }
+
+  if (typeof values['export-gains'] === 'string') {
+    runExportGains(values['export-gains'], Array.isArray(values.voice) ? values.voice : [], typeof values.model === 'string' ? values.model : undefined);
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+  }
+
+  if (typeof values['import-gains'] === 'string') {
+    runImportGains(values['import-gains'], values.overwrite === true);
     process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
 

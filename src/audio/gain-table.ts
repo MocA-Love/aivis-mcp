@@ -16,10 +16,23 @@ export const MAX_BOOST_DB = 8;
 /** 下げる方向の下限（壊れた測定で無音にしないため）。 */
 export const MIN_TABLE_DB = -30;
 export const MIN_FINAL_DB = -60;
-/** 覚え直しに使う直近の回数。 */
-export const LEARN_WINDOW = 5;
-/** これより短い発話は覚え直しに使わない。 */
-export const MIN_LEARN_SECONDS = 1.5;
+/**
+ * 覚え直しに使う直近の回数（既定）。10 声 × 20 文の実測で、窓 5 だと採用値のずれが p99 1.24dB、
+ * 9 だと p99 0.99dB（耳で気付く 1dB 以内）。15 は p99 0.79dB だが落ち着くまでが遅い。
+ * `config.json` の `gain.learnWindow` か `AIVIS_GAIN_LEARN_WINDOW` で変えられる。
+ */
+export const LEARN_WINDOW = 9;
+/**
+ * これより短い発話は覚え直しに使わない（既定、秒）。2.5 秒以下の短い文は声により約 -0.8dB 偏る。
+ * `config.json` の `gain.minLearnSeconds` か `AIVIS_GAIN_MIN_LEARN_SECONDS` で変えられる。
+ */
+export const MIN_LEARN_SECONDS = 2.5;
+/** 窓に指定できる範囲。表のファイルにも上限の分までは測定を残す（窓を増やしたときに使う）。 */
+export const MIN_LEARN_WINDOW = 1;
+export const MAX_LEARN_WINDOW = 50;
+/** 最短の秒数に指定できる範囲。 */
+export const MIN_LEARN_SECONDS_LOWER = 0.5;
+export const MIN_LEARN_SECONDS_UPPER = 30;
 /** 表に覚える組の上限。超えたら更新の古いものから消す。 */
 export const MAX_LEARNED_ENTRIES = 200;
 /**
@@ -131,10 +144,13 @@ export function resolveGainDb(key: string | undefined, learned: Readonly<Record<
   return round1(sameModel.reduce((sum, value) => sum + value, 0) / sameModel.length);
 }
 
-/** 測った大きさ（LUFS）を 1 回分の補正値として足し、直近 5 回の中央値を表の値にする。 */
-export function learnSample(previous: LearnedGain | undefined, measuredLufs: number, now = Date.now()): LearnedGain {
+/**
+ * 測った大きさ（LUFS）を 1 回分の補正値として足し、直近 `window` 回の中央値を表の値にする。
+ * 窓を減らしたときは古い測定を捨て、増やしたときはあるだけで中央値を取る。
+ */
+export function learnSample(previous: LearnedGain | undefined, measuredLufs: number, now = Date.now(), window = LEARN_WINDOW): LearnedGain {
   const sample = round1(clampTableDb(TARGET_LUFS - measuredLufs));
-  const samples = [...(previous?.samples ?? []), sample].slice(-LEARN_WINDOW);
+  const samples = [...(previous?.samples ?? []), sample].slice(-clampLearnWindow(window));
   return { db: round1(median(samples)), samples, updatedAt: now };
 }
 
@@ -148,14 +164,14 @@ export function pruneLearnedGains(entries: Readonly<Record<string, LearnedGain>>
   return result;
 }
 
-/** 覚え直しに使ってよい発話か。 */
+/** 覚え直しに使ってよい発話か（`minLearnSeconds` より短いものは使わない）。 */
 export function isLearnable(input: {
   readonly tagged: boolean;
   readonly durationSeconds: number | undefined;
   readonly completed: boolean;
   readonly measuredLufs?: number;
-}): boolean {
-  if (input.tagged || !input.completed || input.durationSeconds === undefined || input.durationSeconds < MIN_LEARN_SECONDS) {
+}, minLearnSeconds = MIN_LEARN_SECONDS): boolean {
+  if (input.tagged || !input.completed || input.durationSeconds === undefined || input.durationSeconds < minLearnSeconds) {
     return false;
   }
   if (input.measuredLufs !== undefined && (!Number.isFinite(input.measuredLufs) || input.measuredLufs < -70 || input.measuredLufs > 0)) {
@@ -213,6 +229,87 @@ export function gainFilePath(): string {
   return process.env.AIVIS_GAIN_FILE || path.join(os.homedir(), '.config', 'aivis-mcp', 'gain.json');
 }
 
+function clampLearnWindow(window: number): number {
+  if (!Number.isFinite(window)) {
+    return LEARN_WINDOW;
+  }
+  return Math.min(MAX_LEARN_WINDOW, Math.max(MIN_LEARN_WINDOW, Math.floor(window)));
+}
+
+export interface GainLearningSettings {
+  /** 覚え直しに使う直近の回数 */
+  readonly learnWindow: number;
+  /** これより短い発話は覚え直しに使わない（秒） */
+  readonly minLearnSeconds: number;
+}
+
+/** 候補（優先の高い順）。`source` は警告に出す名前。 */
+export interface GainSettingCandidate {
+  readonly source: string;
+  readonly value: unknown;
+}
+
+function toNumber(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    return Number(value.trim());
+  }
+  return undefined;
+}
+
+/**
+ * 候補のうち最初に値があるものを使う。範囲外・数でないときは既定に戻して `warn` で知らせる
+ * （下の優先度の候補へは落とさない。指定した人に、効いていないことを気付かせるため）。
+ */
+function pickSetting(
+  name: string,
+  candidates: readonly GainSettingCandidate[],
+  fallback: number,
+  isValid: (value: number) => boolean,
+  range: string,
+  warn: (message: string) => void,
+): number {
+  for (const candidate of candidates) {
+    if (candidate.value === undefined || candidate.value === null || candidate.value === '') {
+      continue;
+    }
+    const value = toNumber(candidate.value);
+    if (value !== undefined && Number.isFinite(value) && isValid(value)) {
+      return value;
+    }
+    warn(`${candidate.source} の ${name}=${String(candidate.value)} は範囲外です（${range}）。既定の ${fallback} を使います`);
+    return fallback;
+  }
+  return fallback;
+}
+
+/** 窓と最短秒数を、優先の高い順に並べた候補から決める。 */
+export function resolveGainLearningSettings(
+  candidates: { readonly learnWindow: readonly GainSettingCandidate[]; readonly minLearnSeconds: readonly GainSettingCandidate[] },
+  warn: (message: string) => void = message => console.error(`[aivis-mcp] ${message}`),
+): GainLearningSettings {
+  return {
+    learnWindow: pickSetting(
+      'learnWindow',
+      candidates.learnWindow,
+      LEARN_WINDOW,
+      value => Number.isInteger(value) && value >= MIN_LEARN_WINDOW && value <= MAX_LEARN_WINDOW,
+      `${MIN_LEARN_WINDOW}〜${MAX_LEARN_WINDOW} の整数`,
+      warn,
+    ),
+    minLearnSeconds: pickSetting(
+      'minLearnSeconds',
+      candidates.minLearnSeconds,
+      MIN_LEARN_SECONDS,
+      value => value >= MIN_LEARN_SECONDS_LOWER && value <= MIN_LEARN_SECONDS_UPPER,
+      `${MIN_LEARN_SECONDS_LOWER}〜${MIN_LEARN_SECONDS_UPPER} 秒`,
+      warn,
+    ),
+  };
+}
+
 function isLearnedGain(value: unknown): value is LearnedGain {
   if (typeof value !== 'object' || value === null) {
     return false;
@@ -232,7 +329,8 @@ export function loadLearnedGains(filePath = gainFilePath()): Record<string, Lear
         if (key.length <= 300 && key !== '__proto__' && isLearnedGain(entry)) {
           result[key] = {
             db: clampTableDb(entry.db),
-            samples: entry.samples.slice(-LEARN_WINDOW),
+            // 窓を後から増やしても使えるよう、指定できる上限の分まで残す
+            samples: entry.samples.slice(-MAX_LEARN_WINDOW),
             ...(typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt) ? { updatedAt: entry.updatedAt } : {}),
           };
         }
@@ -251,9 +349,9 @@ export function saveLearnedGains(entries: Readonly<Record<string, LearnedGain>>,
 }
 
 /** 1 回分の測定を表に足して保存する。 */
-export function recordMeasurement(key: string, measuredLufs: number, filePath = gainFilePath()): LearnedGain {
+export function recordMeasurement(key: string, measuredLufs: number, filePath = gainFilePath(), window = LEARN_WINDOW): LearnedGain {
   const entries = loadLearnedGains(filePath);
-  const next = learnSample(entries[key], measuredLufs);
+  const next = learnSample(entries[key], measuredLufs, Date.now(), window);
   const merged: Record<string, LearnedGain> = Object.assign(Object.create(null), entries);
   merged[key] = next;
   saveLearnedGains(merged, filePath);

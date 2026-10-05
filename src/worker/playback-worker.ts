@@ -1574,7 +1574,11 @@ export class PlaybackWorker {
     }
     // 長さは Xing/VBRI ヘッダー、無ければ全フレームの合計で数える（可変ビットレートでも外さない）
     const estimated = estimateMp3Duration(audio);
-    if (!isLearnable({ tagged: request.tagged, durationSeconds: estimated, completed: true })) {
+    // 窓と最短秒数は発話ごとに読み直す（config.json を書き換えれば --reboot 無しで効く）
+    const config = this.deps.loadConfig();
+    const minLearnSeconds = config.gainMinLearnSeconds;
+    const learnWindow = config.gainLearnWindow;
+    if (!isLearnable({ tagged: request.tagged, durationSeconds: estimated, completed: true }, minLearnSeconds)) {
       return;
     }
     const gainKey = request.gainKey;
@@ -1583,10 +1587,10 @@ export class PlaybackWorker {
       if (result === undefined) {
         return;
       }
-      if (!isLearnable({ tagged: request.tagged, durationSeconds: result.durationSeconds ?? estimated, completed: true, measuredLufs: result.integratedLufs })) {
+      if (!isLearnable({ tagged: request.tagged, durationSeconds: result.durationSeconds ?? estimated, completed: true, measuredLufs: result.integratedLufs }, minLearnSeconds)) {
         return;
       }
-      const learned = recordMeasurement(gainKey, result.integratedLufs, this.deps.gainFile);
+      const learned = recordMeasurement(gainKey, result.integratedLufs, this.deps.gainFile, learnWindow);
       this.log('gain learned', { gainKey, lufs: result.integratedLufs, db: learned.db });
     })().catch(error => console.error('Gain learning error:', summarizeError(error)));
     this.pendingMeasurements.add(task);

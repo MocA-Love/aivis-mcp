@@ -29,6 +29,14 @@ export interface ElevenLabsSettings {
   volumeMigrated?: boolean;
 }
 
+/** 音量の表の覚え直し方 */
+export interface GainSettings {
+  /** 覚え直しに使う直近の回数（1〜50、既定 9） */
+  learnWindow?: number;
+  /** これより短い発話は覚え直しに使わない（0.5〜30 秒、既定 2.5） */
+  minLearnSeconds?: number;
+}
+
 export interface UserSettings {
   provider?: TtsProvider;
   apiKey?: string;
@@ -38,6 +46,7 @@ export interface UserSettings {
   /** すべての声に足す上乗せ（dB、既定 0） */
   volumeOffsetDb?: number;
   elevenlabs?: ElevenLabsSettings;
+  gain?: GainSettings;
 }
 
 export function loadSettings(): UserSettings {

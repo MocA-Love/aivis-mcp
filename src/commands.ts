@@ -10,6 +10,7 @@ import { safeGainKeyHeader } from './worker/para-code-forward.js';
 import { HIGH_QUEUE_KEY, HOLD_PREFIX, NORMAL_QUEUE_KEY } from './queue/keys.js';
 import { detectPlayerKind, hasFfmpeg } from './audio/player.js';
 import { gainFilePath } from './audio/gain-table.js';
+import { exportGains, GainImportError, importGains } from './audio/gain-transfer.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -339,5 +340,31 @@ export async function runRestoreLegacyQueue(config: AppConfig): Promise<void> {
     console.log(moved > 0 ? `${moved} 件を古い列へ戻しました` : '戻す発話はありません');
   } finally {
     await client.disconnect().catch(() => undefined);
+  }
+}
+
+/** `--export-gains <file> [--voice <id>…] [--model <id>]`: 音量の表を書き出す。 */
+export function runExportGains(outputPath: string, voices: readonly string[], model: string | undefined): void {
+  try {
+    const count = exportGains(outputPath, { voices, model });
+    console.log(`音量の表を ${count} 行書き出しました: ${outputPath}`);
+  } catch (error) {
+    console.error(`書き出せませんでした: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
+}
+
+/** `--import-gains <file> [--overwrite]`: 音量の表を読み込んで足す。 */
+export function runImportGains(inputPath: string, overwrite: boolean): void {
+  try {
+    const result = importGains(inputPath, overwrite);
+    console.log(`音量の表を読み込みました: 追加 ${result.added} 行、上書き ${result.overwritten} 行、自分の値を残した ${result.kept} 行（${gainFilePath()}）`);
+    if (result.kept > 0) {
+      console.log('受け取った値で上書きするには --overwrite を付けてください');
+    }
+  } catch (error) {
+    const prefix = error instanceof GainImportError ? '読み込みを取りやめました' : '読み込めませんでした';
+    console.error(`${prefix}: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
   }
 }

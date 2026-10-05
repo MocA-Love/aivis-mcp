@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.5.2] - 2026-10-05
+
+更新したら `aivis-mcp --reboot` で worker を起動し直してください。
+
+### 音量の覚え直しを安定させる
+
+- 中央値を取る直近の回数（窓）を 5 から 9 に、覚え直しに使う最短の長さを 1.5 秒から 2.5 秒にしました
+- 根拠は 10 声 × 20 文の実測です。1 回ごとのぶれは標準偏差の平均で 0.79dB ありました。窓 5 だと採用値のずれが p99 で 1.24dB でしたが、窓 9 では p99 0.99dB と、耳で気付く 1dB 以内に収まります。窓 15 は p99 0.79dB ですが、落ち着くまでが遅くなります。2.5 秒以下の短い文は声によって約 -0.8dB 偏るので、覚え直しから外しました
+- 窓と最短秒数は `config.json` の `gain.learnWindow`・`gain.minLearnSeconds`、環境変数 `AIVIS_GAIN_LEARN_WINDOW`・`AIVIS_GAIN_MIN_LEARN_SECONDS` で変えられます（環境変数 > `config.json` > 既定）。窓は 1〜50、秒は 0.5〜30 で、外れた値は既定に戻して警告します。`config.json` の変更は `--reboot` 無しで次の発話から効きます
+- 窓を減らすと次に覚え直すときに古い測定を捨て、増やすと残っている分だけで中央値を取ります。表には 50 回分まで測定を残します
+- `tts-get-settings` に今の窓と最短秒数（`gain.learn_window`・`gain.min_learn_seconds`）を出します
+
+### 音量の表を書き出し・読み込む
+
+- `aivis --export-gains <file> [--voice <voice_id>…] [--model <model_id>]` で、覚えた表を（声・モデルで絞り込んで）`gain.json` と同じ形で書き出します
+- `aivis --import-gains <file> [--overwrite]` で、書き出した表を自分の表に足します。既定では自分の表にある行は自分の値を残し、`--overwrite` で受け取った値に置き換えます。直近の測定ごと取り込みます
+- `target` が違うファイルや壊れたファイルは、何も書き換えずに拒みます
+- `aivis-mcp` でも同じ引数で使えます
+
 ## [2.5.1] - 2026-10-05
 
 更新したら `aivis-mcp --reboot` で worker を起動し直してください。

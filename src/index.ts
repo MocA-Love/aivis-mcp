@@ -4,7 +4,7 @@ import { parseCliArgs, resolveConfig, buildSynthesisParams, version } from './co
 import { MCPService } from './services/mcp-service.js';
 import { AivisSpeechService } from './services/aivis-speech-service.js';
 import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
-import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, runRestoreLegacyQueue } from './commands.js';
+import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio, runRestoreLegacyQueue, runExportGains, runImportGains } from './commands.js';
 import { runIngest } from './ingest/ingest.js';
 import { enqueueSynthesis } from './queue/enqueue.js';
 import { withParaCodeVoiceTarget } from './services/para-code-voice.js';
@@ -27,6 +27,8 @@ function printHelp(): void {
   console.log('  aivis-mcp --play-audio --gain-key <provider:voice:model>  音量の表の鍵を添えて積む');
   console.log('  aivis-mcp --restore-legacy-queue    2.5.0 以前へ戻すとき、移した古い列の発話を戻す');
   console.log('  aivis-mcp --ingest                 Para Code 用の取込口（標準入出力の枠。docs/ingest-protocol.md）');
+  console.log('  aivis-mcp --export-gains <file> [--voice <id>…] [--model <id>]  音量の表を書き出す（声・モデルで絞り込み）');
+  console.log('  aivis-mcp --import-gains <file> [--overwrite]  音量の表を読み込んで足す（既定は自分の値を残す）');
   console.log('  aivis-mcp --init                   初期設定（APIキー等を保存）');
   console.log('  aivis-mcp --doctor                 依存ツール診断');
   console.log('  aivis-mcp --version                バージョン表示');
@@ -121,6 +123,16 @@ async function main() {
     const preludeDirs = Array.isArray(values['prelude-dir']) ? values['prelude-dir'] : [];
     await runIngest(() => resolveConfig(values), preludeDirs);
     return;
+  }
+
+  if (typeof values['export-gains'] === 'string') {
+    runExportGains(values['export-gains'], Array.isArray(values.voice) ? values.voice : [], typeof values.model === 'string' ? values.model : undefined);
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+  }
+
+  if (typeof values['import-gains'] === 'string') {
+    runImportGains(values['import-gains'], values.overwrite === true);
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
 
   if (values['play-audio']) {

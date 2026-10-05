@@ -250,6 +250,10 @@ export class MCPService {
         volume_offset_db: config.elevenLabsVolumeOffsetDb,
       },
       volume_offset_db: config.volumeOffsetDb,
+      gain: {
+        learn_window: config.gainLearnWindow,
+        min_learn_seconds: config.gainMinLearnSeconds,
+      },
       config_path: getConfigPath(),
     };
   }

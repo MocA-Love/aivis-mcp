@@ -32,26 +32,51 @@ describe('gain table', () => {
     expect(resolveGainDb('elevenlabs:other:eleven_v3', learned)).toBe(-4.0);
   });
 
-  test('覚え直しは直近 5 回の中央値', () => {
+  test('覚え直しは既定で直近 9 回の中央値', () => {
     let entry = learnSample(undefined, -24);
     expect(entry).toEqual({ db: 4, samples: [4], updatedAt: expect.any(Number) });
-    for (const lufs of [-30, -22, -21, -19, -10]) {
+    for (const lufs of [-30, -22, -21, -19, -10, -20, -20, -20, -26]) {
       entry = learnSample(entry, lufs);
     }
-    // 直近 5 回 = [10→clamp 8, 2, 1, -1, -10]
-    expect(entry.samples).toEqual([8, 2, 1, -1, -10]);
-    expect(entry.db).toBe(1);
+    // 直近 9 回 = [10→clamp 8, 2, 1, -1, -10, 0, 0, 0, 6]（最初の測定 4 は窓から外れる）。並べると真ん中は 0
+    expect(entry.samples).toEqual([8, 2, 1, -1, -10, 0, 0, 0, 6]);
+    expect(entry.db).toBe(0);
     expect(median([1, 2, 3, 4])).toBe(2.5);
     expect(median([])).toBe(0);
   });
 
-  test('感情タグ入り・1.5 秒未満・途中で止まったものは覚え直しに使わない', () => {
-    expect(isLearnable({ tagged: false, durationSeconds: 2, completed: true })).toBe(true);
-    expect(isLearnable({ tagged: true, durationSeconds: 2, completed: true })).toBe(false);
-    expect(isLearnable({ tagged: false, durationSeconds: 1.4, completed: true })).toBe(false);
-    expect(isLearnable({ tagged: false, durationSeconds: 2, completed: false })).toBe(false);
+  test('窓を減らしたら古い測定を捨て、増やしたらあるだけで中央値を取る', () => {
+    const previous = { db: 0, samples: [1, 2, 3, 4, 5, 6, 7, 8, 9], updatedAt: 1 };
+    // 窓 3: 直近 2 回 + 今回（-20 → 0）
+    expect(learnSample(previous, -20, 2, 3)).toEqual({ db: 8, samples: [8, 9, 0], updatedAt: 2 });
+    // 窓 15: 10 回分しかないので 10 回で中央値
+    const grown = learnSample(previous, -20, 2, 15);
+    expect(grown.samples).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 0]);
+    expect(grown.db).toBe(4.5);
+  });
+
+  test('感情タグ入り・2.5 秒未満・途中で止まったものは覚え直しに使わない', () => {
+    expect(isLearnable({ tagged: false, durationSeconds: 2.5, completed: true })).toBe(true);
+    expect(isLearnable({ tagged: true, durationSeconds: 3, completed: true })).toBe(false);
+    expect(isLearnable({ tagged: false, durationSeconds: 2.4, completed: true })).toBe(false);
+    expect(isLearnable({ tagged: false, durationSeconds: 3, completed: false })).toBe(false);
     expect(isLearnable({ tagged: false, durationSeconds: undefined, completed: true })).toBe(false);
-    expect(isLearnable({ tagged: false, durationSeconds: 2, completed: true, measuredLufs: -70.5 })).toBe(false);
+    expect(isLearnable({ tagged: false, durationSeconds: 3, completed: true, measuredLufs: -70.5 })).toBe(false);
+    // しきい値は引数で変えられる
+    expect(isLearnable({ tagged: false, durationSeconds: 2, completed: true }, 1.5)).toBe(true);
+    expect(isLearnable({ tagged: false, durationSeconds: 2, completed: true }, 2.5)).toBe(false);
+  });
+
+  test('表のファイルには窓の上限 50 回分まで測定を残す', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-gain-'));
+    const file = path.join(dir, 'gain.json');
+    try {
+      const samples = Array.from({ length: 60 }, (_, i) => i % 8);
+      fs.writeFileSync(file, JSON.stringify({ version: 1, target: -20, entries: { 'aivis:x:default': { db: 1, samples } } }));
+      expect(loadLearnedGains(file)['aivis:x:default'].samples).toEqual(samples.slice(-50));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('最後の合計にも +8dB の上限を掛ける', () => {
