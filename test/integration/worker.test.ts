@@ -247,6 +247,11 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     expect(await speech.workerGainSettings()).toEqual({ learnWindow: 9, minLearnSeconds: 2.5, version: '2.5.0' });
     const unreachable = new AivisSpeechService(testConfig('redis://127.0.0.1:9'));
     expect(await unreachable.workerGainSettings()).toBeUndefined();
+    // 打ち切った後に繋がった接続も、決着したら閉じる
+    const countClients = async () => String(await client.sendCommand(['CLIENT', 'LIST'])).trim().split('\n').length;
+    const before = await countClients();
+    await speech.workerGainSettings(0);
+    await waitFor(async () => (await countClients()) === before ? true : undefined);
     await worker.flushMeasurements();
     expect({ ...loadLearnedGains(gainFile) }).toEqual({});
     // 設定を 2 秒・窓 2 に変えると、起こし直さずに次の発話から効く（測定は残し、中央値は直近 2 回から）

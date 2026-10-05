@@ -372,6 +372,7 @@ export async function runGainTransfer(values: Record<string, ArgValue>): Promise
     return true;
   }
   if (values['import-gains'] !== undefined) {
+    warnStrayVoiceOption(values);
     const input = gainFileArgument(values['import-gains'], '--import-gains', IMPORT_GAINS_USAGE);
     if (input === undefined) {
       process.exitCode = 1;
@@ -383,12 +384,12 @@ export async function runGainTransfer(values: Record<string, ArgValue>): Promise
   return false;
 }
 
-/** `--voice` は書き出しの絞り込みにしか使わない。ほかで来たら、値が読み上げる文から消えたことを知らせる。 */
+/** `--voice` は書き出しの絞り込みにしか使わない。ほかで（`--import-gains` を含む）来たら、値が読み上げる文から消えたことを知らせる。 */
 export function warnStrayVoiceOption(values: Record<string, ArgValue>): void {
   if (values['export-gains'] !== undefined || !Array.isArray(values.voice) || values.voice.length === 0) {
     return;
   }
-  console.error(`[aivis-mcp] --voice は --export-gains の絞り込み用です。値（${values.voice.join(', ')}）は読み上げる文に入りません。ElevenLabs の声は --voice-id で指定します`);
+  console.error(`[aivis-mcp] --voice は --export-gains の絞り込み用で、ここでは使いません（値 ${values.voice.join(', ')} は読み上げる文にも入りません）。ElevenLabs の声は --voice-id で指定します`);
 }
 
 /** `--export-gains <file> [--voice <id>…] [--model <id>]`: 音量の表を書き出す。 */

@@ -63,30 +63,34 @@ export class AivisSpeechService {
    * 動いている worker が覚え直しに使っている窓と最短秒数。Redis に届かない・worker がいないときは undefined
    * （Redis を起こしたり待ち続けたりしない。設定を見せるだけなので 1 秒で諦める）。
    */
-  async workerGainSettings(): Promise<WorkerGainSettings | undefined> {
+  async workerGainSettings(timeoutMs = 1000): Promise<WorkerGainSettings | undefined> {
     const client = this.redisClient.isOpen
       ? undefined
       : createClient({ url: this.config.redisUrl, socket: { connectTimeout: 1000, reconnectStrategy: false } });
     client?.on('error', () => undefined);
     let timer: NodeJS.Timeout | undefined;
+    const work = (async () => {
+      if (client !== undefined) {
+        await client.connect();
+      }
+      return readWorkerGainSettings((client ?? this.redisClient) as RedisClientType);
+    })();
+    // 打ち切った後に connect が成功しても、決着したら必ず閉じる（接続を残さない）
+    const closed = work.catch(() => undefined).finally(async () => {
+      if (client?.isOpen) {
+        await client.disconnect().catch(() => undefined);
+      }
+    });
     try {
-      const work = (async () => {
-        if (client !== undefined) {
-          await client.connect();
-        }
-        return readWorkerGainSettings((client ?? this.redisClient) as RedisClientType);
-      })();
       return await Promise.race([
         work,
-        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 1000); }),
+        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), timeoutMs); }),
       ]);
     } catch {
       return undefined;
     } finally {
       clearTimeout(timer);
-      if (client?.isOpen) {
-        await client.disconnect().catch(() => undefined);
-      }
+      void closed;
     }
   }
 

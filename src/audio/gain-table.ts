@@ -198,16 +198,43 @@ export function afplayVolume(gainDb: number): number {
 }
 
 /**
+ * シンボリックリンクをたどった先のパス。指し先がまだ無いリンクは、リンクの中身を解決した場所を返す
+ * （`realpath` は指し先が無いと失敗するので、自分で readlink をたどる）。リンクでなければそのまま。
+ */
+export function resolveLinkTarget(filePath: string): string {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    // 指し先が無い、またはまだ無いファイル
+  }
+  let current = path.resolve(filePath);
+  for (let hops = 0; hops < 40; hops++) {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      break;
+    }
+    if (!stat.isSymbolicLink()) {
+      break;
+    }
+    current = path.resolve(path.dirname(current), fs.readlinkSync(current));
+  }
+  // 親フォルダがあれば、そちらのリンクもたどる
+  try {
+    return path.join(fs.realpathSync(path.dirname(current)), path.basename(current));
+  } catch {
+    return current;
+  }
+}
+
+/**
  * 一時ファイルに書いて fsync してから置き換える（書きかけや電源断で中身の無いファイルを残さない）。
  */
 export function writeFileAtomic(target: string, content: string, mode: number): void {
-  // シンボリックリンクなら実体へたどってから書く（リンクを普通のファイルで置き換えて壊さない）
-  let filePath = target;
-  try {
-    filePath = fs.realpathSync(target);
-  } catch {
-    // まだ無いファイルはそのまま作る
-  }
+  // シンボリックリンクなら実体へたどってから書く（リンクを普通のファイルで置き換えて壊さない。
+  // 指し先がまだ無いリンクでも、リンクを残したまま指し先に作る）
+  const filePath = resolveLinkTarget(target);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   const fd = fs.openSync(temporary, 'w', mode);
@@ -359,15 +386,44 @@ const GAIN_LOCK_RETRY_MS = 50;
 /** ロックが空かなかった。 */
 export class GainLockError extends Error {}
 
-/** 表のロックの置き場（シンボリックリンクなら実体の隣。リンク経由と実体経由で同じロックを使う）。 */
+/** 表のロックの置き場（シンボリックリンクなら指し先の隣。指し先がまだ無くても、書く前後で変わらない）。 */
 export function gainLockPath(filePath = gainFilePath()): string {
-  let target = filePath;
+  return `${resolveLinkTarget(filePath)}.lock`;
+}
+
+/** 古いロックを、stat したときと同じ持ち主のままなら退けて消す。消せたら true。 */
+function removeStaleLock(lockPath: string, staleMs: number): boolean {
+  let owner: string;
   try {
-    target = fs.realpathSync(filePath);
+    owner = fs.readFileSync(lockPath, 'utf8');
+    if (Date.now() - fs.statSync(lockPath).mtimeMs <= staleMs) {
+      return false;
+    }
   } catch {
-    // まだ無いファイルはそのまま
+    // 調べている間に消えた。取り直せばよい
+    return true;
   }
-  return `${target}.lock`;
+  // rename で退けてから中身を確かめる。退けたのが別の持ち主の新しいロックだったら、元に戻す
+  const aside = `${lockPath}.stale.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+  try {
+    fs.renameSync(lockPath, aside);
+  } catch {
+    return true;
+  }
+  try {
+    if (fs.readFileSync(aside, 'utf8') !== owner) {
+      try {
+        // 誰かが先に取り直していなければ戻す（link は置き場が空いているときだけ成功する）
+        fs.linkSync(aside, lockPath);
+      } catch {
+        // 置き場が埋まっているなら、そちらが今の持ち主
+      }
+      return false;
+    }
+    return true;
+  } finally {
+    fs.rmSync(aside, { force: true });
+  }
 }
 
 /**
@@ -399,13 +455,7 @@ export async function withGainFileLock<T>(
         throw error;
       }
     }
-    try {
-      if (Date.now() - fs.statSync(lockPath).mtimeMs > staleMs) {
-        fs.rmSync(lockPath, { force: true });
-        continue;
-      }
-    } catch {
-      // 調べている間に消えた。すぐ取り直す
+    if (removeStaleLock(lockPath, staleMs)) {
       continue;
     }
     if (Date.now() >= deadline) {

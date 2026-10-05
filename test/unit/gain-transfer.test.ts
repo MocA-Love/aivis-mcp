@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { gainLockPath, GainLockError, loadLearnedGains, MAX_LEARNED_ENTRIES, recordMeasurement, saveLearnedGains, withGainFileLock, type LearnedGain } from '../../src/audio/gain-table.js';
+import { gainLockPath, GainLockError, writeFileAtomic, loadLearnedGains, MAX_LEARNED_ENTRIES, recordMeasurement, saveLearnedGains, withGainFileLock, type LearnedGain } from '../../src/audio/gain-table.js';
 import { exportGains, GainImportError, importGains, mergeGainEntries, parseGainFile, selectGainEntries } from '../../src/audio/gain-transfer.js';
 
 const table: Record<string, LearnedGain> = {
@@ -171,6 +171,24 @@ describe('音量の表の書き出し・読み込み', () => {
       fs.utimesSync(lock, old, old);
       await expect(withGainFileLock(gainFile, () => 'ok', { waitMs: 100 })).resolves.toBe('ok');
       expect(fs.existsSync(lock)).toBe(false);
+    });
+
+    test('指し先がまだ無いリンクでも、ロックの置き場は書く前後で変わらず、リンクも残る', async () => {
+      const real = path.join(dir, 'sub', 'real.json');
+      fs.mkdirSync(path.dirname(real));
+      fs.symlinkSync(path.join('sub', 'real.json'), gainFile);
+      const before = gainLockPath(gainFile);
+      expect(before).toBe(`${fs.realpathSync(path.dirname(real))}/real.json.lock`);
+      await recordMeasurement('aivis:x:default', -22, gainFile);
+      expect(fs.lstatSync(gainFile).isSymbolicLink()).toBe(true);
+      expect(Object.keys(loadLearnedGains(real))).toEqual(['aivis:x:default']);
+      expect(gainLockPath(gainFile)).toBe(before);
+      // writeFileAtomic も、指し先の無いリンクを普通のファイルで置き換えない
+      const link = path.join(dir, 'dangling.json');
+      fs.symlinkSync('missing.json', link);
+      writeFileAtomic(link, 'x', 0o644);
+      expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(fs.readFileSync(path.join(dir, 'missing.json'), 'utf8')).toBe('x');
     });
 
     test('ロックはシンボリックリンクの実体の隣に置く', () => {

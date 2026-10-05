@@ -106,4 +106,40 @@ describe('実プロセスの --export-gains / --import-gains', () => {
     expect(result.code).toBe(1);
     expect(Object.keys(JSON.parse(fs.readFileSync(path.join(dir, 'gain.json'), 'utf8')).entries)).toHaveLength(3);
   });
+
+  test('--import-gains に付けた --voice も警告する', async () => {
+    const input = path.join(dir, 'in.json');
+    fs.writeFileSync(input, JSON.stringify({ version: 1, target: -20, entries: {} }));
+    const result = await run('cli.js', ['--import-gains', input, '--voice', 'voiceA'], env);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain('--voice は --export-gains の絞り込み用');
+  });
+
+  test('古いロックを 2 つのプロセスが同時に見つけても、ロックを持つのは同時に 1 つだけ', async () => {
+    const gainFile = path.join(dir, 'gain.json');
+    const lock = `${fs.realpathSync(gainFile)}.lock`;
+    const log = path.join(dir, 'log.txt');
+    const script = `
+      import fs from 'fs';
+      import { withGainFileLock } from ${JSON.stringify(path.join(root, 'dist', 'audio', 'gain-table.js'))};
+      await withGainFileLock(${JSON.stringify(gainFile)}, async () => {
+        fs.appendFileSync(${JSON.stringify(log)}, 'start\\n');
+        await new Promise(resolve => setTimeout(resolve, 300));
+        fs.appendFileSync(${JSON.stringify(log)}, 'end\\n');
+      });
+    `;
+    for (let round = 0; round < 3; round++) {
+      fs.writeFileSync(lock, 'crashed');
+      const old = new Date(Date.now() - 60_000);
+      fs.utimesSync(lock, old, old);
+      fs.rmSync(log, { force: true });
+      const codes = await Promise.all([0, 1, 2].map(() => new Promise<number | null>(resolve => {
+        const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: 'ignore' });
+        child.on('exit', code => resolve(code));
+      })));
+      expect(codes).toEqual([0, 0, 0]);
+      expect(fs.readFileSync(log, 'utf8')).toBe('start\nend\n'.repeat(3));
+      expect(fs.existsSync(lock)).toBe(false);
+    }
+  });
 });
