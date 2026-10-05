@@ -7,6 +7,7 @@ import { connectRedis, ensureWorkerRunning } from './services/redis-service.js';
 import { runHealth, runReboot, runMute, runUnmute, runMuteStatus, runPlayAudio } from './commands.js';
 import { runIngest } from './ingest/ingest.js';
 import { enqueueSynthesis } from './queue/enqueue.js';
+import { withParaCodeVoiceTarget } from './services/para-code-voice.js';
 import { runDoctor, checkDependencies } from './doctor.js';
 import { runInit } from './settings.js';
 
@@ -23,6 +24,7 @@ function printHelp(): void {
   console.log('  aivis-mcp --unmute                 ミュート解除');
   console.log('  aivis-mcp --mute-status            ミュート状態を確認');
   console.log('  aivis-mcp --play-audio             標準入力のMP3をキューに積んで再生');
+  console.log('  aivis-mcp --play-audio --gain-key <provider:voice:model>  音量の表の鍵を添えて積む');
   console.log('  aivis-mcp --ingest                 Para Code 用の取込口（標準入出力の枠。docs/ingest-protocol.md）');
   console.log('  aivis-mcp --init                   初期設定（APIキー等を保存）');
   console.log('  aivis-mcp --doctor                 依存ツール診断');
@@ -121,7 +123,7 @@ async function main() {
   }
 
   if (values['play-audio']) {
-    await runPlayAudio(config);
+    await runPlayAudio(config, typeof values['gain-key'] === 'string' ? values['gain-key'] : undefined);
     process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   }
 
@@ -144,7 +146,8 @@ async function main() {
     const params = buildSynthesisParams(config, text, waitMs);
     const client = await connectRedis(config.redisUrl);
     await ensureWorkerRunning(client, config);
-    await enqueueSynthesis(client, params);
+    // `aivis` コマンドと同じく、要求元の Para Code をここで確かめて添える（一回きりなので積む時に取る）
+    await enqueueSynthesis(client, await withParaCodeVoiceTarget(params));
     await client.disconnect();
     process.exit(0);
   }

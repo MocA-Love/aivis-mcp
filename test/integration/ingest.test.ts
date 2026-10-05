@@ -116,7 +116,7 @@ describeWithRedis('--ingest（別ポートの redis-server）', () => {
     input.write(encodeControl({ type: 'open', id: 's2', kind: 'sound' }));
     await waitFor(() => statusesOf('s1').includes('queued') && statusesOf('s2').length > 0 ? true : undefined);
     expect(JSON.parse((await client.lRange(HIGH_QUEUE_KEY, 0, -1))[0]).type).toBe('sound');
-    expect(messages.find(message => message.id === 's2')).toEqual({ type: 'status', id: 's2', status: 'failed', reason: 'prelude-required' });
+    expect(messages.find(message => message.id === 's2')).toEqual({ type: 'status', id: 's2', status: 'failed', reason: 'prelude-required', withdrawn: true });
   });
 
   test('鳴り始める前の abort は列から外す', async () => {

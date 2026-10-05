@@ -6,7 +6,8 @@ import axios from 'axios';
 import type { AppConfig } from '../config.js';
 import { synthesizeElevenLabsStream } from '../services/elevenlabs-client.js';
 
-export type SynthesizeFunction = (config: AppConfig, params: Record<string, unknown>) => Promise<NodeJS.ReadableStream>;
+/** `signal` が中断されたら、要求を取り消す（応答を待っている間・受け取っている間とも）。 */
+export type SynthesizeFunction = (config: AppConfig, params: Record<string, unknown>, signal?: AbortSignal) => Promise<NodeJS.ReadableStream>;
 
 /** provider 未指定のジョブは、ElevenLabs 対応より前の版が積んだものなので Aivis として扱う。 */
 export function providerOf(params: Record<string, unknown>): 'aivis' | 'elevenlabs' {
@@ -25,10 +26,11 @@ export function synthesisSetupError(config: AppConfig, params: Record<string, un
   return undefined;
 }
 
-async function synthesizeAivisStream(config: AppConfig, params: Record<string, unknown>): Promise<NodeJS.ReadableStream> {
+async function synthesizeAivisStream(config: AppConfig, params: Record<string, unknown>, signal?: AbortSignal): Promise<NodeJS.ReadableStream> {
   const requestParams: Record<string, unknown> = {
     model_uuid: params.model_uuid || config.modelUuid,
-    text: '<break time="500ms"/>' + String(params.text ?? ''),
+    // 先頭に無音は足さない（鳴り始めの頭欠けは、鳴らし始める前の 250ms の溜めで防ぐ）
+    text: String(params.text ?? ''),
     output_format: 'mp3',
     speaker_uuid: params.speaker_uuid,
     style_id: params.style_id,
@@ -54,20 +56,21 @@ async function synthesizeAivisStream(config: AppConfig, params: Record<string, u
     },
     responseType: 'stream',
     timeout: 60000,
+    signal,
   });
   return response.data;
 }
 
-export const synthesizeStream: SynthesizeFunction = async (config, params) => {
+export const synthesizeStream: SynthesizeFunction = async (config, params, signal) => {
   if (providerOf(params) === 'elevenlabs') {
     return synthesizeElevenLabsStream(config, {
       text: String(params.text ?? ''),
       voice_id: typeof params.voice_id === 'string' ? params.voice_id : undefined,
       model_id: typeof params.model_id === 'string' ? params.model_id : undefined,
       speaking_rate: params.speaking_rate,
-    });
+    }, signal);
   }
-  return synthesizeAivisStream(config, params);
+  return synthesizeAivisStream(config, params, signal);
 };
 
 /**

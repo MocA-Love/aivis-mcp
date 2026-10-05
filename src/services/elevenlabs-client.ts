@@ -41,7 +41,8 @@ export function stripSsmlTags(text: string): string {
 
 export async function synthesizeElevenLabsStream(
   config: AppConfig,
-  params: { text: string; voice_id?: string; model_id?: string; speaking_rate?: unknown }
+  params: { text: string; voice_id?: string; model_id?: string; speaking_rate?: unknown },
+  signal?: AbortSignal,
 ): Promise<NodeJS.ReadableStream> {
   const voiceId = params.voice_id || config.elevenLabsVoiceId;
   if (!voiceId) {
@@ -65,6 +66,7 @@ export async function synthesizeElevenLabsStream(
       headers: { ...headers(config.elevenLabsApiKey), 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
       responseType: 'stream',
       timeout: 60000,
+      signal,
     }
   );
   return response.data;

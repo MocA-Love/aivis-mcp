@@ -22,8 +22,11 @@ export const LEARN_WINDOW = 5;
 export const MIN_LEARN_SECONDS = 1.5;
 /** 表に覚える組の上限。超えたら更新の古いものから消す。 */
 export const MAX_LEARNED_ENTRIES = 200;
-/** 頭打ち（-1dBTP 相当）。 */
-export const LIMITER_FILTER = 'alimiter=limit=0.89';
+/**
+ * 頭打ち（-1dBTP 相当）。ffmpeg の alimiter は既定で出力を持ち上げる（level が on）ので、
+ * 補正した大きさがずれないよう切る。
+ */
+export const LIMITER_FILTER = 'alimiter=limit=0.89:level=false';
 
 /**
  * 最初の値（目標 -20 − 実測 LUFS、2026-10 に測ったもの）。

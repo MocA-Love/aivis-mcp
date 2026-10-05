@@ -13,13 +13,14 @@ import { buildGainTable, loadLearnedGains, MAX_BOOST_DB, TARGET_LUFS } from '../
 import { validatePreludePath } from '../audio/prelude.js';
 import { MAX_UTTERANCE_MS } from '../streaming/playback-policy.js';
 import { AudioStreamWriter, MAX_STREAM_BYTES } from '../queue/audio-stream.js';
-import { enqueueJob, withdrawJob, withdrawJobById } from '../queue/enqueue.js';
+import { enqueueJob, isJobRegistered, withdrawJob, withdrawJobById } from '../queue/enqueue.js';
 import { anyHoldActive, clearHold, isValidHoldOwner, setHold } from '../queue/hold.js';
 import { isValidStreamId, type Job, type JobPriority, type PreludeSpec } from '../queue/jobs.js';
 import {
   audioStreamKey, PLAY_LOCK_KEY, preludeDirsKey, PRELUDE_DIRS_TTL_SECONDS, queueKeyFor, statusKey, WORKER_LOCK_KEY,
 } from '../queue/keys.js';
 import { decodeStatus, pushStatus, readStatuses, STATUS_TTL_SECONDS, TERMINAL_STATUSES, type JobStatus } from '../queue/status.js';
+import { OperationTimeoutError, REDIS_OP_TIMEOUT_MS } from '../queue/timeout.js';
 import { ensureWorkerRunning, tryStartRedis } from '../services/redis-service.js';
 import {
   encodeControl, FrameDecoder, FrameProtocolError, INGEST_PROTOCOL_VERSION, type Frame,
@@ -48,8 +49,8 @@ const WORKER_CHECK_MS = 5_000;
 const CLOSE_WAIT_MS = 3_000;
 /** 背圧で止めてから進まないまま、これだけ経ったら読むのを再開する。 */
 const PAUSE_WATCHDOG_MS = 10_000;
-/** Redis が応答しないときに 1 つの操作を待つ上限。 */
-const REDIS_OP_TIMEOUT_MS = 5_000;
+/** end の後、Redis へ書き残しを送り終えるまで待つ上限（過ぎたらその流れを redis-error で終える）。 */
+const END_FLUSH_TIMEOUT_MS = 10_000;
 
 interface TrackedJob {
   readonly id: string;
@@ -68,6 +69,12 @@ interface TrackedJob {
   lastLostCheck: number | undefined;
   /** open した時点での hold の累計（追跡の上限から hold の時間を除くため） */
   readonly heldAtOpen: number;
+  /** 列に積めたか。unknown は積む要求の応答が失われた（積めたかどうか、ID で確かめ直す） */
+  registration: 'pending' | 'confirmed' | 'unknown';
+  /** 取り出した worker の ID（dequeued に載る） */
+  dequeuedBy: string | undefined;
+  /** 中断（abort）を受け付けた */
+  abortRequested: boolean;
 }
 
 export interface IngestIo {
@@ -81,23 +88,14 @@ export interface IngestOptions {
   readonly now?: () => number;
   /** テスト用: 背圧のバイト数の閾値 */
   readonly backpressureBytes?: number;
+  /** テスト用: Redis の 1 つの操作を待つ上限 */
+  readonly opTimeoutMs?: number;
 }
 
 function numberInRange(value: unknown, min: number, max: number): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max ? value : undefined;
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms = REDIS_OP_TIMEOUT_MS): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('redis timeout')), ms); }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 export class IngestSession {
   private readonly decoder = new FrameDecoder();
@@ -105,7 +103,12 @@ export class IngestSession {
   /** 終わった件の ID と、覚えておく期限 */
   private readonly finished = new Map<string, number>();
   private readonly holds = new Set<string>();
+  /** open・音声・end・abort・withdraw（同じ流れの中で順を保つ） */
   private chain: Promise<void> = Promise.resolve();
+  /** hold・gain?・ping（音声の書き込み待ちに巻き込まない） */
+  private controlChain: Promise<void> = Promise.resolve();
+  /** 枠の処理から切り離して走らせている後始末（閉じるときに待つ） */
+  private readonly background = new Set<Promise<void>>();
   private chainFrames = 0;
   private chainBytes = 0;
   private paused = false;
@@ -135,6 +138,24 @@ export class IngestSession {
   ) {
     this.now = options.now ?? Date.now;
     this.closedPromise = new Promise(resolve => { this.resolveClosed = resolve; });
+  }
+
+  /** Redis の操作に上限を付ける。 */
+  private op<T>(promise: Promise<T>, ms = this.options.opTimeoutMs ?? REDIS_OP_TIMEOUT_MS): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new OperationTimeoutError(ms)), ms); }),
+    ]).finally(() => clearTimeout(timer));
+  }
+
+  /** 枠の処理を止めずに走らせる（閉じるときは待つ）。 */
+  private runInBackground(task: () => Promise<void>): void {
+    const promise = task().catch(error => {
+      console.error('[ingest] background error:', error instanceof Error ? error.message : error);
+    });
+    this.background.add(promise);
+    void promise.finally(() => this.background.delete(promise));
   }
 
   /** 名乗ってから標準入力を読み始める。 */
@@ -192,7 +213,7 @@ export class IngestSession {
     }
     try {
       const key = preludeDirsKey(this.ingestId);
-      await withTimeout(this.client.multi().sAdd(key, dirs).expire(key, PRELUDE_DIRS_TTL_SECONDS).exec());
+      await this.op(this.client.multi().sAdd(key, dirs).expire(key, PRELUDE_DIRS_TTL_SECONDS).exec());
     } catch {
       // 次の延長で置き直す
     }
@@ -216,13 +237,20 @@ export class IngestSession {
       const size = frame.kind === 'audio' ? frame.data.length : 0;
       this.chainFrames++;
       this.chainBytes += size;
-      this.chain = this.chain.then(() => this.handleFrame(frame)).catch(error => {
-        console.error('[ingest] frame error:', error instanceof Error ? error.message : error);
-      }).finally(() => {
+      const done = () => {
         this.chainFrames--;
         this.chainBytes -= size;
         this.updateBackpressure();
-      });
+      };
+      const report = (error: unknown) => {
+        console.error('[ingest] frame error:', error instanceof Error ? error.message : error);
+      };
+      if (frame.kind === 'control' && isControlOnly(frame.message.type)) {
+        // hold などは、Redis への音声の書き込みが詰まっていても待たせない
+        this.controlChain = this.controlChain.then(() => this.handleFrame(frame)).catch(report).finally(done);
+      } else {
+        this.chain = this.chain.then(() => this.handleFrame(frame)).catch(report).finally(done);
+      }
     }
     this.updateBackpressure();
   }
@@ -321,12 +349,14 @@ export class IngestSession {
     }
   }
 
+  /**
+   * この --ingest が積んで、まだ終わりの知らせを返していない流れの合計（end を受けた流れも、
+   * 鳴り終わる・取り下げる・消すまで数える。Redis に残っている間は Redis のメモリを使うため）。
+   */
   private totalPendingBytes(): number {
     let total = 0;
     for (const job of this.jobs.values()) {
-      if (job.writer && !job.writer.isClosed) {
-        total += job.writer.bytes;
-      }
+      total += job.writer?.bytes ?? 0;
     }
     return total;
   }
@@ -334,7 +364,7 @@ export class IngestSession {
   private async handleOpen(message: Record<string, unknown>): Promise<void> {
     const id = message.id;
     if (!isValidStreamId(id)) {
-      this.send({ type: 'status', id: typeof id === 'string' ? id.slice(0, 64) : null, status: 'failed', reason: 'invalid-id' });
+      this.send({ type: 'status', id: typeof id === 'string' ? id.slice(0, 64) : null, status: 'failed', reason: 'invalid-id', withdrawn: true });
       return;
     }
     if (this.jobs.has(id) || this.isFinished(id)) {
@@ -358,7 +388,7 @@ export class IngestSession {
     }
     if (kind === 'sound' && prelude === undefined) {
       this.rememberFinished(id);
-      this.send({ type: 'status', id, status: 'failed', reason: preludeRejected ? `prelude-${preludeRejected}` : 'prelude-required' });
+      this.send({ type: 'status', id, status: 'failed', reason: preludeRejected ? `prelude-${preludeRejected}` : 'prelude-required', withdrawn: true });
       return;
     }
     this.send(preludeRejected === undefined ? { type: 'accepted', id } : { type: 'accepted', id, preludeRejected });
@@ -392,26 +422,54 @@ export class IngestSession {
     const tracked: TrackedJob = {
       id, kind, priority, raw: '', writer, openedAt: enqueuedAt, statusIndex: 0, started: false, startedAt: undefined,
       dequeued: false, lostMs: 0, lastLostCheck: undefined, heldAtOpen: this.heldAccumMs,
+      registration: 'pending', dequeuedBy: undefined, abortRequested: false,
     };
     this.jobs.set(id, tracked);
     try {
       // Stream を先に作る（取り出した worker が「Stream が無い」と捨てないように）
       if (writer) {
-        await withTimeout(writer.open());
-        await withTimeout(writer.settled());
-      }
-      tracked.raw = await withTimeout(enqueueJob(this.client, job));
-      tracked.statusIndex = 1;
-      if (this.jobs.has(id)) {
-        this.send({ type: 'status', id, status: 'queued' });
+        await this.op(writer.open());
+        await this.op(writer.settled());
       }
     } catch (error) {
-      console.error('[ingest] enqueue error:', error instanceof Error ? error.message : error);
-      this.finishJob(tracked, 'failed', 'redis-error');
+      // まだ積んでいない。積めていないことが確かなので、親は自分で鳴らしてよい
+      console.error('[ingest] stream open error:', error instanceof Error ? error.message : error);
+      writer?.discard();
+      this.finishJob(tracked, 'failed', 'redis-error', { withdrawn: true });
       return;
+    }
+    const raw = JSON.stringify(job);
+    tracked.raw = raw;
+    try {
+      // 積むのと queued の知らせは 1 回（MULTI）で送る
+      await this.op(enqueueJob(this.client, job));
+      this.confirmQueued(tracked);
+    } catch (error) {
+      console.error('[ingest] enqueue error:', error instanceof Error ? error.message : error);
+      // 応答だけが失われたかもしれない。ID で確かめるまで「積めていない」とは扱わない
+      const registered = await this.op(isJobRegistered(this.client, job, raw)).catch(() => undefined);
+      if (registered === true) {
+        this.confirmQueued(tracked);
+      } else if (registered === false) {
+        this.finishJob(tracked, 'failed', 'redis-error', { withdrawn: true });
+        return;
+      } else {
+        // 確かめられない。追い続け、Redis が戻ったら確かめ直す（その間は queued を返さない）
+        tracked.registration = 'unknown';
+      }
     }
     // open のたびに worker の lock が生きているか確かめ、無ければ起こす
     void this.ensureWorker();
+  }
+
+  /** 積めたと確かめた。queued を返す。 */
+  private confirmQueued(job: TrackedJob): void {
+    if (job.registration === 'confirmed' || !this.jobs.has(job.id)) {
+      return;
+    }
+    job.registration = 'confirmed';
+    job.statusIndex = Math.max(job.statusIndex, 1);
+    this.send({ type: 'status', id: job.id, status: 'queued' });
   }
 
   private async handleData(id: string, data: Buffer): Promise<void> {
@@ -427,11 +485,12 @@ export class IngestSession {
     }
     if (this.totalPendingBytes() + data.length > MAX_TOTAL_STREAM_BYTES || !job.writer.write(data)) {
       // 中断の印は worker に届ける（鳴り始めていれば届いた分で終える）。親への終わりは 1 回だけ
-      await job.writer.abort('too-large').catch(() => undefined);
+      // 中断の印を書き終えてから片付ける（片付けると以後の書き込みは捨てるので）。待つのは上限まで
+      await this.op(job.writer.abort('too-large')).catch(() => undefined);
       const withdrawn = !job.started && job.raw !== ''
-        && await withTimeout(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
+        && await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
       // 鳴り始めていれば、worker が中断の印を読んで届いた分で終えるまで Stream を残す
-      this.finishJob(job, 'failed', 'too-large', {}, withdrawn);
+      this.finishJob(job, 'failed', 'too-large', withdrawn ? { withdrawn: true } : {}, withdrawn);
     }
   }
 
@@ -443,10 +502,21 @@ export class IngestSession {
       }
       return;
     }
-    await job.writer.end();
-    if (job.writer.failed) {
-      await this.failWriter(job.id);
-    }
+    // 書き残しを送り終えるのを、ほかの枠の処理を止めずに待つ。期限を過ぎたら以後の書き込みを捨て、
+    // 途中が抜けた音声を鳴らさないよう redis-error で終える
+    const writer = job.writer;
+    const flushed = writer.end();
+    this.runInBackground(async () => {
+      try {
+        await this.op(flushed, END_FLUSH_TIMEOUT_MS);
+        if (writer.failed) {
+          await this.failWriter(job.id);
+        }
+      } catch {
+        writer.discard();
+        await this.failWriter(job.id);
+      }
+    });
   }
 
   /**
@@ -458,10 +528,18 @@ export class IngestSession {
     if (!job || !job.writer) {
       return;
     }
-    await withTimeout(job.writer.abort('redis-error'), 2000).catch(() => undefined);
+    if (job.registration === 'pending') {
+      // まだ積んでいる途中。積めたかどうかは open の処理が確かめて終える
+      return;
+    }
+    if (!job.writer.isDiscarded) {
+      await this.op(job.writer.abort('redis-error'), 2000).catch(() => undefined);
+    }
+    // 書き込みが詰まったままなら、以後の書き込みを捨てる（後から途中の断片が書かれないように）
+    job.writer.discard();
     const withdrawn = !job.started && job.raw !== ''
-      && await withTimeout(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
-    this.finishJob(job, 'failed', 'redis-error', {}, withdrawn);
+      && await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
+    this.finishJob(job, 'failed', 'redis-error', withdrawn ? { withdrawn: true } : {}, withdrawn);
   }
 
   private async handleAbort(message: Record<string, unknown>): Promise<void> {
@@ -472,13 +550,23 @@ export class IngestSession {
       }
       return;
     }
-    const reason = typeof message.reason === 'string' ? message.reason.slice(0, 64) : 'aborted';
-    await job.writer?.abort(reason).catch(() => undefined);
-    // まだ取り出されていなければ列から外す（鳴り始めた後なら worker が届いた分で終える）
-    if (!job.started && job.raw && await withTimeout(withdrawJob(this.client, job.priority, job.raw)).catch(() => false)) {
-      await pushStatus(this.client, job.id, 'skipped', reason).catch(() => undefined);
-      this.finishJob(job, 'skipped', reason);
+    if (job.abortRequested) {
+      return;
     }
+    job.abortRequested = true;
+    const reason = typeof message.reason === 'string' ? message.reason.slice(0, 64) : 'aborted';
+    const writer = job.writer;
+    // 入力の途中なら中断の印、end の後なら「鳴らすのをやめる」印を書く（worker は鳴らし始める前なら捨てる）。
+    // 書き込みの完了は待たない（Redis が詰まっていても、後ろの枠を止めない）
+    const marked = writer === undefined ? Promise.resolve() : (writer.isClosed ? writer.cancel(reason) : writer.abort(reason));
+    this.runInBackground(async () => {
+      await this.op(marked).catch(() => undefined);
+      // まだ取り出されていなければ列から外す（鳴り始めた後なら worker が届いた分で終える）
+      if (!job.started && job.raw && this.jobs.has(job.id) && await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false)) {
+        await this.op(pushStatus(this.client, job.id, 'skipped', reason)).catch(() => undefined);
+        this.finishJob(job, 'skipped', reason);
+      }
+    });
   }
 
   private async handleHold(message: Record<string, unknown>): Promise<void> {
@@ -490,10 +578,10 @@ export class IngestSession {
     try {
       if (message.active === false) {
         this.holds.delete(owner);
-        await withTimeout(clearHold(this.client, owner));
+        await this.op(clearHold(this.client, owner));
       } else {
         this.holds.add(owner);
-        await withTimeout(setHold(this.client, owner));
+        await this.op(setHold(this.client, owner));
       }
       this.send({ type: 'hold', owner, active: message.active !== false });
     } catch {
@@ -527,21 +615,28 @@ export class IngestSession {
       return;
     }
     const job = this.jobs.get(id);
-    if (job?.started || job?.dequeued) {
+    if (job?.started) {
       this.send({ type: 'withdrawn', id, removed: false });
       return;
     }
-    // LREM が 1 のときだけ外せた。worker が同時に BRPOP していれば 0 で、その件は worker が鳴らす
-    const removed = await withTimeout(withdrawJobById(this.client, id)).catch(() => false);
+    // 列にあるときだけ外す（列から外す・Stream と知らせを消すまでを 1 つのスクリプトで行う）。
+    // worker が取り出していれば列に無いので false で、その件は worker が鳴らす。列へ戻されていれば外せる
+    const removed = await this.op(withdrawJobById(this.client, id)).catch(() => false);
     if (removed) {
       if (job) {
         this.jobs.delete(id);
         job.writer?.discard();
-        // 送りかけていた断片がキーを作り直さないよう、書き終わってから消す
-        await withTimeout(job.writer?.settled() ?? Promise.resolve(), 2000).catch(() => undefined);
+        this.updateBackpressure();
+        // 送りかけていた断片がキーを作り直さないよう、書き終わってから消し直す
+        const writer = job.writer;
+        if (writer) {
+          this.runInBackground(async () => {
+            await this.op(writer.settled(), 2000).catch(() => undefined);
+            await this.op(this.client.del([audioStreamKey(id), statusKey(id)])).catch(() => undefined);
+          });
+        }
       }
       this.rememberFinished(id);
-      await this.client.del([audioStreamKey(id), statusKey(id)]).catch(() => undefined);
     }
     this.send({ type: 'withdrawn', id, removed });
   }
@@ -571,15 +666,27 @@ export class IngestSession {
           this.finishJob(job, 'failed', 'untracked');
           continue;
         }
+        if (job.registration === 'unknown') {
+          // 積む要求の応答が失われた件。積めたかを ID で確かめ直す
+          const registered = await this.op(isJobRegistered(this.client, job, job.raw)).catch(() => undefined);
+          if (registered === undefined) {
+            continue;
+          }
+          if (!registered) {
+            this.finishJob(job, 'failed', 'redis-error', { withdrawn: true });
+            continue;
+          }
+          this.confirmQueued(job);
+        }
         try {
           // 知らせのキーが期限切れで作り直されたら、頭から読み直す（先頭は必ず queued なので、そうでなければ作り直し）
           if (job.statusIndex > 0) {
-            const first = await withTimeout(this.client.lIndex(statusKey(job.id), 0));
+            const first = await this.op(this.client.lIndex(statusKey(job.id), 0));
             if (first === null || decodeStatus(first)?.status !== 'queued') {
               job.statusIndex = 0;
             }
           }
-          const { entries, next } = await withTimeout(readStatuses(this.client, job.id, job.statusIndex));
+          const { entries, next } = await this.op(readStatuses(this.client, job.id, job.statusIndex));
           job.statusIndex = next;
           for (const entry of entries) {
             if (!this.jobs.has(job.id)) {
@@ -590,6 +697,17 @@ export class IngestSession {
             }
             if (entry.status === 'dequeued') {
               job.dequeued = true;
+              job.dequeuedBy = entry.worker;
+              job.lostMs = 0;
+              job.lastLostCheck = undefined;
+              continue;
+            }
+            if (entry.status === 'requeued') {
+              // worker が列へ戻した（hold・lock の取り直し・優先の入れ替え）。また列で待つ
+              job.dequeued = false;
+              job.dequeuedBy = undefined;
+              job.lostMs = 0;
+              job.lastLostCheck = undefined;
               continue;
             }
             if (TERMINAL_STATUSES.has(entry.status)) {
@@ -615,9 +733,9 @@ export class IngestSession {
   private async touch(): Promise<void> {
     for (const job of this.jobs.values()) {
       if (job.writer) {
-        await withTimeout(job.writer.touch()).catch(() => undefined);
+        await this.op(job.writer.touch()).catch(() => undefined);
       }
-      await withTimeout(this.client.expire(statusKey(job.id), STATUS_TTL_SECONDS)).catch(() => undefined);
+      await this.op(this.client.expire(statusKey(job.id), STATUS_TTL_SECONDS)).catch(() => undefined);
     }
     await this.publishPreludeDirs();
   }
@@ -627,7 +745,7 @@ export class IngestSession {
       return;
     }
     try {
-      await withTimeout(ensureWorkerRunning(this.client, this.loadConfig()));
+      await this.op(ensureWorkerRunning(this.client, this.loadConfig()));
     } catch (error) {
       console.error('[ingest] worker check error:', error instanceof Error ? error.message : error);
     }
@@ -645,13 +763,13 @@ export class IngestSession {
     }
     let lock: string | null;
     try {
-      lock = await withTimeout(this.client.get(WORKER_LOCK_KEY));
+      lock = await this.op(this.client.get(WORKER_LOCK_KEY));
     } catch {
       return;
     }
     // 追跡の上限から除く hold の時間を数える
     try {
-      const holding = await withTimeout(anyHoldActive(this.client));
+      const holding = await this.op(anyHoldActive(this.client));
       if (holding && this.lastHoldCheck !== undefined) {
         this.heldAccumMs += Math.max(0, now - this.lastHoldCheck);
       }
@@ -667,7 +785,7 @@ export class IngestSession {
     }
     const workerGone = this.workerMissingSince !== undefined && now - this.workerMissingSince >= WORKER_MISSING_WITHDRAW_MS;
     for (const job of [...this.jobs.values()]) {
-      if (!job.raw || !this.jobs.has(job.id)) {
+      if (!job.raw || !this.jobs.has(job.id) || job.registration !== 'confirmed') {
         continue;
       }
       if (job.started) {
@@ -677,8 +795,8 @@ export class IngestSession {
         continue;
       }
       if (workerGone) {
-        if (await withTimeout(withdrawJob(this.client, job.priority, job.raw)).catch(() => false)) {
-          await pushStatus(this.client, job.id, 'failed', 'worker-unavailable').catch(() => undefined);
+        if (await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false)) {
+          await this.op(pushStatus(this.client, job.id, 'failed', 'worker-unavailable')).catch(() => undefined);
           this.finishJob(job, 'failed', 'worker-unavailable', { withdrawn: true });
           continue;
         }
@@ -687,6 +805,27 @@ export class IngestSession {
         // worker が取り出し、再生 lock を待っている。worker が生きている間は見失ったとみなさない
         if (workerGone) {
           this.finishJob(job, 'failed', 'lost', {}, false);
+          continue;
+        }
+        // 取り出した worker が入れ替わった（lock がほかの worker に移った）。取り出した worker が
+        // 再生 lock も持っていない間を数え、30 秒続いたら見失ったとみなす
+        if (job.dequeuedBy !== undefined && lock !== null && lock !== job.dequeuedBy) {
+          let playLockHolder: string | null;
+          try {
+            playLockHolder = await this.op(this.client.get(PLAY_LOCK_KEY));
+          } catch {
+            continue;
+          }
+          const elapsedSinceCheck = job.lastLostCheck === undefined ? 0 : Math.max(0, now - job.lastLostCheck);
+          job.lastLostCheck = now;
+          if (playLockHolder === job.dequeuedBy) {
+            job.lostMs = 0;
+            continue;
+          }
+          job.lostMs += elapsedSinceCheck;
+          if (job.lostMs >= DEQUEUED_SILENT_MS) {
+            this.finishJob(job, 'failed', 'lost', {}, false);
+          }
         }
         continue;
       }
@@ -694,8 +833,8 @@ export class IngestSession {
       let position: number | null;
       let playLock: string | null;
       try {
-        position = await withTimeout(this.client.lPos(queueKeyFor(job.priority), job.raw));
-        playLock = await withTimeout(this.client.get(PLAY_LOCK_KEY));
+        position = await this.op(this.client.lPos(queueKeyFor(job.priority), job.raw));
+        playLock = await this.op(this.client.get(PLAY_LOCK_KEY));
       } catch {
         continue;
       }
@@ -725,7 +864,10 @@ export class IngestSession {
     this.closing = true;
     // 処理中の枠は待つが、Redis が応答しないときに閉じられなくならないよう上限を置く
     let waitTimer: NodeJS.Timeout | undefined;
-    await Promise.race([this.chain.catch(() => undefined), new Promise(resolve => { waitTimer = setTimeout(resolve, CLOSE_WAIT_MS); })]);
+    await Promise.race([
+      Promise.all([this.chain, this.controlChain, ...this.background]).catch(() => undefined),
+      new Promise(resolve => { waitTimer = setTimeout(resolve, CLOSE_WAIT_MS); }),
+    ]);
     clearTimeout(waitTimer);
     for (const timer of this.timers) {
       clearInterval(timer);
@@ -736,16 +878,21 @@ export class IngestSession {
     }
     for (const job of this.jobs.values()) {
       if (job.writer && !job.writer.isClosed) {
-        await withTimeout(job.writer.abort('ingest-closed'), 1000).catch(() => undefined);
+        await this.op(job.writer.abort('ingest-closed'), 1000).catch(() => undefined);
       }
     }
     for (const owner of this.holds) {
-      await withTimeout(clearHold(this.client, owner), 1000).catch(() => undefined);
+      await this.op(clearHold(this.client, owner), 1000).catch(() => undefined);
     }
     this.holds.clear();
     this.closed = true;
     this.resolveClosed();
   }
+}
+
+/** 音声の書き込み待ちに巻き込まない制御の枠。 */
+function isControlOnly(type: unknown): boolean {
+  return type === 'hold' || type === 'gain?' || type === 'ping';
 }
 
 /** `--ingest` 用の接続。Redis が止まったらコマンドを溜めずにすぐ失敗させる。 */

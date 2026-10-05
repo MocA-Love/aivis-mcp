@@ -4,7 +4,7 @@
  */
 
 import type { RedisClientType } from 'redis';
-import { HOLD_CHANNEL, HOLD_LOG_KEY, HOLD_PREFIX, holdKey } from './keys.js';
+import { HOLD_CHANNEL, HOLD_LOG_KEY, HOLD_PREFIX, HOLD_SINCE_KEY, holdKey } from './keys.js';
 
 export const HOLD_TTL_MS = 60_000;
 /** worker が知らせを取りこぼしても、この間隔で確かめ直す。 */
@@ -16,15 +16,59 @@ export function isValidHoldOwner(value: unknown): value is string {
   return typeof value === 'string' && OWNER_PATTERN.test(value);
 }
 
-/** hold を置く（延長も同じ）。 */
+/** hold の始まりの記録を残す時間（これより長い hold は無いものとして消える）。 */
+const HOLD_SINCE_TTL_SECONDS = 2 * 60 * 60;
+
+/** hold を置く（延長も同じ）。続いている hold の始まりが無ければ、いまを始まりとして残す。 */
 export async function setHold(client: RedisClientType, owner: string, ttlMs = HOLD_TTL_MS): Promise<void> {
-  await client.set(holdKey(owner), String(Date.now()), { PX: ttlMs });
+  const now = String(Date.now());
+  await client.multi()
+    .set(holdKey(owner), now, { PX: ttlMs })
+    .set(HOLD_SINCE_KEY, now, { NX: true, EX: HOLD_SINCE_TTL_SECONDS })
+    .exec();
   await client.publish(HOLD_CHANNEL, `set:${owner}`);
 }
 
+/** hold を外す。ほかに hold が残っていなければ、続いていた区間を閉じる。 */
 export async function clearHold(client: RedisClientType, owner: string): Promise<void> {
   await client.del(holdKey(owner));
+  if (!(await anyHoldActive(client))) {
+    await closeHoldInterval(client, Date.now());
+  }
   await client.publish(HOLD_CHANNEL, `clear:${owner}`);
+}
+
+/** hold が掛かっているのに始まりの記録が無い（期限切れ・古い版が置いた）ときに、いまを始まりとして残す。 */
+export async function markHoldStarted(client: RedisClientType, at: number): Promise<void> {
+  await client.set(HOLD_SINCE_KEY, String(at), { NX: true, EX: HOLD_SINCE_TTL_SECONDS });
+}
+
+/** 続いている hold の始まり（無ければ undefined）。 */
+export async function holdStartedAt(client: RedisClientType): Promise<number | undefined> {
+  const value = await client.get(HOLD_SINCE_KEY);
+  if (value === null || !/^\d+$/.test(value)) {
+    return undefined;
+  }
+  return parseInt(value, 10);
+}
+
+const CLOSE_INTERVAL_SCRIPT = `
+local since = redis.call('GET', KEYS[1])
+if not since then return 0 end
+redis.call('DEL', KEYS[1])
+if tonumber(ARGV[1]) > tonumber(since) then
+  redis.call('RPUSH', KEYS[2], since .. '-' .. ARGV[1])
+  redis.call('LTRIM', KEYS[2], -200, -1)
+  redis.call('EXPIRE', KEYS[2], 7200)
+end
+return 1`;
+
+/**
+ * 続いていた hold の区間を閉じて残す（始まりの記録を消して、区間を 1 回だけ足す）。
+ * hold を外した側と worker のどちらが呼んでも、二重には足さない。
+ */
+export async function closeHoldInterval(client: RedisClientType, end: number): Promise<void> {
+  await client.eval(CLOSE_INTERVAL_SCRIPT, { keys: [HOLD_SINCE_KEY, HOLD_LOG_KEY], arguments: [String(end)] });
 }
 
 /** hold のキーが 1 つでもあるか（SCAN で探す）。 */
