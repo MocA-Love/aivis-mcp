@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
 import { buildSynthesisParams, MAX_ELEVENLABS_CONTEXT_MINUTES, type AppConfig } from '../config.js';
-import { applySettingsPatch, getConfigPath, modifySettings, TTS_PROVIDERS, type TtsProvider } from '../settings.js';
+import { applySettingsPatch, getConfigPath, loadSettings, modifySettings, TTS_PROVIDERS, type TtsProvider } from '../settings.js';
 import { AivisSpeechService } from './aivis-speech-service.js';
 import { spawnWorker } from './redis-service.js';
 import {
@@ -357,13 +357,20 @@ export class MCPService {
     const warnings: string[] = [];
 
     const voiceSettings = params.elevenlabs_voice_settings;
-    const voiceSettingsVoiceId = voiceSettings === undefined ? undefined : (voiceSettings.voice_id?.trim() || candidate.elevenLabsVoiceId);
+    // 調整する声: 明示した voice_id > 同じ呼び出しの elevenlabs_voice_id > 環境変数・CLI 引数で決まっている声 >
+    // （ロックを持って読み直した）config.json の今の声。ロックの外で決めると、間に声を替えられたとき前の声に保存してしまう
+    const explicitVoiceId = voiceSettings?.voice_id?.trim() || params.elevenlabs_voice_id?.trim() || undefined;
+    const overriddenVoiceId = current.elevenLabsVoiceId !== undefined && current.elevenLabsVoiceId !== loadSettings().elevenlabs?.voiceId
+      ? current.elevenLabsVoiceId
+      : undefined;
+    const fixedVoiceId = explicitVoiceId ?? overriddenVoiceId;
     if (voiceSettings !== undefined) {
-      if (voiceSettingsVoiceId === undefined) {
+      const precheckVoiceId = fixedVoiceId ?? candidate.elevenLabsVoiceId;
+      if (precheckVoiceId === undefined) {
         return errorResult('保存しませんでした。調整する声が分かりません。elevenlabs_voice_settings.voice_id を指定してください。');
       }
-      if (!isVoiceSettingsVoiceId(voiceSettingsVoiceId)) {
-        return errorResult(`保存しませんでした。voice_id "${voiceSettingsVoiceId}" の形が違います。`);
+      if (!isVoiceSettingsVoiceId(precheckVoiceId)) {
+        return errorResult(`保存しませんでした。voice_id "${precheckVoiceId}" の形が違います。`);
       }
       if (voiceSettings.stability === undefined && voiceSettings.similarity_boost === undefined) {
         return errorResult('保存しませんでした。elevenlabs_voice_settings には stability か similarity_boost を指定してください（消すときは null）。');
@@ -450,12 +457,16 @@ export class MCPService {
     };
     await modifySettings(settings => {
       const next = applySettingsPatch(settings, patch);
-      if (voiceSettings === undefined || voiceSettingsVoiceId === undefined) {
+      if (voiceSettings === undefined) {
         return next;
       }
       // 声ごとの調整は、ロックを持ったまま読んだ表に重ねる（ほかの声の調整を消さない）
+      const voiceId = fixedVoiceId ?? next.elevenlabs?.voiceId;
+      if (voiceId === undefined || !isVoiceSettingsVoiceId(voiceId)) {
+        throw new Error('調整する声が分かりません（ほかのプロセスが声を消したか、形の違う voice_id です）。elevenlabs_voice_settings.voice_id を指定してください');
+      }
       return applyVoiceSettingsCommand(next, {
-        voiceId: voiceSettingsVoiceId,
+        voiceId,
         patch: { stability: voiceSettings.stability, similarityBoost: voiceSettings.similarity_boost },
       });
     });

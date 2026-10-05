@@ -113,7 +113,11 @@ describe('ElevenLabs の声ごとの調整', () => {
       fs.writeFileSync(process.env.AIVIS_CONFIG_FILE, JSON.stringify({ elevenlabs: { voiceSettings: { a: { stability: 0.2, similarityBoost: 0.9 } } } }));
       expect({ ...resolveConfig({}).elevenLabsVoiceSettings }).toEqual({ a: { stability: 0.2, similarityBoost: 0.9 } });
     } finally {
-      process.env.AIVIS_CONFIG_FILE = previous;
+      if (previous === undefined) {
+        delete process.env.AIVIS_CONFIG_FILE;
+      } else {
+        process.env.AIVIS_CONFIG_FILE = previous;
+      }
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
