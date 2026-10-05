@@ -3,7 +3,7 @@
  */
 
 import type { RedisClientType } from 'redis';
-import { PLAY_LOCK_KEY, WORKER_LOCK_KEY, WORKER_VERSION_KEY } from './keys.js';
+import { LEGACY_QUEUE_KEY, MIGRATED_LEGACY_QUEUE_KEY, PLAY_LOCK_KEY, WORKER_LOCK_KEY, WORKER_VERSION_KEY } from './keys.js';
 
 export const WORKER_LOCK_TTL_MS = 20_000;
 export const WORKER_HEARTBEAT_MS = 5_000;
@@ -68,27 +68,41 @@ const COMPARE_DELETE_SCRIPT = 'if redis.call("GET", KEYS[1]) == ARGV[1] then ret
 
 export type AcquireResult = 'acquired' | 'took-over' | 'busy';
 
+export interface AcquireOutcome {
+  readonly result: AcquireResult;
+  /** 引き取ったときの、前の lock の持ち主 */
+  readonly previousHolder?: string;
+  readonly previousVersion?: string | null;
+}
+
 /**
  * worker の lock を取る。空いていれば取り、古い版の worker が持っていれば値を自分の ID に
  * 書き換えて引き取る。古い worker は次の延長（5 秒以内）で失ったと気付いて止まる。
  */
 export async function acquireWorkerLock(client: RedisClientType, workerId: string, version: string): Promise<AcquireResult> {
+  return (await acquireWorkerLockDetailed(client, workerId, version)).result;
+}
+
+/** `acquireWorkerLock` と同じ。引き取ったときは前の持ち主と版も返す。 */
+export async function acquireWorkerLockDetailed(client: RedisClientType, workerId: string, version: string): Promise<AcquireOutcome> {
   const ttl = String(WORKER_LOCK_TTL_MS);
   const acquired = await client.eval(ACQUIRE_SCRIPT, { keys: [WORKER_LOCK_KEY, WORKER_VERSION_KEY], arguments: [workerId, version, ttl] });
   if (Number(acquired) === 1) {
-    return 'acquired';
+    return { result: 'acquired' };
   }
   const [holder, holderVersion] = await Promise.all([client.get(WORKER_LOCK_KEY), client.get(WORKER_VERSION_KEY)]);
   if (holder === null) {
     // 取ろうとした間に空いた。もう一度だけ試す
     const retry = await client.eval(ACQUIRE_SCRIPT, { keys: [WORKER_LOCK_KEY, WORKER_VERSION_KEY], arguments: [workerId, version, ttl] });
-    return Number(retry) === 1 ? 'acquired' : 'busy';
+    return { result: Number(retry) === 1 ? 'acquired' : 'busy' };
   }
   if (!shouldSpawnWorker(holder, holderVersion, version)) {
-    return 'busy';
+    return { result: 'busy' };
   }
   const tookOver = await client.eval(TAKEOVER_SCRIPT, { keys: [WORKER_LOCK_KEY, WORKER_VERSION_KEY], arguments: [workerId, version, ttl, holder] });
-  return Number(tookOver) === 1 ? 'took-over' : 'busy';
+  return Number(tookOver) === 1
+    ? { result: 'took-over', previousHolder: holder, previousVersion: holderVersion }
+    : { result: 'busy' };
 }
 
 /** lock を延長する。失っていたら false。 */
@@ -104,11 +118,31 @@ export async function releaseWorkerLock(client: RedisClientType, workerId: strin
   await client.eval(COMPARE_DELETE_SCRIPT, { keys: [WORKER_LOCK_KEY], arguments: [workerId] });
 }
 
+/**
+ * 空いていれば取る。自分が持っていれば（応答が失われた前の取得が通っていた）期限を延ばして取れたとする。
+ */
+const ACQUIRE_PLAY_SCRIPT = `
+local holder = redis.call('GET', KEYS[1])
+if holder == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  return 1
+end
+if not holder then
+  redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+  return 1
+end
+return 0`;
+
+/** 再生の lock を 1 回だけ取りにいく。取れたら true。 */
+export async function tryAcquirePlayLock(client: RedisClientType, owner: string, ttlMs = PLAY_LOCK_TTL_MS): Promise<boolean> {
+  const acquired = await client.eval(ACQUIRE_PLAY_SCRIPT, { keys: [PLAY_LOCK_KEY], arguments: [owner, String(ttlMs)] });
+  return Number(acquired) === 1;
+}
+
 /** 再生の lock を取るまで待つ（2.4 の worker が鳴らしている間も重ならない）。 */
-export async function acquirePlayLock(client: RedisClientType, owner: string, isCancelled: () => boolean = () => false): Promise<boolean> {
+export async function acquirePlayLock(client: RedisClientType, owner: string, isCancelled: () => boolean = () => false, ttlMs = PLAY_LOCK_TTL_MS): Promise<boolean> {
   while (!isCancelled()) {
-    const acquired = await client.set(PLAY_LOCK_KEY, owner, { NX: true, PX: PLAY_LOCK_TTL_MS });
-    if (acquired) {
+    if (await tryAcquirePlayLock(client, owner, ttlMs)) {
       return true;
     }
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -116,9 +150,33 @@ export async function acquirePlayLock(client: RedisClientType, owner: string, is
   return false;
 }
 
-export async function extendPlayLock(client: RedisClientType, owner: string): Promise<boolean> {
-  const extended = await client.eval(COMPARE_PEXPIRE_SCRIPT, { keys: [PLAY_LOCK_KEY], arguments: [owner, String(PLAY_LOCK_TTL_MS)] });
+export async function extendPlayLock(client: RedisClientType, owner: string, ttlMs = PLAY_LOCK_TTL_MS): Promise<boolean> {
+  const extended = await client.eval(COMPARE_PEXPIRE_SCRIPT, { keys: [PLAY_LOCK_KEY], arguments: [owner, String(ttlMs)] });
   return Number(extended) === 1;
+}
+
+/**
+ * 2.4 の worker の lock の延長の間隔（2.4 は 5 秒ごとに延長し、失ったと気付いたら列を読むのをやめる）。
+ * 引き取った後、これに BRPOP の 1 秒と余裕を足した間は、古い列を 2.4 の worker が読めない場所へ移し続ける。
+ */
+export const LEGACY_WORKER_GRACE_MS = 5_000 + 1_000 + 2_000;
+
+const DRAIN_LEGACY_SCRIPT = `
+local moved = 0
+while true do
+  local item = redis.call('RPOPLPUSH', KEYS[1], KEYS[2])
+  if not item then break end
+  moved = moved + 1
+end
+return moved`;
+
+/**
+ * 古い列（`aivis-mcp:queue`）の中身を、2.4 の worker が読まない `aivis-mcp:q2:legacy` へ順を保って移す。
+ * 移した件数を返す。
+ */
+export async function drainLegacyQueue(client: RedisClientType): Promise<number> {
+  const moved = await client.eval(DRAIN_LEGACY_SCRIPT, { keys: [LEGACY_QUEUE_KEY, MIGRATED_LEGACY_QUEUE_KEY] });
+  return Number(moved);
 }
 
 export async function releasePlayLock(client: RedisClientType, owner: string): Promise<void> {

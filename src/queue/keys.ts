@@ -8,8 +8,13 @@ export const LEGACY_QUEUE_KEY = 'aivis-mcp:queue';
 export const HIGH_QUEUE_KEY = 'aivis-mcp:q2:high';
 /** 2.5 の列（ふつうの発話）。 */
 export const NORMAL_QUEUE_KEY = 'aivis-mcp:q2:normal';
+/**
+ * 2.4 の worker から lock を引き取ったとき、古い列の中身を移す先（2.4 の worker は読まない）。
+ * 引き取られた 2.4 の worker が、止まるまでの間に待機中のジョブを取り出して鳴らさないようにする。
+ */
+export const MIGRATED_LEGACY_QUEUE_KEY = 'aivis-mcp:q2:legacy';
 /** BRPOP で取り出す順（先に書いたキーが優先）。 */
-export const DEQUEUE_ORDER = [HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY, LEGACY_QUEUE_KEY] as const;
+export const DEQUEUE_ORDER = [HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY, MIGRATED_LEGACY_QUEUE_KEY, LEGACY_QUEUE_KEY] as const;
 
 export const WORKER_LOCK_KEY = 'aivis-mcp:worker-lock';
 /** 動いている worker の版（worker が lock と同じ寿命で書く）。 */
@@ -20,10 +25,25 @@ export const PLAY_LOCK_KEY = 'aivis-mcp:play-lock';
 export const AUDIO_STREAM_PREFIX = 'aivis-mcp:audio:';
 export const STATUS_PREFIX = 'aivis-mcp:status:';
 export const HOLD_PREFIX = 'aivis-mcp:hold:';
+/**
+ * worker が取り出した印（期限 30 分）。知らせ（期限 5 分）が切れた後も、withdraw が「積まれていない」と
+ * 取り違えないように残す。
+ */
+export const TAKEN_PREFIX = 'aivis-mcp:taken:';
 /** hold を置いた・消したときの知らせ。 */
 export const HOLD_CHANNEL = 'aivis-mcp:hold-events';
 /** 終わった hold の区間（ジョブの期限から hold の時間を除くため）。 */
 export const HOLD_LOG_KEY = 'aivis-mcp:hold-log';
+/** いま続いている hold の始まり（worker が入れ替わっても hold の時間を数え直せるように）。 */
+export const HOLD_SINCE_KEY = 'aivis-mcp:hold-since';
+
+/**
+ * worker が鳴らし始めるときに、発話を積んだ MCP サーバーへ Para Code の ticket を頼む口（pub/sub）。
+ * 頼むのは `aivis-mcp:voice-ticket:req:<requester>`、返事は `aivis-mcp:voice-ticket:res:<jobId>`。
+ * どちらも pub/sub なので Redis には残らない。
+ */
+export const VOICE_TICKET_REQUEST_PREFIX = 'aivis-mcp:voice-ticket:req:';
+export const VOICE_TICKET_REPLY_PREFIX = 'aivis-mcp:voice-ticket:res:';
 
 /**
  * `--ingest` が起動時に受けた着信音の許可フォルダ（SET、`--ingest` ごとに 1 つ）。worker は全部の和集合で確かめる。
@@ -41,6 +61,10 @@ export function audioStreamKey(id: string): string {
 
 export function statusKey(id: string): string {
   return STATUS_PREFIX + id;
+}
+
+export function takenKey(id: string): string {
+  return TAKEN_PREFIX + id;
 }
 
 export function holdKey(owner: string): string {

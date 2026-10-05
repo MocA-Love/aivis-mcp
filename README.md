@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/c42722bd-8f2f-4543-bdc6-71668db3751d
 - Aivis Cloud
   APIキー（[Aivis Hub](https://hub.aivis-project.com/cloud-api/api-keys)から取得）、または
   ElevenLabs APIキー（[ElevenLabs](https://elevenlabs.io/app/settings/api-keys)から取得）
-- 音声プレイヤー（ffplay推奨、mpv、afplayも対応）。ffmpeg（ffplay）が無いと、全部受け取ってから鳴らすので鳴り始めが遅れ、音量の覚え直しもできません
+- 音声プレイヤー（ffplay推奨、mpv、afplay（macOS）・mplayer・play（sox、Linux）も対応）。ffmpeg（ffplay）が無いと、全部受け取ってから鳴らすので鳴り始めが遅れ、音量の覚え直しもできません
 - Redis（ローカルで起動）
 
 > [!TIP]
@@ -168,7 +168,7 @@ MCPサーバー起動時やCLIコマンドで使用できるオプション：
 
 - 最初の値は、作者が測った Aivis と ElevenLabs のいくつかの声から入れてあります。表に無い組は、同じモデルの声の平均、それも無ければ 0dB です
 - 鳴らし切った発話の補正前の音声を ffmpeg で測り、直近 5 回の中央値で表を覚え直します。感情タグ（`[whispers]` など）入り・1.5 秒未満・途中で止まった発話は使いません
-- 当て方は `volume=XdB,alimiter=limit=0.89`（-1dBTP で頭打ち）です。上げる方向は最大 +8dB で、最後の合計にもこの上限を掛けます
+- 当て方は `volume=XdB,alimiter=limit=0.89:level=false`（-1dBTP で頭打ち。alimiter が出力を持ち上げないよう level を切る）です。上げる方向は最大 +8dB で、最後の合計にもこの上限を掛けます
 - ffplay・mpv が無く afplay だけの環境では、afplay の `-v` が 1.0 までなので下げる方向にしか揃えられず、覚え直しもしません
 
 好みで全体を変えたいときは、次の上乗せ（dB）を使います。

@@ -1,7 +1,9 @@
 import { createClient, type RedisClientType } from 'redis';
+import { v4 as uuidv4 } from 'uuid';
 import { version, type AppConfig } from '../config.js';
 import { ensureWorkerRunning, tryStartRedis } from './redis-service.js';
-import { captureParaCodeVoiceTarget } from './para-code-voice.js';
+import { hasParaCodeVoiceEnv, withParaCodeVoiceTarget, type ParaCodeVoiceTarget } from './para-code-voice.js';
+import { RESPONDER_CLOSE_GRACE_MS, VoiceTicketResponder, type VoiceRequester } from './voice-ticket.js';
 import { enqueueSynthesis } from '../queue/enqueue.js';
 import { PlaybackWorker } from '../worker/playback-worker.js';
 import { createAudioBackend } from '../audio/player.js';
@@ -16,6 +18,9 @@ export class AivisSpeechService {
   private config: AppConfig;
   private loadConfig: () => AppConfig;
   private redisClient: RedisClientType;
+  /** worker から ticket を頼まれたら答える口（Para Code から起動されたときだけ） */
+  private ticketResponder: VoiceTicketResponder | undefined;
+  private ticketResponderFailed = false;
 
   /**
    * @param loadConfig 発話ごとに最新の設定を返す関数。MCPツールで config.json が書き換わっても
@@ -36,16 +41,55 @@ export class AivisSpeechService {
       // 動いている worker が古ければ新しい worker を起こす（起きた worker が lock を引き取る）
       await ensureWorkerRunning(this.redisClient, this.config);
       // 再生workerはRedis全体で1つだけなので、そのprocess.envは要求元MCPと一致しない。
-      // 現在の要求元をenqueue時に確定し、短命なjob payloadとしてworkerへ引き渡す。
-      const voiceTarget = await captureParaCodeVoiceTarget();
-      const queuedParams = voiceTarget === undefined ? params : { ...params, _paraCodeVoiceTarget: voiceTarget };
-      const job = await enqueueSynthesis(this.redisClient, queuedParams);
+      // Para Code の ticket は、worker が鳴らし始めるときにこの MCP サーバーへ頼んで取る（Q208 A）。
+      // 頼まれる口を開けなかったときだけ、従来どおり積む時に取って job payload に載せる
+      // 控えとして積む時にも 1 枚取って載せる（MCP サーバーが先に終わっても鳴らせるように）
+      const jobId = uuidv4();
+      const route = await this.voiceRouteFor(jobId);
+      const queuedParams = route !== undefined
+        ? { ...params, _voiceRequester: route.requester, ...(route.fallback === undefined ? {} : { _paraCodeVoiceTarget: route.fallback }) }
+        : (hasParaCodeVoiceEnv() ? await withParaCodeVoiceTarget(params) : params);
+      const job = await enqueueSynthesis(this.redisClient, queuedParams, 'normal', jobId);
       if (this.config.debug) {
         console.error('[queue] enqueue', { id: job.id, wait_ms: params.wait_ms });
       }
     } catch (error) {
       console.error('Queue enqueue error:', error instanceof Error ? error.message : error);
     }
+  }
+
+  /** MCP サーバーが終わるとき。答えている途中の ticket の依頼に最大 2 秒答えてから閉じる。 */
+  async close(): Promise<void> {
+    await this.ticketResponder?.stop(RESPONDER_CLOSE_GRACE_MS);
+    this.ticketResponder = undefined;
+  }
+
+  /** Para Code から起動されていれば、ticket を頼まれる口を開けて、このジョブを覚える（控えの ticket も取る）。 */
+  private async voiceRouteFor(jobId: string): Promise<{ requester: VoiceRequester; fallback: ParaCodeVoiceTarget | undefined } | undefined> {
+    if (!hasParaCodeVoiceEnv()) {
+      return undefined;
+    }
+    if (this.ticketResponder === undefined && !this.ticketResponderFailed) {
+      const subscriber = this.redisClient.duplicate();
+      subscriber.on('error', error => {
+        console.error('Redis error:', error instanceof Error ? error.message : error);
+      });
+      const responder = new VoiceTicketResponder(subscriber as RedisClientType, this.redisClient, uuidv4());
+      try {
+        await responder.start();
+        this.ticketResponder = responder;
+      } catch (error) {
+        console.error('ticket の受け口を開けませんでした:', error instanceof Error ? error.message : error);
+        this.ticketResponderFailed = true;
+        await responder.stop();
+      }
+    }
+    const responder = this.ticketResponder;
+    if (!responder?.isStarted) {
+      return undefined;
+    }
+    const fallback = await responder.captureFallback();
+    return { requester: responder.register(jobId, fallback), fallback };
   }
 
   private async ensureRedisReady(): Promise<void> {

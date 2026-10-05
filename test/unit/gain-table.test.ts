@@ -62,8 +62,8 @@ describe('gain table', () => {
   });
 
   test('当て方と afplay の音量', () => {
-    expect(voiceFilter(4.1)).toBe('volume=4.1dB,alimiter=limit=0.89');
-    expect(voiceFilter(-7.4)).toBe('volume=-7.4dB,alimiter=limit=0.89');
+    expect(voiceFilter(4.1)).toBe('volume=4.1dB,alimiter=limit=0.89:level=false');
+    expect(voiceFilter(-7.4)).toBe('volume=-7.4dB,alimiter=limit=0.89:level=false');
     expect(afplayVolume(6)).toBe(1);
     expect(afplayVolume(-20)).toBeCloseTo(0.1, 5);
   });

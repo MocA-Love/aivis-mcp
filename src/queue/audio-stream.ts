@@ -1,7 +1,8 @@
 /**
  * 音声を運ぶ Redis Stream `aivis-mcp:audio:<id>`（設計 3.1・3.6 N5）。
  *
- * 項目: `o` = 開いた印、`d` = MP3 の断片、`e` = 終わりの印、`a` = 中断の印（値は理由）。
+ * 項目: `o` = 開いた印、`d` = MP3 の断片、`e` = 終わりの印、`a` = 中断の印（値は理由）、
+ * `c` = 鳴らすのをやめる印（値は理由。入力の終わりとは別に、`e` の後にも書ける）。
  * MAXLEN は使わず、書く側がバイト数で上限を数える。
  */
 
@@ -11,6 +12,8 @@ import { audioStreamKey } from './keys.js';
 export const STREAM_TTL_SECONDS = 180;
 /** 流れ 1 本の上限。 */
 export const MAX_STREAM_BYTES = 8 * 1024 * 1024;
+/** 1 つの項目の上限（`--ingest` の枠の中身は 1 MiB まで。書く側はそれより小さくまとめる）。 */
+export const MAX_STREAM_ENTRY_BYTES = 1024 * 1024 + 64 * 1024;
 /** まとめて XADD する大きさと間隔。 */
 export const FLUSH_BYTES = 8 * 1024;
 export const FLUSH_INTERVAL_MS = 100;
@@ -109,6 +112,21 @@ export class AudioStreamWriter {
   }
 
   /**
+   * 鳴らすのをやめる印を書く。入力を閉じた（end の）後でも書ける。worker は、まだ鳴らし始めていなければ
+   * この印を見て捨てる（鳴らし始めていれば、届いた分を鳴らし切る）。
+   */
+  cancel(reason = 'aborted'): Promise<void> {
+    if (this.discarded) {
+      return this.chain;
+    }
+    if (!this.closed) {
+      this.clearPending();
+      this.closed = true;
+    }
+    return this.enqueueAdd({ c: reason.slice(0, 64) || 'aborted' });
+  }
+
+  /**
    * 以後の書き込みをすべて捨てる（タイマーも止める）。worker が終わりの知らせを積んで Stream を消した後に、
    * 書きかけの断片がキーを作り直さないようにする。まだ Redis へ送っていない書き込みも捨てる。
    */
@@ -200,10 +218,29 @@ export class AudioStreamWriter {
   }
 }
 
+const CANCEL_IF_EXISTS_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+redis.call('XADD', KEYS[1], '*', 'c', ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return 1`;
+
+/**
+ * 書く側（writer）がいない Stream（前の `--ingest` から引き継いだ件）に、鳴らすのをやめる印 `c` を直接書く。
+ * Stream が無ければ作らない（worker が消した後にキーを作り直さない）。書けたら true。
+ */
+export async function cancelStreamById(client: RedisClientType, id: string, reason = 'aborted'): Promise<boolean> {
+  const result = await client.eval(CANCEL_IF_EXISTS_SCRIPT, {
+    keys: [audioStreamKey(id)],
+    arguments: [reason.slice(0, 64) || 'aborted', String(STREAM_TTL_SECONDS)],
+  });
+  return Number(result) === 1;
+}
+
 export type StreamEvent =
   | { readonly kind: 'data'; readonly data: Buffer }
   | { readonly kind: 'end' }
-  | { readonly kind: 'abort'; readonly reason: string };
+  | { readonly kind: 'abort'; readonly reason: string }
+  | { readonly kind: 'cancel'; readonly reason: string };
 
 /** Stream の項目を読む側の事件に直す（`o` は読み飛ばす）。 */
 export function decodeStreamEntry(message: Record<string, Buffer | string>): StreamEvent | undefined {
@@ -223,9 +260,19 @@ export function decodeStreamEntry(message: Record<string, Buffer | string>): Str
   }
   const abort = field('a');
   if (abort !== undefined) {
-    return { kind: 'abort', reason: abort.toString('utf8') || 'aborted' };
+    return { kind: 'abort', reason: reasonOf(abort) };
+  }
+  const cancel = field('c');
+  if (cancel !== undefined) {
+    return { kind: 'cancel', reason: reasonOf(cancel) };
   }
   return undefined;
+}
+
+/** 理由の文字列（Redis から来るので長さと文字を絞る）。 */
+function reasonOf(value: Buffer): string {
+  const text = value.subarray(0, 64).toString('utf8').replace(/[^A-Za-z0-9_.:-]/g, '');
+  return text || 'aborted';
 }
 
 /**

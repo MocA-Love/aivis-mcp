@@ -4,7 +4,9 @@ import { createClient, type RedisClientType } from 'redis';
 import { version, type AppConfig } from './config.js';
 import { connectRedis, ensureWorkerRunning, spawnWorker, WORKER_VERSION_KEY } from './services/redis-service.js';
 import { parseMuteDuration, setMute, clearMute, getMuteStatus } from './services/mute-service.js';
-import { enqueueLegacy } from './queue/enqueue.js';
+import { enqueueAudio, restoreLegacyQueue } from './queue/enqueue.js';
+import { compareVersions } from './queue/worker-lock.js';
+import { safeGainKeyHeader } from './worker/para-code-forward.js';
 import { HIGH_QUEUE_KEY, HOLD_PREFIX, NORMAL_QUEUE_KEY } from './queue/keys.js';
 import { detectPlayerKind, hasFfmpeg } from './audio/player.js';
 import { gainFilePath } from './audio/gain-table.js';
@@ -127,7 +129,7 @@ export async function runHealth(config: AppConfig): Promise<void> {
   }
   console.log(`Audio Player:  ${available.length > 0 ? `OK (${available.join(', ')})` : 'NG (未検出)'}`);
   const kind = detectPlayerKind();
-  if (kind === 'afplay' || kind === 'none') {
+  if (kind !== 'ffplay' && kind !== 'mpv') {
     console.log('               ffmpeg (ffplay) が無いため、全部受け取ってから鳴らします。音量の自動調整も一部しか効きません');
   }
   console.log(`Loudness:      ${hasFfmpeg() ? 'OK (ffmpeg)' : 'NG (ffmpeg が無いため音量を覚え直せません)'}`);
@@ -272,8 +274,13 @@ const MAX_PLAY_AUDIO_BYTES = 8 * 1024 * 1024;
 /**
  * 標準入力の合成済みMP3を、ほかの発話と同じキューに積んで鳴らす（Para Code が SSH 先の発話を手元で
  * 鳴らすための口）。積めたら終了コード 0、入力が空・大きすぎるときは 2。ミュートはworkerが見る。
+ * 2.5 の worker なら `q2:normal` に積み（hold・優先の順・音量の表が効く）、`gainKey` があれば表の鍵として添える。
  */
-export async function runPlayAudio(config: AppConfig): Promise<void> {
+export async function runPlayAudio(config: AppConfig, gainKey?: string): Promise<void> {
+  const safeGainKey = safeGainKeyHeader(gainKey);
+  if (gainKey !== undefined && safeGainKey === undefined) {
+    console.error('Warning: --gain-key の形が正しくないので使いません（provider:voice:model）');
+  }
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const value of process.stdin) {
@@ -308,9 +315,28 @@ export async function runPlayAudio(config: AppConfig): Promise<void> {
       process.exitCode = 3;
       return;
     }
-    await enqueueLegacy(client, { _audioBase64: Buffer.concat(chunks, total).toString('base64') });
+    // 2.4 の worker は 2.5 の列を読まないので、古い列に積む
+    const target = compareVersions(workerVersion, '2.5.0') >= 0 ? 'q2' : 'legacy';
+    await enqueueAudio(client, {
+      _audioBase64: Buffer.concat(chunks, total).toString('base64'),
+      ...(safeGainKey === undefined ? {} : { gainKey: safeGainKey }),
+    }, target);
     // 積めた印。呼び出し側は終了コードではなくこれで判断する（この後に止められても積んだ事実は変わらない）
     process.stdout.write('queued\n');
+  } finally {
+    await client.disconnect().catch(() => undefined);
+  }
+}
+
+/**
+ * 2.5.1 が 2.4 の worker から lock を引き取ったときに `aivis-mcp:q2:legacy` へ移した発話を、古い列
+ * `aivis-mcp:queue` へ戻す。2.5.0 以前へ戻したとき（古い worker はこの列を読まない）に使う。
+ */
+export async function runRestoreLegacyQueue(config: AppConfig): Promise<void> {
+  const client = await connectRedis(config.redisUrl);
+  try {
+    const moved = await restoreLegacyQueue(client);
+    console.log(moved > 0 ? `${moved} 件を古い列へ戻しました` : '戻す発話はありません');
   } finally {
     await client.disconnect().catch(() => undefined);
   }

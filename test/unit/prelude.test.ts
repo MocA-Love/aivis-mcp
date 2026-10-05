@@ -64,10 +64,10 @@ describe('prelude', () => {
   test('声のデコーダは低遅延の指定で起こし、音量と頭打ちを当てる', () => {
     const args = ffplayVoiceArgs(4.1);
     expect(args).toEqual(expect.arrayContaining(['-probesize', '32', '-analyzeduration', '0', '-fflags', 'nobuffer', '-f', 'mp3']));
-    expect(args[args.indexOf('-af') + 1]).toBe('volume=4.1dB,alimiter=limit=0.89');
+    expect(args[args.indexOf('-af') + 1]).toBe('volume=4.1dB,alimiter=limit=0.89:level=false');
     expect(args.slice(-2)).toEqual(['-i', '-']);
     const mpv = mpvVoiceArgs(-3);
-    expect(mpv).toEqual(expect.arrayContaining(['--demuxer-lavf-probesize=32', '--demuxer-lavf-analyzeduration=0', '--demuxer-lavf-o=fflags=+nobuffer', '--af=lavfi=[volume=-3.0dB,alimiter=limit=0.89]']));
+    expect(mpv).toEqual(expect.arrayContaining(['--demuxer-lavf-probesize=32', '--demuxer-lavf-analyzeduration=0', '--demuxer-lavf-o=fflags=+nobuffer', '--af=lavfi=[volume=-3.0dB,alimiter=limit=0.89:level=false]']));
   });
 
   test('mpv の着信音も形式を指定し、プレイリストとして読まない', () => {
