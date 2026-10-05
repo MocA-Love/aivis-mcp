@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.5.3] - 2026-10-05
+
+更新したら `aivis-mcp --reboot` で worker を起動し直してください。
+
+### ElevenLabs で前の発話の調子をつなげる
+
+- worker が直前に合成した声の発話 1 件を覚え、次の発話がそれと同じ voice_id・model_id で 5 分以内なら、前の発話の request ID（応答ヘッダー `request-id`。取れていなければ SSML 風のタグを除いた前の文）を `previous_request_ids` / `previous_text` として付けます。どのペインからの発話かは問いません
+- 間に別の声・別のモデル・Aivis の発話が挟まったら付けません。着信音（sound ジョブ・prelude）は挟まっても切れません
+- 本文を最後まで読み終えた要求だけを覚えます。合成に失敗した・途中で止めた発話は記録を消し、次はつなげません
+- request ID は 2 時間以内のものだけを使い、それより古ければ前の文を付けます。`eleven_v3` 系には付けません。`next_text` / `next_request_ids` は付けません
+- 文脈を付けた要求が 4xx（401・403・429 を除く）で失敗したら、文脈なしで 1 回だけ合成し直します
+- 窓は環境変数 `AIVIS_ELEVENLABS_CONTEXT_MINUTES` > `config.json` の `elevenlabs.contextWindowMinutes` > 既定 5 分。0 で付けません（0〜1440、外れた値は既定に戻して警告）。`tts-configure` の `elevenlabs_context_window_minutes` でも変えられます
+- 覚えるのは worker のメモリだけです。SSH 先の worker が合成して Para Code へ送る発話も、その worker のメモリで同じに動きます
+- `tts-get-settings` の `elevenlabs.context` に、動いている worker が使っている窓（`source: "worker"`）と、今のモデルで付くかどうかを出します
+
+### 辞書を使う
+
+- `config.json` の `elevenlabs.pronunciationDictionaryId`（省略可で `pronunciationDictionaryVersionId`）を `pronunciation_dictionary_locators` として、`aivis.userDictionaryUuid` を `user_dictionary_uuid` として、合成のたびに付けます。worker は発話ごとに設定を読み直すので再起動は要りません
+- ElevenLabs で版を書いていなければ、合成のたびに最新の版を取って 60 秒覚えます。取れない・アーカイブ済みなら辞書なしで合成します
+- `tts-list-dictionaries` で ElevenLabs の発音辞書（アーカイブ済みは除く）と Aivis のユーザー辞書の一覧を出します
+- `tts-configure` の `elevenlabs_pronunciation_dictionary_id`・`elevenlabs_pronunciation_dictionary_version_id`・`aivis_user_dictionary_uuid` で設定し、空文字で解除します。見つからない・アーカイブ済みの辞書は保存しません
+- Para Code などから呼ぶ `--set-dictionary --provider <elevenlabs|aivis> --id <id> [--version-id <id>]` と `--clear-dictionary --provider <elevenlabs|aivis>` を足しました。成功は標準出力に `ok` の 1 行、失敗は標準エラーに `error: <理由>` の 1 行と終了コード 1 です。取り決めは README の「辞書」にあります
+
+### 設定ファイルを順番に書く
+
+- `config.json` の書き込み（`tts-configure`・`--set-dictionary`・`--init`）は、`config.json.lock` を持って読み直してから書きます。同時に書いても互いの変更を消しません。2.4 からの音量の読み替えは、ロックが空いていないときは書かずに次に読むときに回します
+
 ## [2.5.2] - 2026-10-05
 
 更新したら `aivis-mcp --reboot` で worker を起動し直してください。

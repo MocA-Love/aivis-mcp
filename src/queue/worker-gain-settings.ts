@@ -11,6 +11,8 @@ import { WORKER_LOCK_TTL_MS } from './worker-lock.js';
 export interface WorkerGainSettings extends GainLearningSettings {
   /** 書いた worker の版 */
   readonly version: string;
+  /** worker が使っている、前の発話の文脈を付ける時間（分）。2.5.3 より前の worker は書かない */
+  readonly elevenLabsContextWindowMinutes?: number;
 }
 
 /** worker の lock と同じ寿命で書く（lock を延ばすたびに書き直す）。 */
@@ -29,7 +31,13 @@ export async function readWorkerGainSettings(client: RedisClientType): Promise<W
     if (typeof parsed.learnWindow === 'number' && Number.isFinite(parsed.learnWindow)
       && typeof parsed.minLearnSeconds === 'number' && Number.isFinite(parsed.minLearnSeconds)
       && typeof parsed.version === 'string') {
-      return { learnWindow: parsed.learnWindow, minLearnSeconds: parsed.minLearnSeconds, version: parsed.version };
+      const context = parsed.elevenLabsContextWindowMinutes;
+      return {
+        learnWindow: parsed.learnWindow,
+        minLearnSeconds: parsed.minLearnSeconds,
+        version: parsed.version,
+        ...(typeof context === 'number' && Number.isFinite(context) ? { elevenLabsContextWindowMinutes: context } : {}),
+      };
     }
   } catch {
     // 壊れた値は無視する

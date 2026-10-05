@@ -31,6 +31,14 @@ export interface AppConfig {
   elevenLabsModelId: string;
   /** ElevenLabs の声だけに足す上乗せ（dB）。2.4 の volume_db からの読み替えを含む */
   elevenLabsVolumeOffsetDb: number;
+  /** 前の発話の文脈（request ID か文）を付ける時間（分）。0 で付けない */
+  elevenLabsContextWindowMinutes: number;
+  /** ElevenLabs の発音辞書の ID */
+  elevenLabsPronunciationDictionaryId?: string;
+  /** ElevenLabs の発音辞書の版（無ければ合成のたびに最新の版を取る） */
+  elevenLabsPronunciationDictionaryVersionId?: string;
+  /** Aivis のユーザー辞書の UUID */
+  aivisUserDictionaryUuid?: string;
   /** すべての声に足す上乗せ（dB） */
   volumeOffsetDb: number;
   /** 音量の覚え直しに使う直近の回数 */
@@ -89,6 +97,10 @@ export const cliOptions = {
   'trailing-silence':    { type: 'string' as const },
   'line-break-silence':  { type: 'string' as const },
   'redis-url':           { type: 'string' as const },
+  'set-dictionary':      { type: 'boolean' as const, default: false },
+  'clear-dictionary':    { type: 'boolean' as const, default: false },
+  id:                    { type: 'string' as const },
+  'version-id':          { type: 'string' as const },
   wait:                  { type: 'string' as const, short: 'w' },
   debug:                 { type: 'boolean' as const, short: 'd', default: false },
 };
@@ -135,6 +147,35 @@ function warnGainSettingOnce(message: string): void {
   }
   warnedGainSettings.add(message);
   console.error(`[aivis-mcp] ${message}`);
+}
+
+export const DEFAULT_ELEVENLABS_CONTEXT_MINUTES = 5;
+/** 文脈を付ける時間の上限（分）。request ID は 2 時間しか使えないので、それより古い前の発話は文で付ける */
+export const MAX_ELEVENLABS_CONTEXT_MINUTES = 1440;
+
+/** 文脈を付ける時間（分）。環境変数 > config.json > 既定。範囲外・数でない値は既定に戻して 1 回だけ警告する */
+export function resolveContextWindowMinutes(envValue: string | undefined, settingsValue: unknown): number {
+  const candidates: { source: string; value: unknown }[] = [
+    { source: 'AIVIS_ELEVENLABS_CONTEXT_MINUTES', value: envValue === '' ? undefined : envValue },
+    { source: 'config.json の elevenlabs.contextWindowMinutes', value: settingsValue },
+  ];
+  for (const { source, value } of candidates) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+    const parsed = typeof value === 'number' ? value : typeof value === 'string' && value.trim() !== '' ? Number(value.trim()) : NaN;
+    if (Number.isFinite(parsed) && parsed >= 0 && parsed <= MAX_ELEVENLABS_CONTEXT_MINUTES) {
+      return parsed;
+    }
+    warnGainSettingOnce(`${source} の値 ${JSON.stringify(value)} は 0〜${MAX_ELEVENLABS_CONTEXT_MINUTES} の数ではないので、既定の ${DEFAULT_ELEVENLABS_CONTEXT_MINUTES} 分を使います`);
+    return DEFAULT_ELEVENLABS_CONTEXT_MINUTES;
+  }
+  return DEFAULT_ELEVENLABS_CONTEXT_MINUTES;
+}
+
+/** 空文字・文字列でない値は未設定として扱う */
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
 }
 
 /**
@@ -199,6 +240,13 @@ export function resolveConfig(values: Record<string, ArgValue>): AppConfig {
       (legacyEnvVolume !== undefined && Number.isFinite(legacyEnvVolume) ? legacyElevenLabsVolumeToOffset(legacyEnvVolume) : undefined)
       ?? settings.elevenlabs?.volumeOffsetDb
       ?? 0,
+    elevenLabsContextWindowMinutes: resolveContextWindowMinutes(process.env.AIVIS_ELEVENLABS_CONTEXT_MINUTES, settings.elevenlabs?.contextWindowMinutes),
+    elevenLabsPronunciationDictionaryId: nonEmptyString(settings.elevenlabs?.pronunciationDictionaryId),
+    // 版は辞書の ID があるときだけ使う
+    elevenLabsPronunciationDictionaryVersionId: nonEmptyString(settings.elevenlabs?.pronunciationDictionaryId) === undefined
+      ? undefined
+      : nonEmptyString(settings.elevenlabs?.pronunciationDictionaryVersionId),
+    aivisUserDictionaryUuid: nonEmptyString(settings.aivis?.userDictionaryUuid),
     volumeOffsetDb:
       optNumber(undefined, 'AIVIS_VOLUME_OFFSET_DB')
       ?? settings.volumeOffsetDb

@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import * as readline from 'node:readline';
-import { migrateVolumeSettings, writeFileAtomic } from './audio/gain-table.js';
+import { migrateVolumeSettings, tryWithFileLockSync, withFileLock, writeFileAtomic } from './audio/gain-table.js';
 
 /** 設定ファイル。`AIVIS_CONFIG_FILE` で差し替えられる（テスト用）。 */
 function configFile(): string {
@@ -27,6 +27,18 @@ export interface ElevenLabsSettings {
   volumeOffsetDb?: number;
   /** volumeDb を volumeOffsetDb へ読み替え済みの印 */
   volumeMigrated?: boolean;
+  /** 前の発話の文脈を付ける時間（分、既定 5、0 で付けない） */
+  contextWindowMinutes?: number;
+  /** 合成に使う発音辞書の ID */
+  pronunciationDictionaryId?: string;
+  /** 発音辞書の版（無ければ最新の版を使う） */
+  pronunciationDictionaryVersionId?: string;
+}
+
+/** Aivis だけに効く設定（APIキーとモデルは互換のため最上位に置いたまま） */
+export interface AivisSettings {
+  /** 合成に使うユーザー辞書の UUID */
+  userDictionaryUuid?: string;
 }
 
 /** 音量の表の覚え直し方 */
@@ -46,8 +58,17 @@ export interface UserSettings {
   /** すべての声に足す上乗せ（dB、既定 0） */
   volumeOffsetDb?: number;
   elevenlabs?: ElevenLabsSettings;
+  aivis?: AivisSettings;
   gain?: GainSettings;
 }
+
+/** 入れ子の設定の変更。undefined は変えない、null は消す */
+type NestedPatch<T> = { [K in keyof T]?: T[K] | null };
+
+export type SettingsPatch = Omit<UserSettings, 'elevenlabs' | 'aivis'> & {
+  elevenlabs?: NestedPatch<ElevenLabsSettings>;
+  aivis?: NestedPatch<AivisSettings>;
+};
 
 export function loadSettings(): UserSettings {
   try {
@@ -68,12 +89,16 @@ export function loadSettingsWithMigration(): UserSettings {
   }
   try {
     // 書く直前に読み直し、ほかのプロセスが先に読み替えていたら（印があれば）書かない。
-    // 読み替えは 1 回だけで、ほかのプロセスが書いた別の項目も消さない
-    const fresh = migrateVolumeSettings(loadSettings());
-    if (fresh.changed) {
-      saveSettings(fresh.settings);
-    }
-    return fresh.settings;
+    // 読み替えは 1 回だけで、ほかのプロセスが書いた別の項目も消さない。
+    // ほかのプロセスが設定を書いている（ロックが空かない）ときは書かずに、次に読むときに読み替え直す
+    const written = tryWithFileLockSync(configFile(), () => {
+      const fresh = migrateVolumeSettings(loadSettings());
+      if (fresh.changed) {
+        saveSettings(fresh.settings);
+      }
+      return fresh.settings;
+    });
+    return written ?? migrated.settings;
   } catch {
     // 書けなくても、今回の値は読み替えたものを使う
     return migrated.settings;
@@ -87,25 +112,58 @@ export function saveSettings(settings: UserSettings): void {
   fs.chmodSync(configFile(), 0o600);
 }
 
-/**
- * 既存の設定に部分的な変更を重ねて保存する。undefinedのキーは変更しない。
- */
-export function updateSettings(patch: Omit<UserSettings, 'elevenlabs'> & { elevenlabs?: ElevenLabsSettings }): UserSettings {
-  const current = loadSettings();
+/** 入れ子の設定へ変更を重ねる。undefined は変えない、null は消す。空になったら undefined を返す */
+function mergeNested<T extends object>(current: T | undefined, patch: NestedPatch<T> | undefined): T | undefined {
+  if (patch === undefined) {
+    return current;
+  }
+  const next: Record<string, unknown> = { ...current };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) {
+      delete next[key];
+    } else if (value !== undefined) {
+      next[key] = value;
+    }
+  }
+  return Object.keys(next).length > 0 ? next as T : undefined;
+}
+
+/** 読んだ設定に変更を重ねたもの（書かない）。 */
+function applySettingsPatch(current: UserSettings, patch: SettingsPatch): UserSettings {
   const next: UserSettings = { ...current };
   for (const [key, value] of Object.entries(patch)) {
-    if (key === 'elevenlabs' || value === undefined) continue;
+    if (key === 'elevenlabs' || key === 'aivis' || value === undefined) continue;
     (next as Record<string, unknown>)[key] = value;
   }
-  if (patch.elevenlabs) {
-    const elevenlabs: ElevenLabsSettings = { ...current.elevenlabs };
-    for (const [key, value] of Object.entries(patch.elevenlabs)) {
-      if (value !== undefined) (elevenlabs as Record<string, unknown>)[key] = value;
-    }
+  const elevenlabs = mergeNested(current.elevenlabs, patch.elevenlabs);
+  if (elevenlabs === undefined) {
+    delete next.elevenlabs;
+  } else {
     next.elevenlabs = elevenlabs;
   }
-  saveSettings(next);
+  const aivis = mergeNested(current.aivis, patch.aivis);
+  if (aivis === undefined) {
+    delete next.aivis;
+  } else {
+    next.aivis = aivis;
+  }
   return next;
+}
+
+/** 設定ファイルのロックが空かなかった */
+export class SettingsLockError extends Error {}
+
+/**
+ * 既存の設定に部分的な変更を重ねて保存する。undefined のキーは変更しない（入れ子の項目は null で消す）。
+ * 読んでから書き戻すまで `config.json.lock` を持つ（MCP の tts-configure と `--set-dictionary` が
+ * 同時に書いても互いの変更を消さないように。音量の表と同じ方式）。
+ */
+export async function updateSettings(patch: SettingsPatch): Promise<UserSettings> {
+  return withFileLock(configFile(), () => {
+    const next = applySettingsPatch(loadSettings(), patch);
+    saveSettings(next);
+    return next;
+  }, { lockError: lockPath => new SettingsLockError(`設定ファイルのロック（${lockPath}）が空きません。ほかのプロセスが書いています`) });
 }
 
 export function getConfigPath(): string {
@@ -182,7 +240,13 @@ export async function runInit(): Promise<void> {
       settings.elevenlabs = elevenlabs;
     }
 
-    saveSettings(settings);
+    // 尋ねている間にほかのプロセスが書いた項目を消さないよう、答えた項目だけを重ねる
+    await updateSettings({
+      provider: settings.provider,
+      apiKey: settings.apiKey,
+      modelUuid: settings.modelUuid,
+      elevenlabs: settings.elevenlabs,
+    });
     console.log('');
     console.log(`設定を保存しました: ${configFile()}`);
   } finally {

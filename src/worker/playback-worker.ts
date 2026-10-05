@@ -458,7 +458,7 @@ export class PlaybackWorker {
     }
   }
 
-  /** 覚え直しに使っている窓と最短秒数を、lock と同じ寿命で Redis に置く（`tts-get-settings` が見る）。 */
+  /** 覚え直しに使っている窓と最短秒数（と文脈を付ける時間）を、lock と同じ寿命で Redis に置く（`tts-get-settings` が見る）。 */
   private async publishGainSettings(): Promise<void> {
     try {
       const config = this.deps.loadConfig();
@@ -466,6 +466,7 @@ export class PlaybackWorker {
         learnWindow: config.gainLearnWindow,
         minLearnSeconds: config.gainMinLearnSeconds,
         version: this.deps.version,
+        elevenLabsContextWindowMinutes: config.elevenLabsContextWindowMinutes,
       }));
     } catch (error) {
       console.error('Worker gain settings publish error:', summarizeError(error));
