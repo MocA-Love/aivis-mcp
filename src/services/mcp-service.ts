@@ -140,7 +140,7 @@ export class MCPService {
       'tts-get-settings',
       '現在の音声合成設定（使用中のサービス、声、モデル）を返す。APIキーは伏せ字で返す。',
       {},
-      async () => jsonResult(this.describeSettings(this.loadConfig()))
+      async () => jsonResult(await this.describeSettings(this.loadConfig()))
     );
 
     this.mcpServer.tool(
@@ -236,7 +236,16 @@ export class MCPService {
     return undefined;
   }
 
-  private describeSettings(config: AppConfig): Record<string, unknown> {
+  private async describeSettings(config: AppConfig): Promise<Record<string, unknown>> {
+    const worker = await this.speechService.workerGainSettings();
+    const gain = worker !== undefined
+      ? { learn_window: worker.learnWindow, min_learn_seconds: worker.minLearnSeconds, source: 'worker' }
+      : {
+        learn_window: config.gainLearnWindow,
+        min_learn_seconds: config.gainMinLearnSeconds,
+        source: 'this-server',
+        note: '動いている worker が見つからないので、この MCP サーバーで読んだ値を出しています。実際に効くのは worker の値で、worker を起こしたプロセスの環境変数 AIVIS_GAIN_LEARN_WINDOW / AIVIS_GAIN_MIN_LEARN_SECONDS があればそちらが勝ちます',
+      };
     return {
       provider: config.provider,
       aivis: {
@@ -250,6 +259,7 @@ export class MCPService {
         volume_offset_db: config.elevenLabsVolumeOffsetDb,
       },
       volume_offset_db: config.volumeOffsetDb,
+      gain,
       config_path: getConfigPath(),
     };
   }
@@ -354,7 +364,7 @@ export class MCPService {
       warnings.push(`環境変数またはCLI引数が優先されるため、次の項目は保存した値が使われません: ${overridden.join(', ')}`);
     }
 
-    return jsonResult({ saved: true, settings: this.describeSettings(effective), warnings });
+    return jsonResult({ saved: true, settings: await this.describeSettings(effective), warnings });
   }
 
   async start(): Promise<void> {

@@ -16,10 +16,23 @@ export const MAX_BOOST_DB = 8;
 /** 下げる方向の下限（壊れた測定で無音にしないため）。 */
 export const MIN_TABLE_DB = -30;
 export const MIN_FINAL_DB = -60;
-/** 覚え直しに使う直近の回数。 */
-export const LEARN_WINDOW = 5;
-/** これより短い発話は覚え直しに使わない。 */
-export const MIN_LEARN_SECONDS = 1.5;
+/**
+ * 覚え直しに使う直近の回数（既定）。10 声 × 20 文の実測で、窓 5 だと採用値のずれが p99 1.24dB、
+ * 9 だと p99 0.99dB（耳で気付く 1dB 以内）。15 は p99 0.79dB だが落ち着くまでが遅い。
+ * `config.json` の `gain.learnWindow` か `AIVIS_GAIN_LEARN_WINDOW` で変えられる。
+ */
+export const LEARN_WINDOW = 9;
+/**
+ * これより短い発話は覚え直しに使わない（既定、秒）。2.5 秒以下の短い文は声により約 -0.8dB 偏る。
+ * `config.json` の `gain.minLearnSeconds` か `AIVIS_GAIN_MIN_LEARN_SECONDS` で変えられる。
+ */
+export const MIN_LEARN_SECONDS = 2.5;
+/** 窓に指定できる範囲。表のファイルにも上限の分までは測定を残す（窓を増やしたときに使う）。 */
+export const MIN_LEARN_WINDOW = 1;
+export const MAX_LEARN_WINDOW = 50;
+/** 最短の秒数に指定できる範囲。 */
+export const MIN_LEARN_SECONDS_LOWER = 0.5;
+export const MIN_LEARN_SECONDS_UPPER = 30;
 /** 表に覚える組の上限。超えたら更新の古いものから消す。 */
 export const MAX_LEARNED_ENTRIES = 200;
 /**
@@ -131,11 +144,15 @@ export function resolveGainDb(key: string | undefined, learned: Readonly<Record<
   return round1(sameModel.reduce((sum, value) => sum + value, 0) / sameModel.length);
 }
 
-/** 測った大きさ（LUFS）を 1 回分の補正値として足し、直近 5 回の中央値を表の値にする。 */
-export function learnSample(previous: LearnedGain | undefined, measuredLufs: number, now = Date.now()): LearnedGain {
+/**
+ * 測った大きさ（LUFS）を 1 回分の補正値として足し、直近 `window` 回の中央値を表の値にする。
+ * 測定は窓に関わらず上限（`MAX_LEARN_WINDOW` 回）まで残す。窓を減らしても後で増やせば古い測定を使え、
+ * 増やしたときは残っている分だけで中央値を取る。
+ */
+export function learnSample(previous: LearnedGain | undefined, measuredLufs: number, now = Date.now(), window = LEARN_WINDOW): LearnedGain {
   const sample = round1(clampTableDb(TARGET_LUFS - measuredLufs));
-  const samples = [...(previous?.samples ?? []), sample].slice(-LEARN_WINDOW);
-  return { db: round1(median(samples)), samples, updatedAt: now };
+  const samples = [...(previous?.samples ?? []), sample].slice(-MAX_LEARN_WINDOW);
+  return { db: round1(median(samples.slice(-clampLearnWindow(window)))), samples, updatedAt: now };
 }
 
 /** 上限を超えた分を、更新の古いものから消す。 */
@@ -148,14 +165,14 @@ export function pruneLearnedGains(entries: Readonly<Record<string, LearnedGain>>
   return result;
 }
 
-/** 覚え直しに使ってよい発話か。 */
+/** 覚え直しに使ってよい発話か（`minLearnSeconds` より短いものは使わない）。 */
 export function isLearnable(input: {
   readonly tagged: boolean;
   readonly durationSeconds: number | undefined;
   readonly completed: boolean;
   readonly measuredLufs?: number;
-}): boolean {
-  if (input.tagged || !input.completed || input.durationSeconds === undefined || input.durationSeconds < MIN_LEARN_SECONDS) {
+}, minLearnSeconds = MIN_LEARN_SECONDS): boolean {
+  if (input.tagged || !input.completed || input.durationSeconds === undefined || input.durationSeconds < minLearnSeconds) {
     return false;
   }
   if (input.measuredLufs !== undefined && (!Number.isFinite(input.measuredLufs) || input.measuredLufs < -70 || input.measuredLufs > 0)) {
@@ -181,16 +198,43 @@ export function afplayVolume(gainDb: number): number {
 }
 
 /**
+ * シンボリックリンクをたどった先のパス。指し先がまだ無いリンクは、リンクの中身を解決した場所を返す
+ * （`realpath` は指し先が無いと失敗するので、自分で readlink をたどる）。リンクでなければそのまま。
+ */
+export function resolveLinkTarget(filePath: string): string {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    // 指し先が無い、またはまだ無いファイル
+  }
+  let current = path.resolve(filePath);
+  for (let hops = 0; hops < 40; hops++) {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      break;
+    }
+    if (!stat.isSymbolicLink()) {
+      break;
+    }
+    current = path.resolve(path.dirname(current), fs.readlinkSync(current));
+  }
+  // 親フォルダがあれば、そちらのリンクもたどる
+  try {
+    return path.join(fs.realpathSync(path.dirname(current)), path.basename(current));
+  } catch {
+    return current;
+  }
+}
+
+/**
  * 一時ファイルに書いて fsync してから置き換える（書きかけや電源断で中身の無いファイルを残さない）。
  */
 export function writeFileAtomic(target: string, content: string, mode: number): void {
-  // シンボリックリンクなら実体へたどってから書く（リンクを普通のファイルで置き換えて壊さない）
-  let filePath = target;
-  try {
-    filePath = fs.realpathSync(target);
-  } catch {
-    // まだ無いファイルはそのまま作る
-  }
+  // シンボリックリンクなら実体へたどってから書く（リンクを普通のファイルで置き換えて壊さない。
+  // 指し先がまだ無いリンクでも、リンクを残したまま指し先に作る）
+  const filePath = resolveLinkTarget(target);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   const fd = fs.openSync(temporary, 'w', mode);
@@ -213,6 +257,88 @@ export function gainFilePath(): string {
   return process.env.AIVIS_GAIN_FILE || path.join(os.homedir(), '.config', 'aivis-mcp', 'gain.json');
 }
 
+function clampLearnWindow(window: number): number {
+  if (!Number.isFinite(window)) {
+    return LEARN_WINDOW;
+  }
+  return Math.min(MAX_LEARN_WINDOW, Math.max(MIN_LEARN_WINDOW, Math.floor(window)));
+}
+
+export interface GainLearningSettings {
+  /** 覚え直しに使う直近の回数 */
+  readonly learnWindow: number;
+  /** これより短い発話は覚え直しに使わない（秒） */
+  readonly minLearnSeconds: number;
+}
+
+/** 候補（優先の高い順）。`source` は警告に出す名前。 */
+export interface GainSettingCandidate {
+  readonly source: string;
+  readonly value: unknown;
+}
+
+function toNumber(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    return Number(value.trim());
+  }
+  return undefined;
+}
+
+/**
+ * 候補のうち最初に値があるものを使う。範囲外・数でないときは既定に戻して `warn` で知らせる
+ * （下の優先度の候補へは落とさない。指定した人に、効いていないことを気付かせるため）。
+ */
+function pickSetting(
+  name: string,
+  candidates: readonly GainSettingCandidate[],
+  fallback: number,
+  isValid: (value: number) => boolean,
+  range: string,
+  warn: (message: string) => void,
+): number {
+  for (const candidate of candidates) {
+    if (candidate.value === undefined || candidate.value === null || candidate.value === '') {
+      continue;
+    }
+    const value = toNumber(candidate.value);
+    if (value !== undefined && Number.isFinite(value) && isValid(value)) {
+      return value;
+    }
+    const reason = value === undefined || !Number.isFinite(value) ? '数ではありません' : '範囲外です';
+    warn(`${candidate.source} の ${name}=${String(candidate.value)} は${reason}（${range}）。既定の ${fallback} を使います`);
+    return fallback;
+  }
+  return fallback;
+}
+
+/** 窓と最短秒数を、優先の高い順に並べた候補から決める。 */
+export function resolveGainLearningSettings(
+  candidates: { readonly learnWindow: readonly GainSettingCandidate[]; readonly minLearnSeconds: readonly GainSettingCandidate[] },
+  warn: (message: string) => void = message => console.error(`[aivis-mcp] ${message}`),
+): GainLearningSettings {
+  return {
+    learnWindow: pickSetting(
+      'learnWindow',
+      candidates.learnWindow,
+      LEARN_WINDOW,
+      value => Number.isInteger(value) && value >= MIN_LEARN_WINDOW && value <= MAX_LEARN_WINDOW,
+      `${MIN_LEARN_WINDOW}〜${MAX_LEARN_WINDOW} の整数`,
+      warn,
+    ),
+    minLearnSeconds: pickSetting(
+      'minLearnSeconds',
+      candidates.minLearnSeconds,
+      MIN_LEARN_SECONDS,
+      value => value >= MIN_LEARN_SECONDS_LOWER && value <= MIN_LEARN_SECONDS_UPPER,
+      `${MIN_LEARN_SECONDS_LOWER}〜${MIN_LEARN_SECONDS_UPPER} 秒`,
+      warn,
+    ),
+  };
+}
+
 function isLearnedGain(value: unknown): value is LearnedGain {
   if (typeof value !== 'object' || value === null) {
     return false;
@@ -232,7 +358,8 @@ export function loadLearnedGains(filePath = gainFilePath()): Record<string, Lear
         if (key.length <= 300 && key !== '__proto__' && isLearnedGain(entry)) {
           result[key] = {
             db: clampTableDb(entry.db),
-            samples: entry.samples.slice(-LEARN_WINDOW),
+            // 窓を後から増やしても使えるよう、指定できる上限の分まで残す
+            samples: entry.samples.slice(-MAX_LEARN_WINDOW),
             ...(typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt) ? { updatedAt: entry.updatedAt } : {}),
           };
         }
@@ -250,14 +377,116 @@ export function saveLearnedGains(entries: Readonly<Record<string, LearnedGain>>,
   writeFileAtomic(filePath, JSON.stringify(body, null, 2) + '\n', 0o644);
 }
 
-/** 1 回分の測定を表に足して保存する。 */
-export function recordMeasurement(key: string, measuredLufs: number, filePath = gainFilePath()): LearnedGain {
-  const entries = loadLearnedGains(filePath);
-  const next = learnSample(entries[key], measuredLufs);
-  const merged: Record<string, LearnedGain> = Object.assign(Object.create(null), entries);
-  merged[key] = next;
-  saveLearnedGains(merged, filePath);
-  return next;
+/** ロックを持ったままの時間がこれを超えたら、持ち主が落ちたとみなして消す。 */
+export const GAIN_LOCK_STALE_MS = 10_000;
+/** ロックが空くのを待つ上限。 */
+export const GAIN_LOCK_WAIT_MS = 5_000;
+const GAIN_LOCK_RETRY_MS = 50;
+
+/** ロックが空かなかった。 */
+export class GainLockError extends Error {}
+
+/** 表のロックの置き場（シンボリックリンクなら指し先の隣。指し先がまだ無くても、書く前後で変わらない）。 */
+export function gainLockPath(filePath = gainFilePath()): string {
+  return `${resolveLinkTarget(filePath)}.lock`;
+}
+
+/** 古いロックを、stat したときと同じ持ち主のままなら退けて消す。消せたら true。 */
+function removeStaleLock(lockPath: string, staleMs: number): boolean {
+  let owner: string;
+  try {
+    owner = fs.readFileSync(lockPath, 'utf8');
+    if (Date.now() - fs.statSync(lockPath).mtimeMs <= staleMs) {
+      return false;
+    }
+  } catch {
+    // 調べている間に消えた。取り直せばよい
+    return true;
+  }
+  // rename で退けてから中身を確かめる。退けたのが別の持ち主の新しいロックだったら、元に戻す
+  const aside = `${lockPath}.stale.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+  try {
+    fs.renameSync(lockPath, aside);
+  } catch {
+    return true;
+  }
+  try {
+    if (fs.readFileSync(aside, 'utf8') !== owner) {
+      try {
+        // 誰かが先に取り直していなければ戻す（link は置き場が空いているときだけ成功する）
+        fs.linkSync(aside, lockPath);
+      } catch {
+        // 置き場が埋まっているなら、そちらが今の持ち主
+      }
+      return false;
+    }
+    return true;
+  } finally {
+    fs.rmSync(aside, { force: true });
+  }
+}
+
+/**
+ * 表を読んで書き戻す間、`gain.json.lock` を排他で作って持つ（worker の覚え直しと `--import-gains` が
+ * 互いの書き込みを消さないように）。持ち主が {@link GAIN_LOCK_STALE_MS} を超えて残したロックは消して取り直す。
+ */
+export async function withGainFileLock<T>(
+  filePath: string,
+  body: () => T | Promise<T>,
+  options: { readonly staleMs?: number; readonly waitMs?: number } = {},
+): Promise<T> {
+  const staleMs = options.staleMs ?? GAIN_LOCK_STALE_MS;
+  const waitMs = options.waitMs ?? GAIN_LOCK_WAIT_MS;
+  const lockPath = gainLockPath(filePath);
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx', 0o644);
+      try {
+        fs.writeSync(fd, token, null, 'utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw error;
+      }
+    }
+    if (removeStaleLock(lockPath, staleMs)) {
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new GainLockError(`音量の表のロック（${lockPath}）が空きません。ほかのプロセスが書いています`);
+    }
+    await new Promise(resolve => setTimeout(resolve, GAIN_LOCK_RETRY_MS));
+  }
+  try {
+    return await body();
+  } finally {
+    try {
+      // 古いとみなされて別のプロセスに取り直されていたら、そのロックは消さない
+      if (fs.readFileSync(lockPath, 'utf8') === token) {
+        fs.rmSync(lockPath, { force: true });
+      }
+    } catch {
+      // もう無い
+    }
+  }
+}
+
+/** 1 回分の測定を表に足して保存する（表のロックを持って読み書きする）。 */
+export async function recordMeasurement(key: string, measuredLufs: number, filePath = gainFilePath(), window = LEARN_WINDOW): Promise<LearnedGain> {
+  return withGainFileLock(filePath, () => {
+    const entries = loadLearnedGains(filePath);
+    const next = learnSample(entries[key], measuredLufs, Date.now(), window);
+    const merged: Record<string, LearnedGain> = Object.assign(Object.create(null), entries);
+    merged[key] = next;
+    saveLearnedGains(merged, filePath);
+    return next;
+  });
 }
 
 /** 2.4 まで ElevenLabs に掛けていた固定の補正（`volume_db` の既定）。 */

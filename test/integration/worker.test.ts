@@ -9,11 +9,14 @@ import { PlaybackWorker } from '../../src/worker/playback-worker.js';
 import { AudioStreamWriter } from '../../src/queue/audio-stream.js';
 import { enqueueJob, enqueueLegacy, enqueueSynthesis } from '../../src/queue/enqueue.js';
 import { clearHold, setHold } from '../../src/queue/hold.js';
-import { LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, PLAY_LOCK_KEY, preludeDirsKey, WORKER_LOCK_KEY, WORKER_VERSION_KEY } from '../../src/queue/keys.js';
+import { LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, PLAY_LOCK_KEY, preludeDirsKey, WORKER_GAIN_SETTINGS_KEY, WORKER_LOCK_KEY, WORKER_VERSION_KEY } from '../../src/queue/keys.js';
 import { readStatuses } from '../../src/queue/status.js';
 import type { Job, StreamJob } from '../../src/queue/jobs.js';
 import { setMute } from '../../src/services/mute-service.js';
 import { loadLearnedGains } from '../../src/audio/gain-table.js';
+import { readWorkerGainSettings } from '../../src/queue/worker-gain-settings.js';
+import { AivisSpeechService } from '../../src/services/aivis-speech-service.js';
+import type { AppConfig } from '../../src/config.js';
 import { connect, describeWithRedis, startTestRedis, waitFor, type TestRedis } from '../helpers/redis.js';
 import { FakeBackend } from '../helpers/fake-backend.js';
 import { mp3Frames, testConfig } from '../helpers/fixtures.js';
@@ -55,11 +58,11 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function startWorker(backend: FakeBackend, options: { version?: string; synthesize?: () => Promise<NodeJS.ReadableStream>; measure?: () => Promise<{ integratedLufs: number; durationSeconds: number }> } = {}): PlaybackWorker {
+  function startWorker(backend: FakeBackend, options: { version?: string; synthesize?: () => Promise<NodeJS.ReadableStream>; measure?: () => Promise<{ integratedLufs: number; durationSeconds: number }>; loadConfig?: () => AppConfig } = {}): PlaybackWorker {
     const worker = new PlaybackWorker({
       redisUrl: redis.url,
       version: options.version ?? '2.5.0',
-      loadConfig: () => testConfig(redis.url),
+      loadConfig: options.loadConfig ?? (() => testConfig(redis.url)),
       backend,
       synthesize: options.synthesize ?? (async () => Readable.from([mp3Frames(20)])),
       measure: options.measure,
@@ -213,16 +216,53 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
   test('エージェントの声は合成しながら Stream に流して鳴らし、覚え直す', async () => {
     const backend = new FakeBackend({ canMeasure: true });
     const worker = startWorker(backend, {
-      synthesize: async () => Readable.from([mp3Frames(30), mp3Frames(40)]),
-      measure: async () => ({ integratedLufs: -25, durationSeconds: 1.9 }),
+      synthesize: async () => Readable.from([mp3Frames(60), mp3Frames(60)]),
+      measure: async () => ({ integratedLufs: -25, durationSeconds: 3.1 }),
     });
     const job = await enqueueSynthesis(client, { text: 'こんにちは', provider: 'aivis', model_uuid: 'model-b' });
     expect(await finalStatus(job.id)).toEqual({ status: 'done' });
-    expect(backend.voices[0].bytes.length).toBe(417 * 70);
+    expect(backend.voices[0].bytes.length).toBe(417 * 120);
     await worker.flushMeasurements();
     expect({ ...loadLearnedGains(gainFile) }).toEqual({ 'aivis:model-b:default': { db: 5, samples: [5], updatedAt: expect.any(Number) } });
     // 鳴らし終えた Stream は消す
     expect(await client.exists(`aivis-mcp:audio:${job.id}`)).toBe(0);
+  });
+
+  test('窓と最短秒数は発話ごとに設定を読み直して使う', async () => {
+    const backend = new FakeBackend({ canMeasure: true });
+    let current: Partial<AppConfig> = { gainMinLearnSeconds: 2.5, gainLearnWindow: 9 };
+    let lufs = -25;
+    const worker = startWorker(backend, {
+      synthesize: async () => Readable.from([mp3Frames(80)]),
+      measure: async () => ({ integratedLufs: lufs, durationSeconds: 2.1 }),
+      loadConfig: () => ({ ...testConfig(redis.url), ...current }),
+    });
+    // 2.1 秒は既定の 2.5 秒より短いので覚えない
+    const first = await enqueueSynthesis(client, { text: '一つ目', provider: 'aivis', model_uuid: 'model-c' });
+    expect(await finalStatus(first.id)).toEqual({ status: 'done' });
+    // worker が実際に使っている値を、lock と同じ寿命で Redis に置く（tts-get-settings が見る）
+    expect(await readWorkerGainSettings(client)).toEqual({ learnWindow: 9, minLearnSeconds: 2.5, version: '2.5.0' });
+    expect(await client.pTTL(WORKER_GAIN_SETTINGS_KEY)).toBeGreaterThan(0);
+    const speech = new AivisSpeechService(testConfig(redis.url));
+    expect(await speech.workerGainSettings()).toEqual({ learnWindow: 9, minLearnSeconds: 2.5, version: '2.5.0' });
+    const unreachable = new AivisSpeechService(testConfig('redis://127.0.0.1:9'));
+    expect(await unreachable.workerGainSettings()).toBeUndefined();
+    // 打ち切った後に繋がった接続も、決着したら閉じる
+    const countClients = async () => String(await client.sendCommand(['CLIENT', 'LIST'])).trim().split('\n').length;
+    const before = await countClients();
+    await speech.workerGainSettings(0);
+    await waitFor(async () => (await countClients()) === before ? true : undefined);
+    await worker.flushMeasurements();
+    expect({ ...loadLearnedGains(gainFile) }).toEqual({});
+    // 設定を 2 秒・窓 2 に変えると、起こし直さずに次の発話から効く（測定は残し、中央値は直近 2 回から）
+    current = { gainMinLearnSeconds: 2, gainLearnWindow: 2 };
+    for (const value of [-25, -23, -21]) {
+      lufs = value;
+      const job = await enqueueSynthesis(client, { text: '次', provider: 'aivis', model_uuid: 'model-c' });
+      expect(await finalStatus(job.id)).toEqual({ status: 'done' });
+      await worker.flushMeasurements();
+    }
+    expect({ ...loadLearnedGains(gainFile) }).toEqual({ 'aivis:model-c:default': { db: 2, samples: [5, 3, 1], updatedAt: expect.any(Number) } });
   });
 
   test('感情タグ入りの発話は覚え直しに使わない', async () => {

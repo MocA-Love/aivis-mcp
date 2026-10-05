@@ -1,7 +1,7 @@
 import { parseArgs } from 'node:util';
 import { createRequire } from 'module';
 import { loadSettingsWithMigration, isTtsProvider, type TtsProvider } from './settings.js';
-import { legacyElevenLabsVolumeToOffset } from './audio/gain-table.js';
+import { legacyElevenLabsVolumeToOffset, resolveGainLearningSettings } from './audio/gain-table.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -33,6 +33,10 @@ export interface AppConfig {
   elevenLabsVolumeOffsetDb: number;
   /** すべての声に足す上乗せ（dB） */
   volumeOffsetDb: number;
+  /** 音量の覚え直しに使う直近の回数 */
+  gainLearnWindow: number;
+  /** これより短い発話は音量の覚え直しに使わない（秒） */
+  gainMinLearnSeconds: number;
   redisUrl: string;
   debug: boolean;
   queueKey: string;
@@ -61,6 +65,10 @@ export const cliOptions = {
   'play-audio':          { type: 'boolean' as const, default: false },
   'gain-key':            { type: 'string' as const },
   'restore-legacy-queue': { type: 'boolean' as const, default: false },
+  'export-gains':        { type: 'string' as const },
+  'import-gains':        { type: 'string' as const },
+  voice:                 { type: 'string' as const, multiple: true as const },
+  overwrite:             { type: 'boolean' as const, default: false },
   ingest:                { type: 'boolean' as const, default: false },
   'prelude-dir':         { type: 'string' as const, multiple: true as const },
   provider:              { type: 'string' as const },
@@ -118,6 +126,17 @@ function resolveProvider(cliVal: ArgValue, settingsVal: TtsProvider | undefined)
   return settingsVal ?? 'aivis';
 }
 
+/** 同じ警告を発話ごとに繰り返さない（worker は発話ごとに設定を読み直すため）。 */
+const warnedGainSettings = new Set<string>();
+
+function warnGainSettingOnce(message: string): void {
+  if (warnedGainSettings.has(message)) {
+    return;
+  }
+  warnedGainSettings.add(message);
+  console.error(`[aivis-mcp] ${message}`);
+}
+
 /**
  * 設定の解決順は CLI引数 > 環境変数 > ~/.config/aivis-mcp/config.json > デフォルト。
  * config.json はMCPツールから書き換わるので、発話ごとに呼び直して最新値を使う。
@@ -125,6 +144,17 @@ function resolveProvider(cliVal: ArgValue, settingsVal: TtsProvider | undefined)
 export function resolveConfig(values: Record<string, ArgValue>): AppConfig {
   const settings = loadSettingsWithMigration();
   const legacyEnvVolume = optNumber(undefined, 'ELEVENLABS_VOLUME_DB');
+  // 覚え直しは共有の worker（引数無しで起こす）が行うので、CLI 引数は設けず 環境変数 > config.json > 既定
+  const gainLearning = resolveGainLearningSettings({
+    learnWindow: [
+      { source: 'AIVIS_GAIN_LEARN_WINDOW', value: process.env.AIVIS_GAIN_LEARN_WINDOW },
+      { source: 'config.json', value: settings.gain?.learnWindow },
+    ],
+    minLearnSeconds: [
+      { source: 'AIVIS_GAIN_MIN_LEARN_SECONDS', value: process.env.AIVIS_GAIN_MIN_LEARN_SECONDS },
+      { source: 'config.json', value: settings.gain?.minLearnSeconds },
+    ],
+  }, warnGainSettingOnce);
   return {
     provider: resolveProvider(values.provider, settings.provider),
     apiKey:
@@ -173,6 +203,8 @@ export function resolveConfig(values: Record<string, ArgValue>): AppConfig {
       optNumber(undefined, 'AIVIS_VOLUME_OFFSET_DB')
       ?? settings.volumeOffsetDb
       ?? 0,
+    gainLearnWindow: gainLearning.learnWindow,
+    gainMinLearnSeconds: gainLearning.minLearnSeconds,
     redisUrl:
       (typeof values['redis-url'] === 'string' ? values['redis-url'] : undefined)
       ?? process.env.REDIS_URL

@@ -14,6 +14,7 @@ import { createClient, type RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
 import type { AppConfig } from '../config.js';
 import { PLAYER_KILL_GRACE_MS, type AudioBackend, type PlayResult, type VoicePlayback } from '../audio/player.js';
+import { publishWorkerGainSettings } from '../queue/worker-gain-settings.js';
 import { finalGainDb, isLearnable, loadLearnedGains, recordMeasurement, resolveGainDb } from '../audio/gain-table.js';
 import type { LoudnessResult } from '../audio/loudness.js';
 import { validatePreludePath } from '../audio/prelude.js';
@@ -278,6 +279,7 @@ export class PlaybackWorker {
       this.migrationUntil = this.now() + this.timings.legacyGraceMs;
       await this.op(drainLegacyQueue(this.command)).catch(() => undefined);
     }
+    void this.publishGainSettings();
     this.heartbeat = setInterval(() => {
       void this.refreshLock();
     }, WORKER_HEARTBEAT_MS);
@@ -443,6 +445,7 @@ export class PlaybackWorker {
       const kept = await this.op(refreshWorkerLock(this.command, this.workerId, this.deps.version));
       if (kept) {
         this.workerLockValidUntil = sentAt + WORKER_LOCK_TTL_MS;
+        void this.publishGainSettings();
       } else {
         // 新しい版の worker に引き取られた。今の発話を鳴らし切ったら終わる
         this.log('lock lost', { instance: this.workerId });
@@ -452,6 +455,20 @@ export class PlaybackWorker {
       console.error('Worker lock refresh error:', summarizeError(error));
     } finally {
       this.refreshing = false;
+    }
+  }
+
+  /** 覚え直しに使っている窓と最短秒数を、lock と同じ寿命で Redis に置く（`tts-get-settings` が見る）。 */
+  private async publishGainSettings(): Promise<void> {
+    try {
+      const config = this.deps.loadConfig();
+      await this.op(publishWorkerGainSettings(this.command, {
+        learnWindow: config.gainLearnWindow,
+        minLearnSeconds: config.gainMinLearnSeconds,
+        version: this.deps.version,
+      }));
+    } catch (error) {
+      console.error('Worker gain settings publish error:', summarizeError(error));
     }
   }
 
@@ -1574,7 +1591,11 @@ export class PlaybackWorker {
     }
     // 長さは Xing/VBRI ヘッダー、無ければ全フレームの合計で数える（可変ビットレートでも外さない）
     const estimated = estimateMp3Duration(audio);
-    if (!isLearnable({ tagged: request.tagged, durationSeconds: estimated, completed: true })) {
+    // 窓と最短秒数は発話ごとに読み直す（config.json を書き換えれば --reboot 無しで効く）
+    const config = this.deps.loadConfig();
+    const minLearnSeconds = config.gainMinLearnSeconds;
+    const learnWindow = config.gainLearnWindow;
+    if (!isLearnable({ tagged: request.tagged, durationSeconds: estimated, completed: true }, minLearnSeconds)) {
       return;
     }
     const gainKey = request.gainKey;
@@ -1583,10 +1604,10 @@ export class PlaybackWorker {
       if (result === undefined) {
         return;
       }
-      if (!isLearnable({ tagged: request.tagged, durationSeconds: result.durationSeconds ?? estimated, completed: true, measuredLufs: result.integratedLufs })) {
+      if (!isLearnable({ tagged: request.tagged, durationSeconds: result.durationSeconds ?? estimated, completed: true, measuredLufs: result.integratedLufs }, minLearnSeconds)) {
         return;
       }
-      const learned = recordMeasurement(gainKey, result.integratedLufs, this.deps.gainFile);
+      const learned = await recordMeasurement(gainKey, result.integratedLufs, this.deps.gainFile, learnWindow);
       this.log('gain learned', { gainKey, lufs: result.integratedLufs, db: learned.db });
     })().catch(error => console.error('Gain learning error:', summarizeError(error)));
     this.pendingMeasurements.add(task);
