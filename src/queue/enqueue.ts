@@ -4,7 +4,7 @@
 
 import type { RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
-import { AUDIO_STREAM_PREFIX, HIGH_QUEUE_KEY, LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, queueKeyFor, STATUS_PREFIX, statusKey } from './keys.js';
+import { audioStreamKey, HIGH_QUEUE_KEY, LEGACY_QUEUE_KEY, MIGRATED_LEGACY_QUEUE_KEY, NORMAL_QUEUE_KEY, queueKeyFor, statusKey } from './keys.js';
 import type { Job, JobPriority, SynthJob } from './jobs.js';
 import { encodeStatus, STATUS_TTL_SECONDS } from './status.js';
 
@@ -49,14 +49,18 @@ export async function withdrawJob(client: RedisClientType, priority: JobPriority
  * （worker が同時に取り出す・列へ戻すのと入れ違わない）。
  */
 const WITHDRAW_BY_ID_SCRIPT = `
+local needle = '"id":"' .. ARGV[1] .. '"'
 for _, key in ipairs({KEYS[1], KEYS[2]}) do
   local items = redis.call('LRANGE', key, 0, -1)
   for _, raw in ipairs(items) do
-    local ok, job = pcall(cjson.decode, raw)
-    if ok and type(job) == 'table' and job['v'] == 2 and job['id'] == ARGV[1] then
-      if redis.call('LREM', key, 1, raw) == 1 then
-        redis.call('DEL', ARGV[2] .. ARGV[1], ARGV[3] .. ARGV[1])
-        return 1
+    -- 大きな要素（2.4 の形の音声など）を毎回 JSON として読まないよう、ID の文字列で先に絞る
+    if string.find(raw, needle, 1, true) then
+      local ok, job = pcall(cjson.decode, raw)
+      if ok and type(job) == 'table' and job['v'] == 2 and job['id'] == ARGV[1] then
+        if redis.call('LREM', key, 1, raw) == 1 then
+          redis.call('DEL', KEYS[3], KEYS[4])
+          return 1
+        end
       end
     end
   end
@@ -70,8 +74,8 @@ return 0`;
  */
 export async function withdrawJobById(client: RedisClientType, id: string): Promise<boolean> {
   const removed = await client.eval(WITHDRAW_BY_ID_SCRIPT, {
-    keys: [HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY],
-    arguments: [id, AUDIO_STREAM_PREFIX, STATUS_PREFIX],
+    keys: [HIGH_QUEUE_KEY, NORMAL_QUEUE_KEY, audioStreamKey(id), statusKey(id)],
+    arguments: [id],
   });
   return Number(removed) === 1;
 }
@@ -104,4 +108,21 @@ export async function enqueueAudio(client: RedisClientType, payload: Record<stri
  */
 export async function enqueueLegacy(client: RedisClientType, payload: Record<string, unknown>): Promise<void> {
   await enqueueAudio(client, payload, 'legacy');
+}
+
+const RESTORE_LEGACY_SCRIPT = `
+local moved = 0
+while true do
+  local item = redis.call('RPOPLPUSH', KEYS[1], KEYS[2])
+  if not item then break end
+  moved = moved + 1
+end
+return moved`;
+
+/**
+ * `aivis-mcp:q2:legacy`（2.5.1 が 2.4 の worker から引き取ったときに移した古い列）を、古い列 `aivis-mcp:queue` へ
+ * 順を保って戻す。2.5.0 以前へ戻したとき、古い worker はこの列を読まないので使う。戻した件数を返す。
+ */
+export async function restoreLegacyQueue(client: RedisClientType): Promise<number> {
+  return Number(await client.eval(RESTORE_LEGACY_SCRIPT, { keys: [MIGRATED_LEGACY_QUEUE_KEY, LEGACY_QUEUE_KEY] }));
 }

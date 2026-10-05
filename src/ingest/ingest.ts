@@ -12,7 +12,7 @@ import { version, type AppConfig } from '../config.js';
 import { buildGainTable, loadLearnedGains, MAX_BOOST_DB, TARGET_LUFS } from '../audio/gain-table.js';
 import { validatePreludePath } from '../audio/prelude.js';
 import { MAX_UTTERANCE_MS } from '../streaming/playback-policy.js';
-import { AudioStreamWriter, MAX_STREAM_BYTES } from '../queue/audio-stream.js';
+import { AudioStreamWriter, MAX_STREAM_BYTES, STREAM_TTL_SECONDS } from '../queue/audio-stream.js';
 import { enqueueJob, isJobRegistered, withdrawJob, withdrawJobById } from '../queue/enqueue.js';
 import { anyHoldActive, clearHold, isValidHoldOwner, setHold } from '../queue/hold.js';
 import { isValidStreamId, type Job, type JobPriority, type PreludeSpec } from '../queue/jobs.js';
@@ -513,6 +513,8 @@ export class IngestSession {
           await this.failWriter(job.id);
         }
       } catch {
+        // 書き残しが詰まっている。後ろに並ばない中断の印を上限つきで直接書いてから、以後の書き込みを捨てる
+        await this.op(this.client.multi().xAdd(writer.key, '*', { a: 'redis-error' }).expire(writer.key, STREAM_TTL_SECONDS).exec(), 1000).catch(() => undefined);
         writer.discard();
         await this.failWriter(job.id);
       }
@@ -663,7 +665,10 @@ export class IngestSession {
         }
         // hold の間は数えない
         if (this.now() - job.openedAt - (this.heldAccumMs - job.heldAtOpen) > TRACK_LIMIT_MS) {
-          this.finishJob(job, 'failed', 'untracked');
+          // 積めたか分からないまま終える件は、列から外せたときだけ withdrawn を付ける（外せなければ鳴るかもしれない）
+          const withdrawn = job.registration === 'unknown'
+            && await this.op(withdrawJob(this.client, job.priority, job.raw)).catch(() => false);
+          this.finishJob(job, 'failed', 'untracked', withdrawn ? { withdrawn: true } : {});
           continue;
         }
         if (job.registration === 'unknown') {

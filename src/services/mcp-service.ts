@@ -368,6 +368,11 @@ export class MCPService {
     }
   }
 
+  /** 終わるとき。worker から頼まれている ticket に最大 2 秒答えてから閉じる。 */
+  async close(): Promise<void> {
+    await this.speechService.close();
+  }
+
   async runWorker(): Promise<void> {
     await this.speechService.runWorkerLoop();
   }

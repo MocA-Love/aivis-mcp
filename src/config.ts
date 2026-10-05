@@ -60,6 +60,7 @@ export const cliOptions = {
   worker:                { type: 'boolean' as const, default: false },
   'play-audio':          { type: 'boolean' as const, default: false },
   'gain-key':            { type: 'string' as const },
+  'restore-legacy-queue': { type: 'boolean' as const, default: false },
   ingest:                { type: 'boolean' as const, default: false },
   'prelude-dir':         { type: 'string' as const, multiple: true as const },
   provider:              { type: 'string' as const },

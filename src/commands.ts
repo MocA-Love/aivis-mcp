@@ -4,7 +4,7 @@ import { createClient, type RedisClientType } from 'redis';
 import { version, type AppConfig } from './config.js';
 import { connectRedis, ensureWorkerRunning, spawnWorker, WORKER_VERSION_KEY } from './services/redis-service.js';
 import { parseMuteDuration, setMute, clearMute, getMuteStatus } from './services/mute-service.js';
-import { enqueueAudio } from './queue/enqueue.js';
+import { enqueueAudio, restoreLegacyQueue } from './queue/enqueue.js';
 import { compareVersions } from './queue/worker-lock.js';
 import { safeGainKeyHeader } from './worker/para-code-forward.js';
 import { HIGH_QUEUE_KEY, HOLD_PREFIX, NORMAL_QUEUE_KEY } from './queue/keys.js';
@@ -323,6 +323,20 @@ export async function runPlayAudio(config: AppConfig, gainKey?: string): Promise
     }, target);
     // 積めた印。呼び出し側は終了コードではなくこれで判断する（この後に止められても積んだ事実は変わらない）
     process.stdout.write('queued\n');
+  } finally {
+    await client.disconnect().catch(() => undefined);
+  }
+}
+
+/**
+ * 2.5.1 が 2.4 の worker から lock を引き取ったときに `aivis-mcp:q2:legacy` へ移した発話を、古い列
+ * `aivis-mcp:queue` へ戻す。2.5.0 以前へ戻したとき（古い worker はこの列を読まない）に使う。
+ */
+export async function runRestoreLegacyQueue(config: AppConfig): Promise<void> {
+  const client = await connectRedis(config.redisUrl);
+  try {
+    const moved = await restoreLegacyQueue(client);
+    console.log(moved > 0 ? `${moved} 件を古い列へ戻しました` : '戻す発話はありません');
   } finally {
     await client.disconnect().catch(() => undefined);
   }

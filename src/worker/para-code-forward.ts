@@ -47,6 +47,8 @@ export interface ParaCodeForward {
 export const GAIN_KEY_HEADER = 'X-Para-Gain-Key';
 /** 感情タグ入りの発話（音量の覚え直しに使わない）であることを知らせるヘッダー。 */
 export const TAGGED_HEADER = 'X-Para-Tagged';
+/** 接続先がミュート中。Para Code は手元で鳴らさず、モバイルへだけ流す（ticket に muteAware があるときだけ付ける）。 */
+export const MUTED_HEADER = 'X-Para-Muted';
 const GAIN_KEY_PATTERN = /^[A-Za-z0-9:_.-]{1,200}$/;
 
 /** ヘッダーとして安全な鍵だけ返す（それ以外は付けない）。 */
@@ -59,6 +61,8 @@ export interface ForwardOptions {
   readonly gainKey?: string;
   /** 感情タグ入りなら `X-Para-Tagged: 1` を付ける */
   readonly tagged?: boolean;
+  /** この機械がミュート中。手元で鳴らす ticket のときだけ `X-Para-Muted: 1` を付ける */
+  readonly muted?: boolean;
   readonly maxBytes?: number;
   readonly idleTimeoutMs?: number;
   readonly totalTimeoutMs?: number;
@@ -75,11 +79,12 @@ async function defaultIsCurrentInstance(target: ParaCodeVoiceTarget): Promise<bo
   return instanceId === target.instanceId;
 }
 
-function extraHeaders(options: ForwardOptions): Record<string, string> {
+function extraHeaders(options: ForwardOptions, target: ParaCodeVoiceTarget): Record<string, string> {
   const gainKey = safeGainKeyHeader(options.gainKey);
   return {
     ...(gainKey === undefined ? {} : { [GAIN_KEY_HEADER]: gainKey }),
     ...(options.tagged === true ? { [TAGGED_HEADER]: '1' } : {}),
+    ...(options.muted === true && target.localPlayback === true && target.muteAware === true ? { [MUTED_HEADER]: '1' } : {}),
   };
 }
 
@@ -258,7 +263,7 @@ class ChunkedForward extends ForwardBase {
         headers: {
           Authorization: `Bearer ${this.target.ticket}`,
           'Content-Type': 'audio/mpeg',
-          ...extraHeaders(this.options),
+          ...extraHeaders(this.options, this.target),
           'Transfer-Encoding': 'chunked',
         },
       });
@@ -386,7 +391,7 @@ class BufferedForward extends ForwardBase {
       headers: {
         Authorization: `Bearer ${this.target.ticket}`,
         'Content-Type': 'audio/mpeg',
-        ...extraHeaders(this.options),
+        ...extraHeaders(this.options, this.target),
         'Content-Length': audio.byteLength,
       },
     }, this.target.localPlayback === true ? 30_000 : 3_000, audio);

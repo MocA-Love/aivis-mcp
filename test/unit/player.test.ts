@@ -93,4 +93,14 @@ describe('プレイヤーの結果と止め方', () => {
     expect(mplayerVoiceArgs('/t/a.mp3', 2)).toEqual(['-really-quiet', '-nolirc', '-vo', 'null', '-af', 'volume=2.0:1', '/t/a.mp3']);
     expect(soxPlayVoiceArgs('/t/a.mp3', -4.5)).toEqual(['-q', '/t/a.mp3', 'gain', '-l', '-4.5']);
   });
+
+  test('[再レビュー MEDIUM 5] 一時ファイルを作れなくても例外にせず player-spawn-failed', async () => {
+    fakePlayer('afplay', 'exit 0');
+    const backend = createAudioBackend('afplay', false, local, () => path.join(binDir, 'no-such-dir', 'deeper'));
+    const playback = backend.startVoice(0);
+    await playback.write(Buffer.from([1]));
+    playback.end();
+    expect(await playback.done).toEqual({ ok: false, reason: 'player-spawn-failed' });
+  });
 });
+

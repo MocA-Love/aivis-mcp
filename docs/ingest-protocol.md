@@ -80,6 +80,7 @@ aivis-mcp --ingest --prelude-dir <着信音のフォルダ> [--prelude-dir <別�
 - 積めていた: `queued` を返します
 - 積めていなかった（確かめられた）: `{"type":"status","status":"failed","reason":"redis-error","withdrawn":true}` を返します。親は自分で鳴らしてかまいません
 - 確かめられない: `queued` も `failed` も返さずに追い続け、Redis が戻ったら確かめ直して上のどちらかを返します。その間に `withdraw` を送ることもできます。15 分（hold の間は数えない）確かめられなければ `untracked` です
+- 確かめられない間にその件が終わったとき（`too-large`・書き込みの失敗・`untracked`）は、aivis-mcp が列から外せた（LREM が 1）ときだけ `withdrawn: true` を付けます。外せなかった・確かめられなかったときは `withdrawn` の無い `failed` を返します。この件は列に残っていて後で worker が鳴らすかもしれないので、親は自分で鳴らす前に `withdraw` を送り、`removed: true` を受け取ってから鳴らしてください
 
 ### 音声の枠（型 `0x02`）
 
@@ -219,7 +220,7 @@ worker は、どこで終えても（Redis の読み取りの失敗・中断を�
 | `aivis-mcp:hold-since` / `aivis-mcp:hold-log` | 続いている hold の始まりと、終わった hold の区間（ジョブの期限から hold の時間を除く） |
 | `aivis-mcp:worker-lock` / `aivis-mcp:worker-version` | worker の lock と版 |
 | `aivis-mcp:play-lock` | 再生の lock（期限 10 秒、鳴らしている間 3 秒ごとに延長。worker が止められたらすぐ消す） |
-| `aivis-mcp:voice-ticket:req:<requester>` / `aivis-mcp:voice-ticket:res:<jobId>` | pub/sub のチャネル。worker が鳴らし始めるときに、積んだ MCP サーバーへ Para Code の ticket を頼む（下記）。Redis には残らない |
+| `aivis-mcp:voice-ticket:req:<requester>` / `aivis-mcp:voice-ticket:res:<jobId>` | pub/sub のチャネル。worker が鳴らし始めるときに、積んだ MCP サーバーへ Para Code の ticket を頼む（下記）。Redis には残らない（控えの ticket はジョブの中に載る） |
 
 ## 接続先から Para Code への送り出し（参考）
 
@@ -229,6 +230,7 @@ SSH 先などの aivis-mcp が Para Code の `/paradis-mcp/mobile-voice` へ合�
 
 - `X-Para-Gain-Key: <provider>:<voice>:<model>`: 値は音量の表の鍵と同じ形（Aivis は `aivis:<model_uuid>:default`、ElevenLabs は `elevenlabs:<voice_id>:<model_id>`）で、英数・`:`・`_`・`-`・`.` だけの 200 文字までのときだけ付けます（それ以外の文字を含む鍵は付けません）
 - `X-Para-Tagged: 1`: 感情タグ（`[whispers]` など）入りの発話のときだけ付けます。音量の覚え直しに使わない印です
+- `X-Para-Muted: 1`: この機械がミュート中で、ticket が `localPlayback: true` かつ `muteAware: true` のときだけ付けます（下の「ミュート中」）
 - どちらも `stream-v1` の chunked 送信でも、旧方式（Content-Length 付き）でも付けます
 - `Authorization: Bearer <ticket>` の ticket は、ヘッダーに書ける文字（英数と `.` `_` `~` `+` `/` `=` `-`、200 文字まで）のときだけ使います。それ以外の ticket は無いものとして扱います
 
@@ -247,15 +249,28 @@ Para Code は、本文を受け取り終えたら、手元で鳴らせたかを�
 
 ### ticket を取る時（Q208 A）
 
-- MCP サーバー（ペインごとに常駐する）から積んだ発話は、積む時ではなく、worker が鳴らし始める（転送を始める）時に ticket を取ります。worker は `aivis-mcp:voice-ticket:req:<requester>` に `{"id":<jobId>}` を publish し、MCP サーバーがその場で Para Code の `/paradis-mcp/mobile-voice-ticket` から ticket を取って `aivis-mcp:voice-ticket:res:<jobId>` に返します。worker は 1.5 秒まで待ち、返事が無ければ ticket なしとして扱います
-- ペインのトークンは Redis に出しません。返すのは 1 回限り・10 分の ticket だけで、pub/sub なので Redis には残りません。MCP サーバーは自分が積んだジョブの ID にだけ、1 回だけ答えます
-- 一回きりの `aivis` コマンドと `aivis-mcp "<文>"` は常駐しないので、従来どおり積む時に取ります（ジョブの中身 `_paraCodeVoiceTarget` に載ります）
-- ticket が取れなかったとき、SSH 先のペイン（ポートファイルに `pid` と `instanceId` が無い）で Para Code が手元の PC で鳴らす前提の発話は、接続先では鳴らさずに `failed`（`ticket-unavailable`）で終えます。手元のペインの発話は、送らずに手元で鳴らします
-- Para Code 側の ticket の発行・取込口は変わりません（発行が鳴らし始める時になるだけです）
+- MCP サーバー（ペインごとに常駐する）から積んだ発話は、worker が鳴らし始める（転送を始める）時に ticket を頼みます。worker は `aivis-mcp:voice-ticket:req:<requester>` に `{"id":<jobId>}` を publish し、MCP サーバーが `aivis-mcp:voice-ticket:res:<jobId>` に返します。worker が待つのは、手元のペインで 1.5 秒、SSH 先のペイン（ジョブの `_voiceRequester.remote`）で 3.5 秒です（MCP サーバーが戻り経路越しに health と ticket を取る分）。MCP サーバーは戻り経路の先の instanceId を覚え、2 回目からは health を取りません
+- MCP サーバーは積む時にも 1 枚取り、控えとしてジョブ（`_paraCodeVoiceTarget`）に載せます。MCP サーバーが先に終わっても鳴らせるようにするためです。頼まれたときは、その控えがまだ 60 秒以上使えればそれを返し、新しくは取りません（使われない ticket でペインごとの上限を埋めないため）。60 秒を切っていれば新しく取ります
+- worker は、返事が無い（購読している MCP サーバーがいない・時間切れ）・取れなかったときは、控えがまだ使えればそれを使います
+- 返事が worker に届かなかった新しい ticket（時間切れの後に取れた）は捨てず、MCP サーバーが次の依頼か次の控えに回します
+- MCP サーバーは終わるとき、答えている途中の依頼に最大 2 秒答えてから終わります
+- ペインのトークンは Redis に出しません。Redis に載るのは 1 回限り・10 分の ticket（控え）だけです。pub/sub の返事は Redis に残りません
+- 依頼の中身はジョブ ID だけで、Redis に触れる誰でも publish できます。MCP サーバーは自分が積んだ ID にだけ 1 回答えるので、偽の依頼で得られるのはその件のための ticket 1 枚（控えと同じもの、または新しい 1 枚）です。同じ Redis を他人と共有していれば、返事のチャネルを購読して ticket を読めます（列の中の控えも同じく読めます。2.5.0 までと同じ前提で、別件として記録します）
+- 一回きりの `aivis` コマンドと `aivis-mcp "<文>"` は常駐しないので、積む時に取った ticket だけを使います
+- ticket が控えも含めて取れなかったとき、SSH 先のペイン（ポートファイルに `pid` と `instanceId` が無い）で Para Code が手元の PC で鳴らす前提の発話は、接続先では鳴らさずに `failed`（`ticket-unavailable`）で終えます。手元のペインの発話は、送らずに手元で鳴らします
+- Para Code 側の ticket の発行・取込口は変わりません
 
 ### ミュート中（Q209 B）
 
-`aivis --mute` の間も、Para Code から起動されたエージェントの声は合成して Para Code へ送ります（モバイルへ届けるため）。この機械のスピーカーでは鳴らしません。SSH 先のペインで ticket が `localPlayback` のときは Para Code が手元の PC で鳴らす前提なので、Para Code 側でミュートを見て鳴らすかを決めてください。Para Code へ送れないとき（ticket が取れない）は、合成もしません。
+`aivis --mute` の間も、Para Code から起動されたエージェントの声は合成して Para Code へ送ります（モバイルへ届けるため）。この機械のスピーカーでは鳴らしません。
+
+- ticket が `localPlayback: true`（Para Code が手元の PC で鳴らす）のときは、ticket に `muteAware: true` があるときだけ送り、ヘッダー `X-Para-Muted: 1` を付けます。Para Code はこのヘッダーを受けたら手元では鳴らさず、モバイルへだけ流してください。`muteAware` が無い（古い Para Code）ときは、手元で鳴ってしまうので送らずに `muted` で終えます
+- `localPlayback` の無い ticket（手元のペイン、モバイルへの転送だけ）は、ヘッダーを付けずに送ります
+- Para Code へ送れないとき（ticket が取れない）は、合成もしません
+
+### hold と送り出し
+
+`stream-v1` の chunked 送信は、hold・中断・打ち切りで途中で止めます。旧方式（Content-Length 付き、`stream-v1` の無い Para Code）は、合成を受け取り終えてから 1 回で送るので、送り始めた後は hold で取り消せません（受け取る途中なら止めます）。
 
 ### `sync: true` と SSH 先
 
@@ -265,4 +280,5 @@ MCP の `aivis-speech` の `sync: true` は、この機械の worker がその�
 
 - 2.4 までの `aivis` CLI・MCP は、古い列 `aivis-mcp:queue` に RPUSH で積みます。worker は BRPOP で右から取り出すので、2.4 から積まれた発話同士は後から積んだものが先に鳴ることがあります（2.5 から積む分は LPUSH なので積んだ順）。古い列は 2.5 の列（high → normal）より後に読みます。すべて 2.5 に更新すると解消します
 - 2.5.1 の `--play-audio` は、動いている worker が 2.5 以上なら `q2:normal` に積みます（hold と優先の順が効きます）。`--gain-key <provider:voice:model>` を付けると、その鍵で音量の表を当てます。worker が 2.4 なら古い列に積みます
+- `aivis-mcp:q2:legacy` は 2.5.1 から読む列です。2.5.1 から 2.5.0 以前へ戻すと、この列に残った発話は読まれません。戻すときは、先に `aivis-mcp --restore-legacy-queue` で古い列へ戻してください（`--reboot` は Redis のキーを消すので、残った発話も消えます）
 - 2.4 の worker から lock を引き取ったとき、新しい worker は古い列の中身を `aivis-mcp:q2:legacy` へ移し、2.4 の worker が気付いて止まるまで（8 秒、2.4 の worker が再生 lock を持つ間は延ばす）古い列からは読まずに移し続けます。引き取る前に 2.4 の worker が取り出していた件は、2.4 の worker が鳴らします（再生 lock で重なりません）

@@ -451,4 +451,116 @@ describeWithRedis('worker の 2.5.1 の直し（別ポートの redis-server）'
     expect(backend.voices[0].bytes.length).toBe(417 * 120);
     expect(backend.maxPendingWrites).toBe(1);
   });
+
+  test('[再レビュー HIGH] ミュート中、手元で鳴らす ticket は muteAware のある Para Code にだけ X-Para-Muted を付けて送る', async () => {
+    await setMute(client, undefined);
+    const paraCode = await fakeParaCode((request, response, bodies) => {
+      response.writeHead(200, { 'X-Para-Local-Playback': 'accepted' });
+      collectBody(request, bodies, () => response.end());
+    });
+    const backend = new FakeBackend();
+    startWorker(backend);
+    const old = await enqueueSynthesis(client, { text: '古い Para Code', provider: 'aivis', _paraCodeVoiceTarget: sshTarget(paraCode.port) });
+    expect(await finalStatus(old.id)).toEqual({ status: 'muted' });
+    expect(paraCode.requests).toHaveLength(0);
+    const aware = await enqueueSynthesis(client, { text: '新しい Para Code', provider: 'aivis', _paraCodeVoiceTarget: sshTarget(paraCode.port, { muteAware: true }) });
+    expect(await finalStatus(aware.id)).toEqual({ status: 'muted', reason: 'forwarded' });
+    expect(paraCode.requests).toHaveLength(1);
+    expect(paraCode.requests[0].headers['x-para-muted']).toBe('1');
+    expect(backend.voices).toHaveLength(0);
+  });
+
+  test('[再レビュー MEDIUM 1] SSH 先の MCP サーバーの返事は 1.5 秒を過ぎても待つ', async () => {
+    const paraCode = await fakeParaCode((request, response, bodies) => {
+      response.writeHead(200, { 'X-Para-Local-Playback': 'accepted' });
+      collectBody(request, bodies, () => response.end());
+    });
+    const subscriber = await connect(redis.url);
+    const responder = new VoiceTicketResponder(subscriber, client, uuidv4(), async () => {
+      await new Promise(resolve => setTimeout(resolve, 2200));
+      return sshTarget(paraCode.port);
+    }, () => true);
+    await responder.start();
+    cleanups.push(() => responder.stop());
+    const jobId = uuidv4();
+    const requester = responder.register(jobId);
+    expect(requester.remote).toBe(true);
+    await enqueueSynthesis(client, { text: 'リモート', provider: 'aivis', _voiceRequester: requester }, 'normal', jobId);
+    const backend = new FakeBackend();
+    startWorker(backend);
+    expect(await finalStatus(jobId)).toEqual({ status: 'done', reason: 'played-by-para-code' });
+    expect(backend.voices).toHaveLength(0);
+  });
+
+  test('[再レビュー MEDIUM 2] MCP サーバーが終わっていても（receivers 0）、積む時の控えの ticket で送る', async () => {
+    const paraCode = await fakeParaCode((request, response, bodies) => {
+      response.writeHead(200, { 'X-Para-Local-Playback': 'accepted' });
+      collectBody(request, bodies, () => response.end());
+    });
+    const backend = new FakeBackend();
+    startWorker(backend);
+    const jobId = uuidv4();
+    await enqueueSynthesis(client, {
+      text: 'リモート', provider: 'aivis',
+      _voiceRequester: { id: uuidv4(), localPlayback: true, remote: true },
+      _paraCodeVoiceTarget: sshTarget(paraCode.port),
+    }, 'normal', jobId);
+    expect(await finalStatus(jobId)).toEqual({ status: 'done', reason: 'played-by-para-code' });
+    expect(paraCode.bodies).toHaveLength(1);
+    expect(paraCode.requests[0].headers.authorization).toBe('Bearer ticket');
+  });
+
+  test('[再レビュー MEDIUM 1・2] MCP サーバーは控えが使えれば新しく取らず、待ちきれなかった ticket は次に回し、終わるときは答えてから閉じる', async () => {
+    const subscriber = await connect(redis.url);
+    let captured = 0;
+    let delayMs = 0;
+    const responder = new VoiceTicketResponder(subscriber, client, uuidv4(), async () => {
+      captured++;
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      return sshTarget(1, { ticket: `fresh-${captured}`, expiresAt: Date.now() + 600_000 });
+    }, () => true);
+    await responder.start();
+    const probe = await connect(redis.url);
+    try {
+      // 控えがまだ使える: 控えを返し、新しく取らない
+      const withFallback = uuidv4();
+      const requester = responder.register(withFallback, sshTarget(1, { ticket: 'fallback', expiresAt: Date.now() + 600_000 }));
+      expect((await requestVoiceTicket(client, probe, requester, withFallback, 1000))?.ticket).toBe('fallback');
+      expect(captured).toBe(0);
+      // worker が待ちきれなかった ticket は、次の依頼に回す
+      delayMs = 600;
+      const late = uuidv4();
+      responder.register(late);
+      expect(await requestVoiceTicket(client, probe, requester, late, 200)).toBeUndefined();
+      await new Promise(resolve => setTimeout(resolve, 800));
+      const next = uuidv4();
+      responder.register(next);
+      expect((await requestVoiceTicket(client, probe, requester, next, 1000))?.ticket).toBe('fresh-1');
+      expect(captured).toBe(1);
+      // 終わるとき、答えている途中の依頼には答えてから閉じる
+      const closing = uuidv4();
+      responder.register(closing);
+      const pending = requestVoiceTicket(client, probe, requester, closing, 2000);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await responder.stop(2000);
+      expect((await pending)?.ticket).toBe('fresh-2');
+    } finally {
+      await probe.disconnect();
+      await responder.stop();
+    }
+  });
+
+  test('[再レビュー MEDIUM 4] 止められたら、プレイヤーが終わるのを待ってから再生 lock を手放す', async () => {
+    const backend = new FakeBackend({ voiceMs: 30_000, killDelayMs: 500 });
+    const worker = startWorker(backend);
+    await streamJob('sd');
+    await waitFor(() => backend.events.some(event => event.kind === 'voice-start') ? true : undefined);
+    await worker.shutdown();
+    const releasedAt = Date.now();
+    expect(await client.exists(PLAY_LOCK_KEY)).toBe(0);
+    const voiceEnd = backend.events.find(event => event.kind === 'voice-end');
+    expect(voiceEnd).toBeDefined();
+    expect(voiceEnd!.at).toBeLessThanOrEqual(releasedAt);
+  });
 });
+

@@ -21,6 +21,8 @@ export interface FakeBackendOptions {
   voiceResult?: PlayResult;
   /** 書き込みが空くまでの時間（プレイヤーの入力が詰まっているのを真似る） */
   drainMs?: number;
+  /** 止めてから終わるまでの時間（すぐには終わらないプレイヤーを真似る） */
+  killDelayMs?: number;
 }
 
 /**
@@ -86,7 +88,13 @@ export class FakeBackend implements AudioBackend {
         }
       },
       end: () => { timer = setTimeout(() => finish(false), this.options.voiceMs ?? 20); },
-      kill: () => finish(true),
+      kill: () => {
+        if (this.options.killDelayMs === undefined) {
+          finish(true);
+        } else {
+          setTimeout(() => finish(true), this.options.killDelayMs);
+        }
+      },
       done,
     };
   }

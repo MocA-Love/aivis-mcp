@@ -39,7 +39,7 @@ import {
 } from '../queue/worker-lock.js';
 import { isMuted } from '../services/mute-service.js';
 import { isParaCodeVoiceTarget, type ParaCodeVoiceTarget } from '../services/para-code-voice.js';
-import { isVoiceRequester, requestVoiceTicket, VOICE_TICKET_WAIT_MS } from '../services/voice-ticket.js';
+import { isVoiceRequester, requestVoiceTicket, VOICE_TICKET_REMOTE_WAIT_MS, VOICE_TICKET_WAIT_MS } from '../services/voice-ticket.js';
 import { FORWARD_IDLE_TIMEOUT_MS, startParaCodeForward, type ParaCodeForward } from './para-code-forward.js';
 
 /** テストで短くできる時間の決まり。 */
@@ -54,8 +54,10 @@ export interface WorkerTimings {
   readonly opTimeoutMs: number;
   /** 2.4 の worker から引き取った後、古い列を 2.4 が読めない場所へ移し続ける間 */
   readonly legacyGraceMs: number;
-  /** 鳴らし始めるときに ticket の返事を待つ上限 */
+  /** 鳴らし始めるときに ticket の返事を待つ上限（手元のペイン） */
   readonly voiceTicketWaitMs: number;
+  /** 同じ（SSH 先のペイン） */
+  readonly voiceTicketRemoteWaitMs: number;
   /** テスト用: 1 件の全体の上限（既定はジョブの種類ごとに 1 発話の上限から決める） */
   readonly jobHardLimitMs?: number;
 }
@@ -67,6 +69,7 @@ export const DEFAULT_WORKER_TIMINGS: WorkerTimings = {
   opTimeoutMs: REDIS_OP_TIMEOUT_MS,
   legacyGraceMs: LEGACY_WORKER_GRACE_MS,
   voiceTicketWaitMs: VOICE_TICKET_WAIT_MS,
+  voiceTicketRemoteWaitMs: VOICE_TICKET_REMOTE_WAIT_MS,
 };
 
 export interface WorkerDependencies {
@@ -363,6 +366,11 @@ export class PlaybackWorker {
       }
     }
     this.wakeHoldWaiters();
+    // 鳴らしている件が、プレイヤーを止めて終わるのを待ってから lock を手放す（重ならないように）
+    const handling = this.handling;
+    if (handling !== undefined) {
+      await settleWithin(handling, PLAYER_STOP_WAIT_MS + 1_000);
+    }
     if (this.command.isOpen) {
       await this.op(releasePlayLock(this.command, this.workerId), 1000).catch(() => undefined);
       await this.op(releaseWorkerLock(this.command, this.workerId), 1000).catch(() => undefined);
@@ -525,10 +533,31 @@ export class PlaybackWorker {
     return this.op(isMuted(this.command));
   }
 
+  /** いま扱っている 1 件の処理（止められたとき、終わるのを待ってから lock を手放す）。 */
+  private handling: Promise<void> | undefined;
+
   private async handle(queueKey: string, raw: string): Promise<void> {
+    const task = this.handleOne(queueKey, raw);
+    this.handling = task;
+    try {
+      await task;
+    } finally {
+      if (this.handling === task) {
+        this.handling = undefined;
+      }
+    }
+  }
+
+  private async handleOne(queueKey: string, raw: string): Promise<void> {
     // hold などで取り出しを諦めたら、取り出した位置（右端）へそのまま戻す
     const requeue = async (id?: string) => {
-      await this.op(this.command.rPush(queueKey, raw));
+      try {
+        await this.op(this.command.rPush(queueKey, raw));
+      } catch (error) {
+        // 時間切れでも、要求は遅れて通るかもしれない（通ればその件は後で鳴る）。分かるように残す
+        console.error(`列へ戻せたか分かりません（${id ?? '2.4 の形のジョブ'}）。遅れて戻った場合は後で鳴ります:`, summarizeError(error));
+        throw error;
+      }
       if (id !== undefined) {
         await this.setStatus(id, 'requeued', undefined, this.workerId);
       }
@@ -758,18 +787,26 @@ export class PlaybackWorker {
       let value: Promise<T> | undefined;
       return () => (value ??= make());
     };
-    if (isParaCodeVoiceTarget(params._paraCodeVoiceTarget)) {
-      // 一回きりの aivis コマンドが積む時に取った ticket
-      const target = params._paraCodeVoiceTarget;
-      return { obtain: memo(async () => (target.expiresAt > Date.now() ? target : undefined)), expectLocalPlayback: target.localPlayback === true };
-    }
+    const fallback = isParaCodeVoiceTarget(params._paraCodeVoiceTarget) ? params._paraCodeVoiceTarget : undefined;
     const requester = params._voiceRequester;
     if (isVoiceRequester(requester)) {
-      // 積んだ MCP サーバーに、鳴らし始めるいま ticket を頼む
+      // 積んだ MCP サーバーに、鳴らし始めるいま ticket を頼む。返事が無ければ（MCP サーバーが終わっている・
+      // 時間切れ）、積む時に取った控えがまだ使えればそれを使う
+      const waitMs = requester.remote === true ? this.timings.voiceTicketRemoteWaitMs : this.timings.voiceTicketWaitMs;
       return {
-        obtain: memo(() => requestVoiceTicket(this.command, this.subscriber, requester, job.id, this.timings.voiceTicketWaitMs)),
-        expectLocalPlayback: requester.localPlayback,
+        obtain: memo(async () => {
+          const fresh = await requestVoiceTicket(this.command, this.subscriber, requester, job.id, waitMs);
+          if (fresh !== undefined) {
+            return fresh;
+          }
+          return fallback !== undefined && fallback.expiresAt > Date.now() ? fallback : undefined;
+        }),
+        expectLocalPlayback: requester.localPlayback || fallback?.localPlayback === true,
       };
+    }
+    if (fallback !== undefined) {
+      // 一回きりの aivis コマンドが積む時に取った ticket
+      return { obtain: memo(async () => (fallback.expiresAt > Date.now() ? fallback : undefined)), expectLocalPlayback: fallback.localPlayback === true };
     }
     return undefined;
   }
@@ -1211,7 +1248,12 @@ export class PlaybackWorker {
     if (target.value === undefined) {
       return { status: 'muted' };
     }
-    const forward = startParaCodeForward(target.value, { gainKey: options.gainKey, tagged: options.tagged });
+    if (target.value.localPlayback === true && target.value.muteAware !== true) {
+      // 手元の PC で鳴らす ticket で、Para Code がミュートの印を解さない。送ると手元で鳴ってしまうので送らない
+      return { status: 'muted' };
+    }
+    // 手元で鳴らす ticket なら `X-Para-Muted: 1` を付ける（Para Code は手元で鳴らさず、モバイルへだけ流す）
+    const forward = startParaCodeForward(target.value, { gainKey: options.gainKey, tagged: options.tagged, muted: true });
     const synthesis = this.runSynthesis(config, params, ctx, undefined, forward);
     ctx.kills.add(synthesis.stop);
     try {

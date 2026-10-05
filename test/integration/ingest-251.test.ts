@@ -222,4 +222,35 @@ describeWithRedis('--ingest の 2.5.1 の直し（別ポートの redis-server�
     expect(own.messages.filter(message => message.status === 'failed').map(message => [message.id, message.reason])).toEqual([['moved', 'lost'], ['still', 'lost']]);
     expect(await client.lLen(HIGH_QUEUE_KEY)).toBe(0);
   });
+
+  test('[再レビュー MEDIUM 3] 積めたか分からない件の終わりは、列から外せたときだけ withdrawn を付ける', async () => {
+    const proxy = await proxied();
+    let clock = Date.now();
+    const own = await session({ url: proxy.url, opTimeoutMs: 300, now: () => clock });
+    const open = (id: string) => own.input.write(encodeControl({ type: 'open', id, kind: 'sound', prelude: { path: path.join(tempDir, 'chime.wav'), volume: 1 } }));
+    proxy.holdResponses();
+    open('u1');
+    await waitFor(() => own.statusesOf('u1').includes('accepted') ? true : undefined);
+    await new Promise(resolve => setTimeout(resolve, 800));
+    // 確かめられないまま追跡の上限を越える。列から外せない（Redis が答えない）ので withdrawn は付けない
+    clock += 16 * 60_000;
+    await own.ingest.pollStatuses();
+    const unknownEnd = await waitFor(() => own.messages.find(message => message.id === 'u1' && message.status === 'failed'), 5000);
+    expect(unknownEnd).toMatchObject({ reason: 'untracked' });
+    expect(unknownEnd.withdrawn).toBeUndefined();
+    proxy.release();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    // 同じ状況でも、列から外せたら withdrawn を付ける
+    proxy.holdResponses();
+    open('u2');
+    await waitFor(() => own.statusesOf('u2').includes('accepted') ? true : undefined);
+    await new Promise(resolve => setTimeout(resolve, 800));
+    // 同じ tick で時計を進めてから返事を流す（確かめ直しより先に上限の判定が走る）
+    clock += 16 * 60_000;
+    proxy.release();
+    await own.ingest.pollStatuses();
+    const removedEnd = await waitFor(() => own.messages.find(message => message.id === 'u2' && message.status === 'failed'), 5000);
+    expect(removedEnd).toMatchObject({ reason: 'untracked', withdrawn: true });
+  });
 });
+

@@ -2,8 +2,8 @@ import { createClient, type RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
 import { version, type AppConfig } from '../config.js';
 import { ensureWorkerRunning, tryStartRedis } from './redis-service.js';
-import { hasParaCodeVoiceEnv, withParaCodeVoiceTarget } from './para-code-voice.js';
-import { VoiceTicketResponder, type VoiceRequester } from './voice-ticket.js';
+import { hasParaCodeVoiceEnv, withParaCodeVoiceTarget, type ParaCodeVoiceTarget } from './para-code-voice.js';
+import { RESPONDER_CLOSE_GRACE_MS, VoiceTicketResponder, type VoiceRequester } from './voice-ticket.js';
 import { enqueueSynthesis } from '../queue/enqueue.js';
 import { PlaybackWorker } from '../worker/playback-worker.js';
 import { createAudioBackend } from '../audio/player.js';
@@ -43,10 +43,11 @@ export class AivisSpeechService {
       // 再生workerはRedis全体で1つだけなので、そのprocess.envは要求元MCPと一致しない。
       // Para Code の ticket は、worker が鳴らし始めるときにこの MCP サーバーへ頼んで取る（Q208 A）。
       // 頼まれる口を開けなかったときだけ、従来どおり積む時に取って job payload に載せる
+      // 控えとして積む時にも 1 枚取って載せる（MCP サーバーが先に終わっても鳴らせるように）
       const jobId = uuidv4();
-      const requester = await this.voiceRequesterFor(jobId);
-      const queuedParams = requester !== undefined
-        ? { ...params, _voiceRequester: requester }
+      const route = await this.voiceRouteFor(jobId);
+      const queuedParams = route !== undefined
+        ? { ...params, _voiceRequester: route.requester, ...(route.fallback === undefined ? {} : { _paraCodeVoiceTarget: route.fallback }) }
         : (hasParaCodeVoiceEnv() ? await withParaCodeVoiceTarget(params) : params);
       const job = await enqueueSynthesis(this.redisClient, queuedParams, 'normal', jobId);
       if (this.config.debug) {
@@ -57,8 +58,14 @@ export class AivisSpeechService {
     }
   }
 
-  /** Para Code から起動されていれば、ticket を頼まれる口を開けて、このジョブを覚える。 */
-  private async voiceRequesterFor(jobId: string): Promise<VoiceRequester | undefined> {
+  /** MCP サーバーが終わるとき。答えている途中の ticket の依頼に最大 2 秒答えてから閉じる。 */
+  async close(): Promise<void> {
+    await this.ticketResponder?.stop(RESPONDER_CLOSE_GRACE_MS);
+    this.ticketResponder = undefined;
+  }
+
+  /** Para Code から起動されていれば、ticket を頼まれる口を開けて、このジョブを覚える（控えの ticket も取る）。 */
+  private async voiceRouteFor(jobId: string): Promise<{ requester: VoiceRequester; fallback: ParaCodeVoiceTarget | undefined } | undefined> {
     if (!hasParaCodeVoiceEnv()) {
       return undefined;
     }
@@ -77,7 +84,12 @@ export class AivisSpeechService {
         await responder.stop();
       }
     }
-    return this.ticketResponder?.isStarted ? this.ticketResponder.register(jobId) : undefined;
+    const responder = this.ticketResponder;
+    if (!responder?.isStarted) {
+      return undefined;
+    }
+    const fallback = await responder.captureFallback();
+    return { requester: responder.register(jobId, fallback), fallback };
   }
 
   private async ensureRedisReady(): Promise<void> {

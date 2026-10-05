@@ -20,6 +20,11 @@ export interface ParaCodeVoiceTarget {
    * `X-Para-Local-Playback: accepted` で鳴らし方を決める。無ければ全部受け取ってから送る。
    */
   ingress?: string;
+  /**
+   * Para Code が `X-Para-Muted: 1` を解する（接続先がミュート中の声を、手元では鳴らさずモバイルへだけ流す）か。
+   * 無ければ、ミュート中の接続先は localPlayback の ticket で送らない。
+   */
+  muteAware?: boolean;
 }
 
 /** 手元のloopbackでの発行待ち。モバイル副経路でPC再生キューを待たせないよう短くする。 */
@@ -55,7 +60,8 @@ export function isParaCodeVoiceTarget(value: unknown): value is ParaCodeVoiceTar
     && Number.isSafeInteger(target.expiresAt)
     && target.expiresAt > Date.now()
     && (target.localPlayback === undefined || typeof target.localPlayback === 'boolean')
-    && (target.ingress === undefined || (typeof target.ingress === 'string' && target.ingress.length <= 32));
+    && (target.ingress === undefined || (typeof target.ingress === 'string' && target.ingress.length <= 32))
+    && (target.muteAware === undefined || typeof target.muteAware === 'boolean');
 }
 
 function paneToken(env: NodeJS.ProcessEnv): string | undefined {
@@ -115,7 +121,13 @@ export function isRemoteParaCodePane(env: NodeJS.ProcessEnv = process.env): bool
  * 再生workerはRedis全体で1つだけなので、そのprocess.envは要求元と一致しない。
  * Para Code から起動されていない場合は undefined（PC再生だけが続く）。
  */
-export async function captureParaCodeVoiceTarget(env: NodeJS.ProcessEnv = process.env): Promise<ParaCodeVoiceTarget | undefined> {
+/** 戻り経路の先の instanceId を覚えておく入れ物（常駐する MCP サーバーが、毎回 health を取らないために持つ）。 */
+export interface InstanceIdCache {
+  port?: number;
+  instanceId?: string;
+}
+
+export async function captureParaCodeVoiceTarget(env: NodeJS.ProcessEnv = process.env, cache?: InstanceIdCache): Promise<ParaCodeVoiceTarget | undefined> {
   // ターミナルのペインで動く場合はペイントークン、拡張機能ホスト経由（Codex等）で動く場合は
   // 音声取込専用トークンが渡ってくる。どちらも Para Code のloopbackだけが受理する。
   const token = paneToken(env);
@@ -132,9 +144,21 @@ export async function captureParaCodeVoiceTarget(env: NodeJS.ProcessEnv = proces
     // 戻り経路はSSHを往復するので、手元より長めに待つ
     let timeoutMs = LOCAL_TIMEOUT_MS;
     if (record.remote) {
-      // 生存確認を経路の応答で代え、instanceId は health から取る
       timeoutMs = REMOTE_TIMEOUT_MS;
+      // 覚えている instanceId があれば health を飛ばす（ticket の応答の instanceId で確かめる）
+      if (cache?.port === record.port && cache.instanceId !== undefined) {
+        const target = await requestParaCodeVoiceTicket(record.port, cache.instanceId, token, timeoutMs);
+        if (target !== undefined) {
+          return target;
+        }
+        cache.instanceId = undefined;
+      }
+      // 生存確認を経路の応答で代え、instanceId は health から取る
       instanceId = await requestParaCodeInstanceId(record.port, timeoutMs);
+      if (cache !== undefined && instanceId !== undefined) {
+        cache.port = record.port;
+        cache.instanceId = instanceId;
+      }
     } else {
       try {
         process.kill(record.pid!, 0);

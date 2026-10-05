@@ -274,7 +274,12 @@ class BufferedVoicePlayback implements VoicePlayback {
   private killed = false;
   private resolveEnded!: () => void;
 
-  constructor(private readonly kind: PlayerKind, private readonly gainDb: number, private readonly command: (name: string) => string) {
+  constructor(
+    private readonly kind: PlayerKind,
+    private readonly gainDb: number,
+    private readonly command: (name: string) => string,
+    private readonly tempRoot: () => string,
+  ) {
     const ended = new Promise<void>(resolve => { this.resolveEnded = resolve; });
     this.done = ended.then(() => this.playAll());
   }
@@ -320,10 +325,22 @@ class BufferedVoicePlayback implements VoicePlayback {
     if (this.chunks.length === 0) {
       return { ok: true };
     }
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-mcp-'));
+    let directory: string;
+    try {
+      directory = fs.mkdtempSync(path.join(this.tempRoot(), 'aivis-mcp-'));
+    } catch (error) {
+      console.error('一時ファイルを作れませんでした:', error instanceof Error ? error.message : error);
+      return { ok: false, reason: 'player-spawn-failed' };
+    }
     const filePath = path.join(directory, 'speech.mp3');
     try {
-      fs.writeFileSync(filePath, Buffer.concat(this.chunks));
+      try {
+        fs.writeFileSync(filePath, Buffer.concat(this.chunks));
+      } catch (error) {
+        // ディスクが一杯など。鳴らせないので失敗として返す（例外のまま返さない）
+        console.error('一時ファイルに書けませんでした:', error instanceof Error ? error.message : error);
+        return { ok: false, reason: 'player-spawn-failed' };
+      }
       if (this.kind === 'start') {
         // 鳴り終わりを待てない（既定のアプリに渡すだけ）。消す前に少し待つ
         spawn('cmd', ['/c', 'start', '', filePath], { stdio: 'ignore' }).on('error', () => undefined);
@@ -340,7 +357,11 @@ class BufferedVoicePlayback implements VoicePlayback {
       }
       return await this.watch.done;
     } finally {
-      fs.rmSync(directory, { recursive: true, force: true });
+      try {
+        fs.rmSync(directory, { recursive: true, force: true });
+      } catch {
+        // 消せなくても結果は変えない
+      }
     }
   }
 }
@@ -365,8 +386,14 @@ function preludeChild(kind: PlayerKind, filePath: string, format: string, volume
 
 /**
  * @param command テスト用。プレイヤーの名前から起こすコマンドを決める（既定は名前のまま PATH から探す）
+ * @param tempRoot テスト用。全部溜めてから鳴らすときの一時フォルダの置き場
  */
-export function createAudioBackend(kind = detectPlayerKind(), canMeasure = hasFfmpeg(), command: (name: string) => string = name => name): AudioBackend {
+export function createAudioBackend(
+  kind = detectPlayerKind(),
+  canMeasure = hasFfmpeg(),
+  command: (name: string) => string = name => name,
+  tempRoot: () => string = () => os.tmpdir(),
+): AudioBackend {
   const streaming = kind === 'ffplay' || kind === 'mpv';
   return {
     kind,
@@ -379,7 +406,7 @@ export function createAudioBackend(kind = detectPlayerKind(), canMeasure = hasFf
       if (kind === 'mpv') {
         return new ProcessVoicePlayback(spawn(command('mpv'), mpvVoiceArgs(gainDb), { stdio: ['pipe', 'ignore', 'ignore'] }));
       }
-      return new BufferedVoicePlayback(kind, gainDb, command);
+      return new BufferedVoicePlayback(kind, gainDb, command, tempRoot);
     },
     playPrelude(filePath: string, format: string, volume: number): PreludePlayback {
       const child = preludeChild(kind, filePath, format, volume, command);
