@@ -61,6 +61,14 @@ describe('前の発話の文脈（メモリ）', () => {
     expect(memory.begin(v4('voiceA', 180))).toEqual({ previous_text: '一つ目' });
   });
 
+  test('forget で記録を消したら、次はつながない', () => {
+    const memory = new ElevenLabsContextMemory(() => 0);
+    memory.remember('voiceA', 'eleven_v4_turbo', 'req-1', '一つ目');
+    memory.forget();
+    expect(memory.hasLast).toBe(false);
+    expect(memory.begin(v4())).toBeUndefined();
+  });
+
   test('eleven_v3 系には付けない', () => {
     const memory = new ElevenLabsContextMemory(() => 0);
     memory.remember('voiceA', 'eleven_v3', 'req-1', '一つ目');

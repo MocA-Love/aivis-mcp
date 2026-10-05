@@ -9,7 +9,14 @@ import { ElevenLabsContextMemory, type ElevenLabsContext } from '../services/ele
 import { PronunciationDictionaryResolver } from '../services/dictionaries.js';
 
 /** `signal` が中断されたら、要求を取り消す（応答を待っている間・受け取っている間とも）。 */
-export type SynthesizeFunction = (config: AppConfig, params: Record<string, unknown>, signal?: AbortSignal) => Promise<NodeJS.ReadableStream>;
+export interface SynthesizeFunction {
+  (config: AppConfig, params: Record<string, unknown>, signal?: AbortSignal): Promise<NodeJS.ReadableStream>;
+  /**
+   * 合成を通らない声（取込の stream ジョブ）を鳴らした・合成し直す前に呼ぶ。直前の発話の文脈を消し、次の発話をつなげない。
+   * 文脈を覚えない合成関数では無い
+   */
+  forgetContext?: () => void;
+}
 
 /** provider 未指定のジョブは、ElevenLabs 対応より前の版が積んだものなので Aivis として扱う。 */
 export function providerOf(params: Record<string, unknown>): 'aivis' | 'elevenlabs' {
@@ -92,7 +99,7 @@ export function createSynthesizer(options: SynthesizerOptions = {}): SynthesizeF
   const dictionaries = options.dictionaryResolver ?? new PronunciationDictionaryResolver();
   const request = options.requestElevenLabs ?? requestElevenLabsStream;
 
-  return async (config, params, signal) => {
+  const synthesize: SynthesizeFunction = async (config, params, signal) => {
     if (providerOf(params) !== 'elevenlabs') {
       // 間に Aivis の声が挟まったら、前の ElevenLabs の発話とはつなげない
       memory.begin(undefined);
@@ -136,6 +143,8 @@ export function createSynthesizer(options: SynthesizerOptions = {}): SynthesizeF
     }
     return stream;
   };
+  synthesize.forgetContext = () => memory.forget();
+  return synthesize;
 }
 
 /** worker が使う合成。文脈は worker のプロセスが生きている間だけ覚える */

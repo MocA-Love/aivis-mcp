@@ -150,6 +150,32 @@ function applySettingsPatch(current: UserSettings, patch: SettingsPatch): UserSe
   return next;
 }
 
+/**
+ * 書き戻すために設定を読む。ファイルが無ければ空。読めない・JSON として壊れているときは投げる
+ * （{@link loadSettings} のように空として扱うと、APIキーなど既存の設定を変更分だけで上書きして消してしまう）。
+ */
+function loadSettingsForUpdate(): UserSettings {
+  let data: string;
+  try {
+    data = fs.readFileSync(configFile(), 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return {};
+    }
+    throw new Error(`設定ファイルを読めないので書きません: ${(error as NodeJS.ErrnoException).code ?? 'unknown'}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    throw new Error('設定ファイルが JSON として読めないので書きません（直すか消してからやり直してください）');
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('設定ファイルの中身がオブジェクトではないので書きません');
+  }
+  return parsed as UserSettings;
+}
+
 /** 設定ファイルのロックが空かなかった */
 export class SettingsLockError extends Error {}
 
@@ -160,7 +186,7 @@ export class SettingsLockError extends Error {}
  */
 export async function updateSettings(patch: SettingsPatch): Promise<UserSettings> {
   return withFileLock(configFile(), () => {
-    const next = applySettingsPatch(loadSettings(), patch);
+    const next = applySettingsPatch(loadSettingsForUpdate(), patch);
     saveSettings(next);
     return next;
   }, { lockError: lockPath => new SettingsLockError(`設定ファイルのロック（${lockPath}）が空きません。ほかのプロセスが書いています`) });

@@ -47,6 +47,18 @@ describe('設定ファイルの書き込み', () => {
     expect(loadSettings().elevenlabs?.volumeMigrated).toBe(true);
   });
 
+  test('config.json が壊れていたら書かずにエラーにする（既存の設定を変更分だけで上書きしない）', async () => {
+    for (const broken of ['{ "apiKey": "k", }', '[]', 'null']) {
+      fs.writeFileSync(configFile, broken);
+      await expect(updateSettings({ aivis: { userDictionaryUuid: 'u' } })).rejects.toThrow('書きません');
+      expect(fs.readFileSync(configFile, 'utf8')).toBe(broken);
+    }
+    fs.rmSync(configFile);
+    await updateSettings({ aivis: { userDictionaryUuid: 'u' } });
+    expect(loadSettings()).toEqual({ aivis: { userDictionaryUuid: 'u' } });
+    expect(fs.existsSync(gainLockPath(configFile))).toBe(false);
+  });
+
   test('config.json の辞書と文脈の時間を読む（版は辞書があるときだけ）', () => {
     fs.writeFileSync(configFile, JSON.stringify({
       elevenlabs: { contextWindowMinutes: 2, pronunciationDictionaryId: ' d ', pronunciationDictionaryVersionId: 'v' },

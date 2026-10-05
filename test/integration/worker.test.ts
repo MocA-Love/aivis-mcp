@@ -20,7 +20,7 @@ import type { AppConfig } from '../../src/config.js';
 import { connect, describeWithRedis, startTestRedis, waitFor, type TestRedis } from '../helpers/redis.js';
 import { FakeBackend } from '../helpers/fake-backend.js';
 import { mp3Frames, testConfig } from '../helpers/fixtures.js';
-import { createSynthesizer } from '../../src/audio/synthesize.js';
+import { createSynthesizer, type SynthesizeFunction } from '../../src/audio/synthesize.js';
 import type { ElevenLabsRequestExtras } from '../../src/services/elevenlabs-client.js';
 
 describeWithRedis('worker（別ポートの redis-server）', () => {
@@ -60,7 +60,7 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function startWorker(backend: FakeBackend, options: { version?: string; synthesize?: () => Promise<NodeJS.ReadableStream>; measure?: () => Promise<{ integratedLufs: number; durationSeconds: number }>; loadConfig?: () => AppConfig } = {}): PlaybackWorker {
+  function startWorker(backend: FakeBackend, options: { version?: string; synthesize?: SynthesizeFunction; measure?: () => Promise<{ integratedLufs: number; durationSeconds: number }>; loadConfig?: () => AppConfig } = {}): PlaybackWorker {
     const worker = new PlaybackWorker({
       redisUrl: redis.url,
       version: options.version ?? '2.5.0',
@@ -503,6 +503,31 @@ describeWithRedis('worker（別ポートの redis-server）', () => {
       ['一つ目', {}],
       ['二つ目', { previous_request_ids: ['req-1'] }],
       ['三つ目', {}],
+    ]);
+  });
+
+  test('ElevenLabs の文脈: 取込の声（stream ジョブ）が挟まったらつながない', async () => {
+    const sent: { text: string; extras: ElevenLabsRequestExtras }[] = [];
+    const synthesize = createSynthesizer({
+      requestElevenLabs: async (_config, params, extras) => {
+        sent.push({ text: params.text, extras: extras ?? {} });
+        return { stream: Readable.from([mp3Frames(20)]), requestId: `req-${sent.length}`, sentText: params.text };
+      },
+    });
+    const config: AppConfig = { ...testConfig(redis.url), elevenLabsApiKey: 'k', elevenLabsVoiceId: 'voiceA' };
+    const eleven = (text: string) => ({ text, provider: 'elevenlabs' });
+    const first = await enqueueSynthesis(client, eleven('一つ目'));
+    await streamJob('ingested-voice');
+    const second = await enqueueSynthesis(client, eleven('二つ目'));
+    const third = await enqueueSynthesis(client, eleven('三つ目'));
+    startWorker(new FakeBackend(), { loadConfig: () => config, synthesize });
+    for (const id of [first.id, 'ingested-voice', second.id, third.id]) {
+      expect(await finalStatus(id)).toEqual({ status: 'done' });
+    }
+    expect(sent.map(item => [item.text, item.extras])).toEqual([
+      ['一つ目', {}],
+      ['二つ目', {}],
+      ['三つ目', { previous_request_ids: ['req-2'] }],
     ]);
   });
 });

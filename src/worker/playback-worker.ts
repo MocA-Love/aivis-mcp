@@ -1004,6 +1004,8 @@ export class PlaybackWorker {
   }
 
   private async playStreamJob(job: StreamJob, ctx: JobContext, handlingStartedAt: number, heldMs: number): Promise<Outcome> {
+    // 取込の声（Para Code の通知・SSH 先の発話）が挟まった。聞き手には声なので、前の ElevenLabs の発話とはつなげない
+    this.deps.synthesize.forgetContext?.();
     return this.playFromStream({
       job,
       ctx,
@@ -1274,6 +1276,8 @@ export class PlaybackWorker {
       prelude: undefined,
       params: { ...job.params, wait_ms: undefined, _paraCodeVoiceTarget: undefined, _voiceRequester: undefined },
     };
+    // 最初の合成が読み終えていれば、この発話自体が「直前の発話」として残っている。自分につなげないよう消す
+    this.deps.synthesize.forgetContext?.();
     try {
       return await this.playSynthJob(retry, ctx, 0, { muted: false, route: undefined });
     } finally {

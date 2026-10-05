@@ -4,7 +4,8 @@
  * worker 全体で、直前に合成した声の発話 1 件だけを覚える。次の発話がそれと同じ voice_id・model_id なら、
  * 前の発話の request ID（取れていなければ前の文）を要求に付けて声の調子をつなげる。どのペインからの発話かは問わない。
  * 間に別の声・別のモデル・Aivis の発話が挟まったら、その発話で置き換わるのでつなげない。
- * 着信音など声でない再生は合成を通らないので、挟まっても切れない。
+ * 取込の stream ジョブ（Para Code の通知や SSH 先から届いた合成済みの声）も聞き手には声なので、鳴らしたら記録を消す
+ * （worker が {@link ElevenLabsContextMemory.forget} を呼ぶ）。着信音（sound ジョブ・prelude）は声でないので、挟まっても切れない。
  * 合成に失敗した・途中で止めた発話は記録を消す（次はつなげない）。
  * worker が入れ替わったら消える（ファイルにも Redis にも置かない）。
  */
@@ -71,6 +72,11 @@ export class ElevenLabsContextMemory {
   /** 本文を最後まで読み終えた ElevenLabs の発話を、直前の発話として覚える。 */
   remember(voiceId: string, modelId: string, requestId: string | undefined, text: string): void {
     this.last = { voiceId, modelId, requestId, text, at: this.now() };
+  }
+
+  /** 直前の発話の記録を消す（合成を通らない声を鳴らしたとき。次の発話はつなげない）。 */
+  forget(): void {
+    this.last = undefined;
   }
 
   /** テスト用: 直前の発話を覚えているか */
