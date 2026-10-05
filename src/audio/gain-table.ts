@@ -98,7 +98,7 @@ export function median(values: readonly number[]): number {
   return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-function splitKey(key: string): { provider: string; voice: string; model: string } | undefined {
+export function splitKey(key: string): { provider: string; voice: string; model: string } | undefined {
   const first = key.indexOf(':');
   const last = key.lastIndexOf(':');
   if (first <= 0 || last <= first || last === key.length - 1) {

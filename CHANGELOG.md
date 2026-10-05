@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.5.4] - 2026-10-05
+
+更新したら `aivis-mcp --reboot` で worker を起動し直してください。
+
+### ElevenLabs の声ごとの調整
+
+- `config.json` の `elevenlabs.voiceSettings` に voice_id ごとの `stability` / `similarityBoost`（0〜1）を書くと、その声の合成で `voice_settings` に `stability` / `similarity_boost` を入れます。書いていないキーは送らず、ElevenLabs に保存した値を使います。`speed` はこれまでどおり
+- `eleven_v3` 系では stability を 0 / 0.5 / 1 の最寄りに丸めます
+- worker は発話ごとに設定を読み直します。範囲外の値・voice_id の形でない鍵は使わず、1 回だけ警告します
+- `tts-configure` の `elevenlabs_voice_settings` で設定・解除（`null`）でき、`tts-get-settings` の `elevenlabs.voice_settings` に表示します
+- Para Code から呼ぶ `aivis-mcp --set-voice-settings --voice <voice_id> [--stability <0..1>] [--similarity <0..1>]` と `--clear-voice-settings --voice <voice_id>` を足しました（出力の取り決めは `--set-dictionary` と同じ）
+
+### 音量の表を機械が読める形で
+
+- `aivis-mcp --list-gains --json`: 表（覚えた行と最初の値の行）を `{version, target, learnWindow, minLearnSeconds, entries:[{key, provider, voice, model, gainDb, sampleCount, updatedAt}]}` の JSON 1 つで出します。`--json` 無しは人が読む一覧
+- `aivis-mcp --reset-gain --key <provider:voice:model>`: その行の測定を捨てます（`gain.json.lock` を持って行ごと消す。壊れた `gain.json` は書かない）
+- `aivis-mcp --set-gain-learning [--window N] [--min-seconds S]`: `config.json` の `gain.learnWindow` / `gain.minLearnSeconds` を書きます
+- `--export-gains` / `--import-gains` に `--json` を付けると、標準出力に `{"ok":true,"written":N}` / `{"ok":true,"added":N,"updated":N,"skipped":N,"evicted":N,"dropped":N}` だけを出し、失敗は標準エラーに `error: <理由>` と終了コード 1
+
 ## [2.5.3] - 2026-10-05
 
 更新したら `aivis-mcp --reboot` で worker を起動し直してください。

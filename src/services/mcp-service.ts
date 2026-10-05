@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
 import { buildSynthesisParams, MAX_ELEVENLABS_CONTEXT_MINUTES, type AppConfig } from '../config.js';
-import { getConfigPath, updateSettings, TTS_PROVIDERS, type TtsProvider } from '../settings.js';
+import { applySettingsPatch, getConfigPath, modifySettings, TTS_PROVIDERS, type TtsProvider } from '../settings.js';
 import { AivisSpeechService } from './aivis-speech-service.js';
 import { spawnWorker } from './redis-service.js';
 import {
@@ -19,6 +19,8 @@ import {
 import { getAivisUserDictionary, isElevenLabsId, isUuid, listAivisUserDictionaries } from './dictionaries.js';
 import { supportsElevenLabsContext } from './elevenlabs-context.js';
 import { dictionaryPatch } from '../dictionary-command.js';
+import { applyVoiceSettingsCommand } from '../voice-settings-command.js';
+import { isElevenLabsV3Model, isVoiceSettingsVoiceId, voiceSettingsForRequest } from './voice-settings.js';
 
 const MCP_MODEL_ID = 'aivis-speech';
 const MCP_MODEL_NAME = 'Aivis Speech';
@@ -168,7 +170,12 @@ export class MCPService {
         elevenlabs_context_window_minutes: z.number().min(0).max(MAX_ELEVENLABS_CONTEXT_MINUTES).optional().describe('同じ声・同じモデルの前の発話が何分以内なら、その文脈を付けて声の調子をつなげるか（デフォルト5、0で付けない。eleven_v3 系には付かない）'),
         elevenlabs_pronunciation_dictionary_id: z.string().optional().describe('ElevenLabs の発音辞書の ID（tts-list-dictionaries で調べる）。空文字で辞書を使わない'),
         elevenlabs_pronunciation_dictionary_version_id: z.string().optional().describe('発音辞書の版の ID。省略・空文字なら合成のたびに最新の版を使う'),
-        aivis_user_dictionary_uuid: z.string().optional().describe('Aivis のユーザー辞書の UUID（tts-list-dictionaries で調べる）。空文字で辞書を使わない')
+        aivis_user_dictionary_uuid: z.string().optional().describe('Aivis のユーザー辞書の UUID（tts-list-dictionaries で調べる）。空文字で辞書を使わない'),
+        elevenlabs_voice_settings: z.object({
+          voice_id: z.string().min(1).optional().describe('調整する声の voice_id（省略時は今の声）'),
+          stability: z.number().min(0).max(1).nullable().optional().describe('voice_settings.stability（0〜1）。null で消して ElevenLabs に保存した値に戻す。eleven_v3 系では 0 / 0.5 / 1 の最寄りに丸めて送る'),
+          similarity_boost: z.number().min(0).max(1).nullable().optional().describe('voice_settings.similarity_boost（0〜1）。null で消して ElevenLabs に保存した値に戻す'),
+        }).optional().describe('ElevenLabs の声ごとの調整。指定したキーだけ変える。両方 null にすると、その声の調整を消す'),
       },
       async (params) => {
         try {
@@ -293,10 +300,29 @@ export class MCPService {
         pronunciation_dictionary: config.elevenLabsPronunciationDictionaryId === undefined
           ? null
           : { id: config.elevenLabsPronunciationDictionaryId, version_id: config.elevenLabsPronunciationDictionaryVersionId ?? 'latest' },
+        voice_settings: this.describeVoiceSettings(config),
       },
       volume_offset_db: config.volumeOffsetDb,
       gain,
       config_path: getConfigPath(),
+    };
+  }
+
+  /** 声ごとの調整（設定した値と、今の声・モデルで実際に送る値） */
+  private describeVoiceSettings(config: AppConfig): Record<string, unknown> {
+    const voices: Record<string, unknown> = {};
+    for (const [voiceId, entry] of Object.entries(config.elevenLabsVoiceSettings ?? {})) {
+      voices[voiceId] = {
+        ...(entry.stability !== undefined ? { stability: entry.stability } : {}),
+        ...(entry.similarityBoost !== undefined ? { similarity_boost: entry.similarityBoost } : {}),
+      };
+    }
+    const sent = voiceSettingsForRequest(config.elevenLabsVoiceSettings, config.elevenLabsVoiceId, config.elevenLabsModelId);
+    return {
+      voices,
+      current_voice_sent: Object.keys(sent).length > 0 ? sent : null,
+      description: '声ごとの stability / similarity_boost。値の無いキーは送らず、ElevenLabs に保存した値を使う。current_voice_sent は今の声・モデルで実際に送る値',
+      ...(isElevenLabsV3Model(config.elevenLabsModelId) ? { note: 'eleven_v3 系のモデルは stability を 0 / 0.5 / 1 の最寄りに丸めて送ります' } : {}),
     };
   }
 
@@ -313,6 +339,7 @@ export class MCPService {
     elevenlabs_pronunciation_dictionary_id?: string;
     elevenlabs_pronunciation_dictionary_version_id?: string;
     aivis_user_dictionary_uuid?: string;
+    elevenlabs_voice_settings?: { voice_id?: string; stability?: number | null; similarity_boost?: number | null };
   }) {
     const current = this.loadConfig();
     const candidate: AppConfig = {
@@ -328,6 +355,20 @@ export class MCPService {
       elevenLabsContextWindowMinutes: params.elevenlabs_context_window_minutes ?? current.elevenLabsContextWindowMinutes,
     };
     const warnings: string[] = [];
+
+    const voiceSettings = params.elevenlabs_voice_settings;
+    const voiceSettingsVoiceId = voiceSettings === undefined ? undefined : (voiceSettings.voice_id?.trim() || candidate.elevenLabsVoiceId);
+    if (voiceSettings !== undefined) {
+      if (voiceSettingsVoiceId === undefined) {
+        return errorResult('保存しませんでした。調整する声が分かりません。elevenlabs_voice_settings.voice_id を指定してください。');
+      }
+      if (!isVoiceSettingsVoiceId(voiceSettingsVoiceId)) {
+        return errorResult(`保存しませんでした。voice_id "${voiceSettingsVoiceId}" の形が違います。`);
+      }
+      if (voiceSettings.stability === undefined && voiceSettings.similarity_boost === undefined) {
+        return errorResult('保存しませんでした。elevenlabs_voice_settings には stability か similarity_boost を指定してください（消すときは null）。');
+      }
+    }
 
     const dictionaryError = await this.checkDictionaries(candidate, params, warnings);
     if (dictionaryError !== undefined) {
@@ -390,7 +431,7 @@ export class MCPService {
         : undefined;
     const aivisUuid = params.aivis_user_dictionary_uuid?.trim();
     const aivisDictionary = aivisUuid === undefined ? undefined : dictionaryPatch('aivis', aivisUuid || undefined).aivis;
-    await updateSettings({
+    const patch = {
       provider: params.provider,
       apiKey: params.aivis_api_key,
       modelUuid: params.aivis_model_uuid,
@@ -406,6 +447,17 @@ export class MCPService {
         ...elevenDictionary,
       },
       aivis: aivisDictionary,
+    };
+    await modifySettings(settings => {
+      const next = applySettingsPatch(settings, patch);
+      if (voiceSettings === undefined || voiceSettingsVoiceId === undefined) {
+        return next;
+      }
+      // 声ごとの調整は、ロックを持ったまま読んだ表に重ねる（ほかの声の調整を消さない）
+      return applyVoiceSettingsCommand(next, {
+        voiceId: voiceSettingsVoiceId,
+        patch: { stability: voiceSettings.stability, similarityBoost: voiceSettings.similarity_boost },
+      });
     });
 
     // 環境変数やCLI引数は config.json より優先されるので、保存しても反映されない項目を知らせる

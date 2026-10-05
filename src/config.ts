@@ -2,6 +2,7 @@ import { parseArgs } from 'node:util';
 import { createRequire } from 'module';
 import { loadSettingsWithMigration, isTtsProvider, type TtsProvider } from './settings.js';
 import { legacyElevenLabsVolumeToOffset, resolveGainLearningSettings } from './audio/gain-table.js';
+import { sanitizeVoiceSettings, type ElevenLabsVoiceSettingsMap } from './services/voice-settings.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -37,6 +38,8 @@ export interface AppConfig {
   elevenLabsPronunciationDictionaryId?: string;
   /** ElevenLabs の発音辞書の版（無ければ合成のたびに最新の版を取る） */
   elevenLabsPronunciationDictionaryVersionId?: string;
+  /** ElevenLabs の声（voice_id）ごとの調整（stability / similarityBoost）。無ければ ElevenLabs に保存した値 */
+  elevenLabsVoiceSettings?: ElevenLabsVoiceSettingsMap;
   /** Aivis のユーザー辞書の UUID */
   aivisUserDictionaryUuid?: string;
   /** すべての声に足す上乗せ（dB） */
@@ -101,6 +104,17 @@ export const cliOptions = {
   'clear-dictionary':    { type: 'boolean' as const, default: false },
   id:                    { type: 'string' as const },
   'version-id':          { type: 'string' as const },
+  'set-voice-settings':  { type: 'boolean' as const, default: false },
+  'clear-voice-settings': { type: 'boolean' as const, default: false },
+  stability:             { type: 'string' as const },
+  similarity:            { type: 'string' as const },
+  'list-gains':          { type: 'boolean' as const, default: false },
+  'reset-gain':          { type: 'boolean' as const, default: false },
+  key:                   { type: 'string' as const },
+  'set-gain-learning':   { type: 'boolean' as const, default: false },
+  window:                { type: 'string' as const },
+  'min-seconds':         { type: 'string' as const },
+  json:                  { type: 'boolean' as const, default: false },
   wait:                  { type: 'string' as const, short: 'w' },
   debug:                 { type: 'boolean' as const, short: 'd', default: false },
 };
@@ -246,6 +260,7 @@ export function resolveConfig(values: Record<string, ArgValue>): AppConfig {
     elevenLabsPronunciationDictionaryVersionId: nonEmptyString(settings.elevenlabs?.pronunciationDictionaryId) === undefined
       ? undefined
       : nonEmptyString(settings.elevenlabs?.pronunciationDictionaryVersionId),
+    elevenLabsVoiceSettings: sanitizeVoiceSettings(settings.elevenlabs?.voiceSettings, warnGainSettingOnce),
     aivisUserDictionaryUuid: nonEmptyString(settings.aivis?.userDictionaryUuid),
     volumeOffsetDb:
       optNumber(undefined, 'AIVIS_VOLUME_OFFSET_DB')
