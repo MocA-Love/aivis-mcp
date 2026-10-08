@@ -451,6 +451,7 @@ Para Code から起動されると、次のように動きます。
 - Para Code の通知の読み上げ（着信音つき）と SSH 先の声は、Para Code が常駐させる `aivis-mcp --ingest` を通して同じ worker の列に入ります。エージェントの声とも重ならず、許可・質問の通知（high）が先に読まれます。音声入力中は hold で止まります
 - `--ingest` の標準入出力の取り決めは [docs/ingest-protocol.md](./docs/ingest-protocol.md) にあります
 - エージェントの声は、合成しながら Para Code（モバイルアプリ）へも送ります。Para Code が新しい取込（`stream-v1`）を名乗ったときだけ、受け取りながら chunked で送ります
+- モバイルが聞いているときは、PC で前の声を鳴らしている間に、待っている声を先に合成してモバイルへ送ります（PC では順番が来たら同じ音声を鳴らします）。PC の待ちで期限切れになった声も、モバイルへは届けます（[docs/ingest-protocol.md](./docs/ingest-protocol.md) の「モバイルへの先送り」）
 - SSH 先で発話したときは、Para Code が応答のヘッダー `X-Para-Local-Playback: accepted` で引き受けたら接続先では鳴らさず、ヘッダーが 1 つも来ないまま接続に失敗したときだけ接続先で鳴らします
 
 ## 使用例

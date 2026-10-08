@@ -1,5 +1,6 @@
 import fs from 'fs';
 import http from 'http';
+import { routeLog } from './route-log.js';
 
 /**
  * Para Code へ生成済み音声を渡すための、1回限りの認証済みlocalhost転送先。
@@ -25,10 +26,20 @@ export interface ParaCodeVoiceTarget {
    * 無ければ、ミュート中の接続先は localPlayback の ticket で送らない。
    */
   muteAware?: boolean;
+  /**
+   * 新しい Para Code が名乗る、ticket を発行した時点でモバイルが声を聞いている（宛先の）数。無ければ分からない
+   * （古い Para Code）。1 以上なら worker は PC の再生待ちを待たずに合成してモバイルへ送る。
+   */
+  mobileListeners?: number;
+  /** 新しい Para Code が名乗る。使わなかった ticket を `/paradis-mcp/mobile-voice-ticket/release` で返せる。 */
+  release?: boolean;
 }
 
-/** 手元のloopbackでの発行待ち。モバイル副経路でPC再生キューを待たせないよう短くする。 */
-const LOCAL_TIMEOUT_MS = 300;
+/**
+ * 手元のloopbackでの発行待ち。300ms では Para Code の shared process が混んでいるときに間に合わず、その 1 件が
+ * モバイルへ届かなかった。積む前に 1 回待つだけなので 1 秒まで待つ。
+ */
+export const LOCAL_TIMEOUT_MS = 1_000;
 /** SSH先からの戻り経路（ssh -R）越しの待ち。 */
 const REMOTE_TIMEOUT_MS = 1500;
 /** 応答の本文の上限。 */
@@ -61,7 +72,14 @@ export function isParaCodeVoiceTarget(value: unknown): value is ParaCodeVoiceTar
     && target.expiresAt > Date.now()
     && (target.localPlayback === undefined || typeof target.localPlayback === 'boolean')
     && (target.ingress === undefined || (typeof target.ingress === 'string' && target.ingress.length <= 32))
-    && (target.muteAware === undefined || typeof target.muteAware === 'boolean');
+    && (target.muteAware === undefined || typeof target.muteAware === 'boolean')
+    && (target.mobileListeners === undefined || (typeof target.mobileListeners === 'number' && Number.isSafeInteger(target.mobileListeners) && target.mobileListeners >= 0))
+    && (target.release === undefined || typeof target.release === 'boolean');
+}
+
+/** ticket を発行したときにモバイルが聞いていたか（古い Para Code は名乗らないので undefined）。 */
+export function mobileListening(target: ParaCodeVoiceTarget | undefined): boolean | undefined {
+  return target?.mobileListeners === undefined ? undefined : target.mobileListeners > 0;
 }
 
 function paneToken(env: NodeJS.ProcessEnv): string | undefined {
@@ -128,17 +146,29 @@ export interface InstanceIdCache {
 }
 
 export async function captureParaCodeVoiceTarget(env: NodeJS.ProcessEnv = process.env, cache?: InstanceIdCache): Promise<ParaCodeVoiceTarget | undefined> {
+  const { target } = await captureParaCodeVoiceTargetDetailed(env, cache);
+  return target;
+}
+
+/** ticket を取った結果と、取れなかった理由（ログに残す。値は短い印だけ）。 */
+export interface VoiceTargetCapture {
+  readonly target?: ParaCodeVoiceTarget;
+  /** issued / no-env / no-port-file / pid-gone / no-instance / timeout / status-<code> / invalid / error */
+  readonly reason: string;
+}
+
+export async function captureParaCodeVoiceTargetDetailed(env: NodeJS.ProcessEnv = process.env, cache?: InstanceIdCache): Promise<VoiceTargetCapture> {
   // ターミナルのペインで動く場合はペイントークン、拡張機能ホスト経由（Codex等）で動く場合は
   // 音声取込専用トークンが渡ってくる。どちらも Para Code のloopbackだけが受理する。
   const token = paneToken(env);
   const portFile = env.PARA_CODE_MCP_PORT_FILE;
   if (token === undefined || !portFile) {
-    return undefined;
+    return { reason: 'no-env' };
   }
   try {
     const record = readPortFile(portFile);
     if (record === undefined) {
-      return undefined;
+      return { reason: 'no-port-file' };
     }
     let instanceId: string | undefined;
     // 戻り経路はSSHを往復するので、手元より長めに待つ
@@ -147,13 +177,13 @@ export async function captureParaCodeVoiceTarget(env: NodeJS.ProcessEnv = proces
       timeoutMs = REMOTE_TIMEOUT_MS;
       // 覚えている instanceId があれば health を飛ばす（ticket の応答の instanceId で確かめる）
       if (cache?.port === record.port && cache.instanceId !== undefined) {
-        const target = await requestParaCodeVoiceTicket(record.port, cache.instanceId, token, timeoutMs);
-        if (target === undefined) {
+        const result = await requestParaCodeVoiceTicket(record.port, cache.instanceId, token, timeoutMs);
+        if (result.target === undefined) {
           // Para Code が起動し直したなどで古いかもしれない。捨てて、次の依頼で health から取り直す
           // （この依頼は諦める。呼び出し側は控えの ticket を使う。health まで続けると最大 4.5 秒かかる）
           cache.instanceId = undefined;
         }
-        return target;
+        return result;
       }
       // 生存確認を経路の応答で代え、instanceId は health から取る
       instanceId = await requestParaCodeInstanceId(record.port, timeoutMs);
@@ -165,22 +195,38 @@ export async function captureParaCodeVoiceTarget(env: NodeJS.ProcessEnv = proces
       try {
         process.kill(record.pid!, 0);
       } catch {
-        return undefined;
+        return { reason: 'pid-gone' };
       }
       instanceId = record.instanceId;
     }
     if (instanceId === undefined) {
-      return undefined;
+      return { reason: 'no-instance' };
     }
     return await requestParaCodeVoiceTicket(record.port, instanceId, token, timeoutMs);
   } catch {
-    return undefined;
+    return { reason: 'error' };
   }
+}
+
+/** ticket を取った結果を 1 行残す（取れたか・モバイルの宛先の数・手元で鳴らすか。ticket そのものは書かない）。 */
+export function logVoiceTargetCapture(capture: VoiceTargetCapture, source: string): void {
+  if (capture.reason === 'no-env') {
+    // Para Code の外で動いている。毎回書くほどのことではない
+    return;
+  }
+  routeLog(capture.target === undefined ? 'ticket.none' : 'ticket.issued', {
+    source,
+    reason: capture.target === undefined ? capture.reason : undefined,
+    listeners: capture.target?.mobileListeners,
+    local: capture.target?.localPlayback === true ? true : undefined,
+  });
 }
 
 /** 発話の引数に、その場で取った Para Code の転送先を添える（取れなければそのまま）。 */
 export async function withParaCodeVoiceTarget(params: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const voiceTarget = await captureParaCodeVoiceTarget();
+  const capture = await captureParaCodeVoiceTargetDetailed();
+  logVoiceTargetCapture(capture, 'enqueue');
+  const voiceTarget = capture.target;
   return voiceTarget === undefined ? params : { ...params, _paraCodeVoiceTarget: voiceTarget };
 }
 
@@ -239,7 +285,7 @@ export function requestSmall(options: http.RequestOptions, timeoutMs: number, bo
   });
 }
 
-async function requestParaCodeVoiceTicket(port: number, expectedInstanceId: string, authToken: string, timeoutMs: number): Promise<ParaCodeVoiceTarget | undefined> {
+async function requestParaCodeVoiceTicket(port: number, expectedInstanceId: string, authToken: string, timeoutMs: number): Promise<VoiceTargetCapture> {
   // 任意のモバイル副経路でPC再生キューを待たせないよう、loopback発行は短時間で諦める。
   const response = await requestSmall({
     hostname: '127.0.0.1',
@@ -248,16 +294,40 @@ async function requestParaCodeVoiceTicket(port: number, expectedInstanceId: stri
     method: 'POST',
     headers: { Authorization: `Bearer ${authToken}`, 'Content-Length': 0 },
   }, timeoutMs);
-  if (response === undefined || response.statusCode !== 201 || response.body.length === 0) {
-    return undefined;
+  if (response === undefined) {
+    return { reason: 'timeout' };
+  }
+  if (response.statusCode !== 201 || response.body.length === 0) {
+    return { reason: `status-${response.statusCode}` };
   }
   try {
     const body = JSON.parse(response.body.toString('utf8')) as Partial<ParaCodeVoiceTarget>;
     const target = { ...body, port };
-    return target.instanceId === expectedInstanceId && isParaCodeVoiceTarget(target) ? target : undefined;
+    return target.instanceId === expectedInstanceId && isParaCodeVoiceTarget(target) ? { target, reason: 'issued' } : { reason: 'invalid' };
   } catch {
-    return undefined;
+    return { reason: 'invalid' };
   }
+}
+
+/** 返す要求の待ち。 */
+const RELEASE_TIMEOUT_MS = 1_000;
+
+/**
+ * 使わなかった ticket を Para Code へ返す（ペインごとの枚数の上限を、使われない ticket で埋めない）。Para Code が
+ * `release: true` を名乗った ticket だけ。返せたら true。期限切れ・返せなかったときは何もしない（10 分で切れる）。
+ */
+export async function releaseParaCodeVoiceTicket(target: ParaCodeVoiceTarget, hostname = '127.0.0.1'): Promise<boolean> {
+  if (target.release !== true || target.expiresAt <= Date.now()) {
+    return false;
+  }
+  const response = await requestSmall({
+    hostname,
+    port: target.port,
+    path: '/paradis-mcp/mobile-voice-ticket/release',
+    method: 'POST',
+    headers: { Authorization: `Bearer ${target.ticket}`, 'Content-Length': 0 },
+  }, RELEASE_TIMEOUT_MS);
+  return response !== undefined && response.statusCode >= 200 && response.statusCode < 300;
 }
 
 /** 戻り経路の先にいる Para Code の instanceId を health から読む（読めなければ undefined）。 */

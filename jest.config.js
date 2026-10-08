@@ -11,5 +11,6 @@ export default {
     '^.+\\.ts$': ['ts-jest', { useESM: true, tsconfig: '<rootDir>/tsconfig.test.json' }],
   },
   setupFiles: ['<rootDir>/test/helpers/env.ts'],
+  globalTeardown: '<rootDir>/test/helpers/teardown.js',
   testTimeout: 30000,
 };
