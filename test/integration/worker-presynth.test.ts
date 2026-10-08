@@ -373,6 +373,10 @@ describeWithRedis('モバイルへの先送り（Q309 A、別ポートの redis-
     expect(await finalStatus(job.id)).toEqual({ status: 'done' });
     expect(events).toEqual(['synth:鳴っている', 'synth:失敗する', 'synth:失敗する']);
     expect(backend.voices).toHaveLength(2);
+    // 合成し直した音は、同じ ticket でモバイルへも届く（失敗した 1 回目は Para Code へ届いていない）
+    await waitFor(() => paraCode.bodies.length === 1 || undefined);
+    expect(paraCode.bodies[0].bytes.length).toBe(417 * 20);
+    expect(paraCode.released).toEqual([]);
   });
 
   test('期限切れの声を裏で送るのは 4 件まで。超えた分は合成しない', async () => {
@@ -382,7 +386,8 @@ describeWithRedis('モバイルへの先送り（Q309 A、別ポートの redis-
       events.push(`synth:${String(params.text)}`);
       const stream = new PassThrough();
       stream.write(mp3Frames(5));
-      setTimeout(() => stream.end(mp3Frames(5)), 500);
+      // 6 件を取り出し終えるまで、最初の送り出しが終わらないようにする
+      setTimeout(() => stream.end(mp3Frames(5)), 2_000);
       return stream;
     };
     synthesize.forgetContext = () => undefined;
@@ -394,7 +399,7 @@ describeWithRedis('モバイルへの先送り（Q309 A、別ポートの redis-
     for (const id of ids) {
       expect(await finalStatus(id)).toEqual({ status: 'skipped', reason: 'expired' });
     }
-    await waitFor(() => paraCode.bodies.length === 4 || undefined, 15_000);
+    await waitFor(() => paraCode.bodies.length === 4 || undefined, 20_000);
     await waitFor(() => paraCode.released.length === 2 || undefined);
     expect(events).toEqual(['synth:期限切れ0', 'synth:期限切れ1', 'synth:期限切れ2', 'synth:期限切れ3']);
   });

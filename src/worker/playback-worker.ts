@@ -160,7 +160,7 @@ interface PresynthEntry {
   released: boolean;
   /** 列にも PC の番にも見えなくなった時刻（片付けの判断） */
   missingSince?: number;
-  /** 合成の番が来て Para Code への送り出しをつないだ（ticket を使った） */
+  /** Para Code への送り出しに最初の断片を渡した（ticket を使った） */
   connected: boolean;
 }
 
@@ -172,8 +172,6 @@ interface SynthesisLink {
   readonly priority: 'main' | 'presynth';
   /** 合成の番が来たときに呼ぶ（Para Code への送り出しをここでつなぐ。{@link PlaybackWorker.gatedForward}） */
   readonly onStart?: () => void;
-  /** 番が来た後、合成する前に呼ぶ（ticket をここで取る）。false なら合成しない */
-  readonly beforeSynthesis?: () => Promise<boolean>;
 }
 
 /** 合成の流れ 1 本。 */
@@ -1313,17 +1311,8 @@ export class PlaybackWorker {
       const releaseGate = await this.synthesisGate.acquire(link.priority, link.jobId);
       markStarted();
       try {
-        let proceed = true;
-        if (link.beforeSynthesis !== undefined && !stopped && !ctx.cancelled) {
-          proceed = await link.beforeSynthesis().catch(() => false);
-        }
         // 止められていても呼ぶ（送り出しは ticket を受け取ってから、止めた印を見て終わる）
         link.onStart?.();
-        if (!proceed) {
-          finished = true;
-          fail('stopped');
-          return;
-        }
         await synthesizeOnce();
       } finally {
         releaseGate();
@@ -1648,12 +1637,12 @@ export class PlaybackWorker {
     });
     routeLog('presynth.played', { job: shortId(job.id), status: outcome.status, reason: outcome.reason });
     if (entry !== undefined && outcome.status !== 'done' && outcome.status !== 'held' && !ctx.cancelled && (entry.writer?.bytes ?? 0) === 0) {
-      // 先送りの合成が音を書かずに終わった（429 などの失敗・止めた）。PC の番で合成し直す。まだ Para Code へつないで
-      // いなければ、同じ ticket でモバイルへも送る
+      // 先送りの合成が音を書かずに終わった（429 などの失敗・止めた）。PC の番で合成し直し、同じ ticket でモバイルへも送る。
+      // 音が無いので ticket は Para Code へ届いていないはず。届いていても 1 回限りなので Para Code が 401 で断り、二重には届かない
       await settleWithin(entry.done, SYNTHESIS_SETTLE_MS);
-      routeLog('presynth.resynthesize', { job: shortId(job.id), status: outcome.status, reason: outcome.reason, connected: entry.connected });
+      routeLog('presynth.resynthesize', { job: shortId(job.id), status: outcome.status, reason: outcome.reason });
       await this.op(this.command.del(streamKey)).catch(() => undefined);
-      return this.playSynthJob(job, ctx, heldMs, { muted: false, route: entry.connected ? undefined : this.voiceRouteFor(job) });
+      return this.playSynthJob(job, ctx, heldMs, { muted: false, route: this.voiceRouteFor(job) });
     }
     if (outcome.status !== 'done' && entry?.run?.failed === true) {
       return { status: 'failed', reason: 'synthesis-failed' };
@@ -1707,22 +1696,18 @@ export class PlaybackWorker {
     this.backgroundRoutes.add(route);
     const ctx: JobContext = { id: job.id, reported: true, cancelled: false, kills: new Set() };
     this.backgroundContexts.add(ctx);
-    let target: ParaCodeVoiceTarget | undefined;
     const task = (async () => {
       const tagged = hasEmotionTags(job.params.text);
-      // ticket は合成の番が来てから取る（番を待つ間に切れない）。送れないと分かったら合成しない
-      const beforeSynthesis = async () => {
-        target = await route.obtain();
-        if (target === undefined || target.localPlayback === true || mobileListening(target) !== true) {
-          routeLog('expired.dropped', { job: shortId(job.id), reason: target === undefined ? 'no-ticket' : 'no-listeners' });
-          return false;
-        }
-        route.used.add(target.ticket);
-        return true;
-      };
+      // ticket は番を待つ前に取る（番を握ったまま MCP サーバーの返事を待たない。ticket は 10 分使える）
+      const target = await route.obtain();
+      if (target === undefined || target.localPlayback === true || mobileListening(target) !== true) {
+        routeLog('expired.dropped', { job: shortId(job.id), reason: target === undefined ? 'no-ticket' : 'no-listeners' });
+        return;
+      }
+      route.used.add(target.ticket);
       const { forward, onStart } = this.gatedForward(() => target, { gainKey: this.synthGainKey(config, job.params), tagged });
       // 聞こえる順には入らない（PC では鳴らさない）ので、前の発話の文脈はつながない
-      const synthesis = this.runSynthesis(config, job.params, ctx, undefined, forward, { jobId: job.id, prevVoiceId: () => undefined, priority: 'presynth', onStart, beforeSynthesis });
+      const synthesis = this.runSynthesis(config, job.params, ctx, undefined, forward, { jobId: job.id, prevVoiceId: () => undefined, priority: 'presynth', onStart });
       ctx.kills.add(synthesis.stop);
       // 1 発話の上限は番が来てから数える
       await Promise.race([synthesis.started, synthesis.done]);
@@ -1734,9 +1719,7 @@ export class PlaybackWorker {
         forward.abort();
       }
       await settleWithin(synthesis.done, SYNTHESIS_SETTLE_MS);
-      if (target !== undefined && route.used.has(target.ticket)) {
-        routeLog('expired.forwarded', { job: shortId(job.id), ok: synthesis.completed, listeners: target.mobileListeners });
-      }
+      routeLog('expired.forwarded', { job: shortId(job.id), ok: synthesis.completed, listeners: target.mobileListeners });
     })().catch(error => {
       console.error('Expired forward error:', summarizeError(error));
     }).finally(() => {
@@ -1919,12 +1902,29 @@ export class PlaybackWorker {
       const params = job.params;
       const ctx: JobContext = { id: job.id, reported: true, cancelled: false, kills: new Set() };
       const gated = this.gatedForward(() => target, { gainKey: this.synthGainKey(config, params), tagged: hasEmotionTags(params.text) });
-      const forward = gated.forward;
+      const inner = gated.forward;
+      // 最初の断片を渡した時点で「送った」とみなす（Node の http.request は本文を書くまでヘッダーも送らないので、
+      // 断片が無いまま終わった件の ticket は Para Code へ届いていない）
+      const forward: ParaCodeForward = {
+        push: chunk => {
+          if (!entry.connected) {
+            entry.connected = true;
+            route!.used.add(target.ticket);
+          }
+          inner.push(chunk);
+        },
+        end: () => inner.end(),
+        abort: () => inner.abort(),
+        decision: inner.decision,
+        outcome: inner.outcome,
+        settled: inner.settled,
+      };
+      let stopRun: (() => void) | undefined;
       const onStart = () => {
-        // ここで初めて ticket を Para Code へ渡す。つなぐ前に止めた件は、PC の番が同じ ticket で送り直せる
-        if (!ctx.cancelled && this.active) {
-          entry.connected = true;
-          route!.used.add(target.ticket);
+        if (!this.active) {
+          // worker が止まるところ。つないでモバイルへ送らない（次の worker が今どおり送る）
+          forward.abort();
+          stopRun?.();
         }
         gated.onStart();
       };
@@ -1945,6 +1945,7 @@ export class PlaybackWorker {
         }
       };
       const run = this.runSynthesis(config, params, ctx, writer, forward, { jobId: job.id, prevVoiceId: prevVoiceAtTurn, priority: 'presynth', onStart });
+      stopRun = run.stop;
       // 1 発話の上限（番を待つ間を含む）。止まった合成で先送りの枠を握り続けない
       entry.writer = writer;
       entry.run = run;
