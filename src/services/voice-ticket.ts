@@ -19,7 +19,7 @@
 import type { RedisClientType } from 'redis';
 import { VOICE_TICKET_REPLY_PREFIX, VOICE_TICKET_REQUEST_PREFIX } from '../queue/keys.js';
 import { withTimeout } from '../queue/timeout.js';
-import { captureParaCodeVoiceTarget, isParaCodeVoiceTarget, isRemoteParaCodePane, type InstanceIdCache, type ParaCodeVoiceTarget } from './para-code-voice.js';
+import { captureParaCodeVoiceTargetDetailed, isParaCodeVoiceTarget, isRemoteParaCodePane, logVoiceTargetCapture, type InstanceIdCache, type ParaCodeVoiceTarget } from './para-code-voice.js';
 
 /** worker が返事を待つ上限（手元のペイン）。 */
 export const VOICE_TICKET_WAIT_MS = 1_500;
@@ -80,7 +80,11 @@ export class VoiceTicketResponder {
     capture?: () => Promise<ParaCodeVoiceTarget | undefined>,
     private readonly isRemotePane: () => boolean = () => isRemoteParaCodePane(),
   ) {
-    this.capture = capture ?? (() => captureParaCodeVoiceTarget(process.env, this.instanceCache));
+    this.capture = capture ?? (async () => {
+      const result = await captureParaCodeVoiceTargetDetailed(process.env, this.instanceCache);
+      logVoiceTargetCapture(result, 'mcp');
+      return result.target;
+    });
   }
 
   /** 購読を始める。失敗したら例外（呼び出し側は積む時に ticket を取る方へ戻る）。 */

@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.6.0] - 2026-10-09
+
+更新したら `aivis-mcp --reboot` で worker を起動し直してください。
+
+- Para Code のモバイルが聞いているとき、PC の再生待ちを待たずに声を先に合成してモバイルへ送るようにしました（PC では順番が来たら同じ音声を鳴らし、合成は 1 回）。PC の待ちで期限切れになった声もモバイルへは届けます。手元の ticket の待ちを 300ms から 1 秒にし、使わなかった ticket は Para Code へ返し、行き先の判断を `~/.config/aivis-mcp/logs/voice-route.log` に残します（新しい Para Code が要ります。古い Para Code とは 2.5.4 と同じ動き）
+
 ## [2.5.4] - 2026-10-05
 
 更新したら `aivis-mcp --reboot` で worker を起動し直してください。

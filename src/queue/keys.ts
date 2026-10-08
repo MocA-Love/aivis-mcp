@@ -48,6 +48,16 @@ export const VOICE_TICKET_REQUEST_PREFIX = 'aivis-mcp:voice-ticket:req:';
 export const VOICE_TICKET_REPLY_PREFIX = 'aivis-mcp:voice-ticket:res:';
 
 /**
+ * worker が PC の再生待ちの間に先に合成した（モバイルへ先に送った）印。中身は Stream と同じ ID。入れ替わった worker は
+ * 印があれば合成し直さず Stream から鳴らす（worker/presynth.ts）。
+ */
+export const PRESYNTH_PREFIX = 'aivis-mcp:presynth:';
+
+export function presynthKey(id: string): string {
+  return PRESYNTH_PREFIX + id;
+}
+
+/**
  * `--ingest` が起動時に受けた着信音の許可フォルダ（SET、`--ingest` ごとに 1 つ）。worker は全部の和集合で確かめる。
  */
 export const PRELUDE_DIRS_PREFIX = 'aivis-mcp:prelude-dirs:';

@@ -3,7 +3,10 @@ import http from 'http';
 import type { AddressInfo } from 'net';
 import os from 'os';
 import path from 'path';
-import { captureParaCodeVoiceTarget, isRemoteParaCodePane, requestParaCodeInstanceId } from '../../src/services/para-code-voice.js';
+import {
+  captureParaCodeVoiceTarget, captureParaCodeVoiceTargetDetailed, isParaCodeVoiceTarget, isRemoteParaCodePane, LOCAL_TIMEOUT_MS, mobileListening,
+  releaseParaCodeVoiceTicket, requestParaCodeInstanceId,
+} from '../../src/services/para-code-voice.js';
 
 async function withServer(handler: http.RequestListener, run: (port: number) => Promise<void>): Promise<void> {
   const server = http.createServer(handler);
@@ -95,5 +98,51 @@ describe('Para Code の ticket と health', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
-});
 
+  test('[Q309] モバイルの宛先の数と ticket を返せるかを読み、壊れた値は受け取らない', () => {
+    const base = { ticket: 't', port: 1, instanceId: 'i', expiresAt: Date.now() + 60_000 };
+    expect(isParaCodeVoiceTarget({ ...base, mobileListeners: 2, release: true })).toBe(true);
+    expect(isParaCodeVoiceTarget({ ...base, mobileListeners: -1 })).toBe(false);
+    expect(isParaCodeVoiceTarget({ ...base, mobileListeners: 1.5 })).toBe(false);
+    expect(isParaCodeVoiceTarget({ ...base, release: 'yes' })).toBe(false);
+    expect([mobileListening({ ...base, mobileListeners: 1 }), mobileListening({ ...base, mobileListeners: 0 }), mobileListening(base)]).toEqual([true, false, undefined]);
+  });
+
+  test('[Q309 案 4] 手元の ticket は 1 秒まで待ち、取れなかった理由を返す', async () => {
+    expect(LOCAL_TIMEOUT_MS).toBe(1_000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aivis-pc-'));
+    try {
+      await withServer((request, response) => {
+        if (request.url === '/paradis-mcp/health') {
+          response.end(JSON.stringify({ instanceId: 'instance' }));
+          return;
+        }
+        response.writeHead(429);
+        response.end();
+      }, async port => {
+        const portFile = path.join(dir, 'port.json');
+        fs.writeFileSync(portFile, JSON.stringify({ port }));
+        const env = { PARA_CODE_TERMINAL_PANE_ID: 'pane-token', PARA_CODE_MCP_PORT_FILE: portFile };
+        expect(await captureParaCodeVoiceTargetDetailed(env)).toEqual({ reason: 'status-429' });
+        expect(await captureParaCodeVoiceTargetDetailed({})).toEqual({ reason: 'no-env' });
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('[Q309 案 4] 使わなかった ticket は、Para Code が release を名乗ったときだけ返す', async () => {
+    const released: string[] = [];
+    await withServer((request, response) => {
+      released.push(`${request.url} ${request.headers.authorization}`);
+      response.writeHead(204);
+      response.end();
+    }, async port => {
+      const target = { ticket: 'unused', port, instanceId: 'i', expiresAt: Date.now() + 60_000 };
+      expect(await releaseParaCodeVoiceTicket(target)).toBe(false);
+      expect(await releaseParaCodeVoiceTicket({ ...target, release: true, expiresAt: Date.now() - 1 })).toBe(false);
+      expect(await releaseParaCodeVoiceTicket({ ...target, release: true })).toBe(true);
+    });
+    expect(released).toEqual(['/paradis-mcp/mobile-voice-ticket/release Bearer unused']);
+  });
+});
