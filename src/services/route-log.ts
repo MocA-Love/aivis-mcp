@@ -4,6 +4,8 @@
  * worker は標準エラーを捨てる子として起きるので、判断の跡をファイルに置かないと後から追えない。
  * 音声の本文・ticket・ペインのトークンは書かない（呼び出し側が渡すのは ID の頭と数と理由だけ）。
  * 1 MiB を超えたら `.1` へ回し、2 つまでしか持たない。書けなくても発話は止めない。
+ * worker・MCP サーバー・`aivis` コマンドが同じファイルへ書くので、回すときに別のプロセスと重なると数行落ちることがある
+ * （判断の跡なので許容する。ロックは取らない）。
  */
 
 import fs from 'fs';
@@ -49,7 +51,7 @@ export function routeLog(event: string, fields: Record<string, RouteLogValue> = 
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     try {
-      if (fs.statSync(file).size + line.length > ROUTE_LOG_MAX_BYTES) {
+      if (fs.statSync(file).size + Buffer.byteLength(line) > ROUTE_LOG_MAX_BYTES) {
         fs.renameSync(file, `${file}.1`);
       }
     } catch {

@@ -6,4 +6,5 @@ process.env.AIVIS_GAIN_FILE = path.join(os.tmpdir(), `aivis-mcp-test-gain-${proc
 // 手元の ~/.config/aivis-mcp/config.json も読み書きしない
 process.env.AIVIS_CONFIG_FILE = path.join(os.tmpdir(), `aivis-mcp-test-config-${process.pid}-does-not-exist.json`);
 // 声の行き先のログも手元の ~/.config/aivis-mcp/logs へ書かない
+// （test/helpers/teardown.js が最後にまとめて消す）
 process.env.AIVIS_ROUTE_LOG_FILE = path.join(os.tmpdir(), `aivis-mcp-test-route-${process.pid}.log`);

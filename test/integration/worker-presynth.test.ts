@@ -325,4 +325,77 @@ describeWithRedis('モバイルへの先送り（Q309 A、別ポートの redis-
     expect(backend.voices).toHaveLength(1);
     expect(paraCode.bodies).toHaveLength(0);
   });
+
+  test('先送りの合成が番を握っている間に、先送りしない声（wait_ms 付き）が来ても、番を待って鳴らす', async () => {
+    const paraCode = await fakeParaCode();
+    const events: string[] = [];
+    const synthesize: Synthesize = async (_config, params) => {
+      events.push(`synth:${String(params.text)}`);
+      if (params.text !== '遅い先送り') {
+        return Readable.from([mp3Frames(20)]);
+      }
+      const stream = new PassThrough();
+      stream.write(mp3Frames(10));
+      setTimeout(() => stream.end(mp3Frames(10)), 2500);
+      return stream;
+    };
+    synthesize.forgetContext = () => undefined;
+    const backend = new FakeBackend({ voiceMs: 300 });
+    startWorker(backend, synthesize);
+    const busy = await enqueueSynthesis(client, { text: '鳴っている', provider: 'aivis' });
+    await waitFor(async () => (await lastStatus(busy.id)) === 'playing' || undefined);
+    const waiting = await enqueueSynthesis(client, { text: '少し待つ', provider: 'aivis', wait_ms: 50 });
+    const presynth = await enqueueSynthesis(client, { text: '遅い先送り', provider: 'aivis', _paraCodeVoiceTarget: mobileTarget(paraCode.port, { mobileListeners: 1 }) });
+    expect(await finalStatus(waiting.id, 15_000)).toEqual({ status: 'done' });
+    expect(await finalStatus(presynth.id, 15_000)).toEqual({ status: 'done' });
+    expect(events).toEqual(['synth:鳴っている', 'synth:遅い先送り', 'synth:少し待つ']);
+    expect(backend.voices).toHaveLength(3);
+    await waitFor(() => paraCode.bodies.length === 1 || undefined);
+  });
+
+  test('先送りの合成が音を書かずに失敗したら（429 など）、PC の番で合成し直して鳴らす', async () => {
+    const paraCode = await fakeParaCode();
+    const events: string[] = [];
+    let failures = 0;
+    const synthesize: Synthesize = async (_config, params) => {
+      events.push(`synth:${String(params.text)}`);
+      if (params.text === '失敗する' && failures++ === 0) {
+        throw new Error('429');
+      }
+      return Readable.from([mp3Frames(20)]);
+    };
+    synthesize.forgetContext = () => undefined;
+    const backend = new FakeBackend({ voiceMs: 800 });
+    startWorker(backend, synthesize);
+    const busy = await enqueueSynthesis(client, { text: '鳴っている', provider: 'aivis' });
+    await waitFor(async () => (await lastStatus(busy.id)) === 'playing' || undefined);
+    const job = await enqueueSynthesis(client, { text: '失敗する', provider: 'aivis', _paraCodeVoiceTarget: mobileTarget(paraCode.port, { mobileListeners: 1 }) });
+    expect(await finalStatus(job.id)).toEqual({ status: 'done' });
+    expect(events).toEqual(['synth:鳴っている', 'synth:失敗する', 'synth:失敗する']);
+    expect(backend.voices).toHaveLength(2);
+  });
+
+  test('期限切れの声を裏で送るのは 4 件まで。超えた分は合成しない', async () => {
+    const paraCode = await fakeParaCode();
+    const events: string[] = [];
+    const synthesize: Synthesize = async (_config, params) => {
+      events.push(`synth:${String(params.text)}`);
+      const stream = new PassThrough();
+      stream.write(mp3Frames(5));
+      setTimeout(() => stream.end(mp3Frames(5)), 500);
+      return stream;
+    };
+    synthesize.forgetContext = () => undefined;
+    const ids = Array.from({ length: 6 }, () => uuidv4());
+    for (const [index, id] of ids.entries()) {
+      await enqueueJob(client, { v: 2, type: 'synth', id, priority: 'normal', source: 'agent', enqueuedAt: Date.now() - 200_000, params: { text: `期限切れ${index}`, provider: 'aivis', _paraCodeVoiceTarget: mobileTarget(paraCode.port, { mobileListeners: 1, release: true }) } });
+    }
+    startWorker(new FakeBackend(), synthesize);
+    for (const id of ids) {
+      expect(await finalStatus(id)).toEqual({ status: 'skipped', reason: 'expired' });
+    }
+    await waitFor(() => paraCode.bodies.length === 4 || undefined, 15_000);
+    await waitFor(() => paraCode.released.length === 2 || undefined);
+    expect(events).toEqual(['synth:期限切れ0', 'synth:期限切れ1', 'synth:期限切れ2', 'synth:期限切れ3']);
+  });
 });

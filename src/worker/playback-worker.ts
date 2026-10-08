@@ -160,6 +160,8 @@ interface PresynthEntry {
   released: boolean;
   /** 列にも PC の番にも見えなくなった時刻（片付けの判断） */
   missingSince?: number;
+  /** 合成の番が来て Para Code への送り出しをつないだ（ticket を使った） */
+  connected: boolean;
 }
 
 /** 合成の番と、ElevenLabs の文脈をつなぐかを決める手がかり。 */
@@ -170,6 +172,8 @@ interface SynthesisLink {
   readonly priority: 'main' | 'presynth';
   /** 合成の番が来たときに呼ぶ（Para Code への送り出しをここでつなぐ。{@link PlaybackWorker.gatedForward}） */
   readonly onStart?: () => void;
+  /** 番が来た後、合成する前に呼ぶ（ticket をここで取る）。false なら合成しない */
+  readonly beforeSynthesis?: () => Promise<boolean>;
 }
 
 /** 合成の流れ 1 本。 */
@@ -200,6 +204,16 @@ const PLAYER_STOP_WAIT_MS = PLAYER_KILL_GRACE_MS + 1_000;
 const SYNTH_EXTRA_LIMIT_MS = 30_000;
 /** 控えの ticket を使うのに残っていてほしい時間。 */
 const FALLBACK_MIN_REMAINING_MS = 15_000;
+/** setTimeout に渡せる最長（これを超えると Node は 1 ms に縮める）。 */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+/** {@link PlaybackWorker.waitBounded} に渡す「期限なし」。 */
+const NO_DEADLINE = Number.POSITIVE_INFINITY;
+/** 引き継いだ先送りの Stream が書き終わるのを待つ上限。 */
+const INHERITED_END_WAIT_MS = 5_000;
+/** 期限切れの声を裏でモバイルへ送る件の上限（待っている件を含む）。 */
+const EXPIRED_FORWARD_MAX_PENDING = 4;
+/** 先送りの見回りで読む列の長さ（取り出す側の端から）。 */
+const PRESYNTH_SCAN_WINDOW = 64;
 /** 列にも PC の番にも見えない先送りの件を片付けるまで。 */
 const PRESYNTH_ORPHAN_MS = 10_000;
 
@@ -1298,9 +1312,18 @@ export class PlaybackWorker {
     const done = (async () => {
       const releaseGate = await this.synthesisGate.acquire(link.priority, link.jobId);
       markStarted();
-      // 止められていても呼ぶ（送り出しは ticket を受け取ってから、止めた印を見て終わる）
-      link.onStart?.();
       try {
+        let proceed = true;
+        if (link.beforeSynthesis !== undefined && !stopped && !ctx.cancelled) {
+          proceed = await link.beforeSynthesis().catch(() => false);
+        }
+        // 止められていても呼ぶ（送り出しは ticket を受け取ってから、止めた印を見て終わる）
+        link.onStart?.();
+        if (!proceed) {
+          finished = true;
+          fail('stopped');
+          return;
+        }
         await synthesizeOnce();
       } finally {
         releaseGate();
@@ -1325,10 +1348,16 @@ export class PlaybackWorker {
     };
   }
 
-  /** 止められる・hold・期限のどれかまで待つ。 */
+  /**
+   * 止められる・hold・期限のどれかまで待つ。`deadline` が {@link NO_DEADLINE}（または setTimeout に渡せない遠さ）なら
+   * 期限では打ち切らない（2^31-1 ms を超える setTimeout は Node が 1 ms に縮めるため）。
+   */
   private async waitBounded<T>(promise: Promise<T>, ctx: JobContext, deadline: number): Promise<Bounded<T>> {
     let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), Math.max(0, deadline - this.now())); });
+    const remaining = Math.max(0, deadline - this.now());
+    const timeout = remaining > MAX_TIMER_MS
+      ? new Promise<'timeout'>(() => undefined)
+      : new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), remaining); });
     try {
       const raced = await this.raceHold(Promise.race([promise.then(value => ({ value })), timeout]), () => undefined, ctx);
       if (raced === HOLD_INTERRUPTED) {
@@ -1357,7 +1386,7 @@ export class PlaybackWorker {
       return { status: 'failed', reason: 'not-configured' };
     }
     if (typeof params.wait_ms === 'number' && params.wait_ms > 0) {
-      const waited = await this.waitBounded(delay(Math.min(params.wait_ms, 60000)), ctx, Number.MAX_SAFE_INTEGER);
+      const waited = await this.waitBounded(delay(Math.min(params.wait_ms, 60000)), ctx, NO_DEADLINE);
       if (waited === 'held') {
         return { status: 'held' };
       }
@@ -1405,7 +1434,7 @@ export class PlaybackWorker {
 
     try {
       // 先送りの合成が走っていれば、それが終わるまで待つ（合成は 1 本ずつ）。hold・中断で抜ける。最初の音の時計は番が来てから数える
-      const begun = await this.waitBounded(Promise.race([synthesis.started, synthesis.done]), ctx, Number.MAX_SAFE_INTEGER);
+      const begun = await this.waitBounded(Promise.race([synthesis.started, synthesis.done]), ctx, NO_DEADLINE);
       if (typeof begun === 'string') {
         return stoppedOutcome(begun);
       }
@@ -1583,15 +1612,20 @@ export class PlaybackWorker {
   /** 先送りで合成済み（合成中）の声を、Stream から鳴らす。モバイルへはもう送ってある。 */
   private async playPresynthesized(job: SynthJob, ctx: JobContext, heldMs: number, entry: PresynthEntry | undefined): Promise<Outcome> {
     const streamKey = audioStreamKey(job.id);
-    if (entry === undefined && (await this.op(this.command.exists(streamKey))) === 0) {
-      // 入れ替わる前の worker が先送りした Stream が切れていた。モバイルへは送ってあるので、送らずに合成し直して鳴らす
-      routeLog('presynth.inherited-missing', { job: shortId(job.id) });
-      return this.playSynthJob(job, ctx, heldMs, { muted: false, route: undefined });
+    if (entry === undefined) {
+      const state = await this.inheritedStreamState(streamKey, ctx);
+      if (state !== 'complete') {
+        // 入れ替わる前の worker が先送りした Stream が切れていた・中断された・終わらない。モバイルへは送ってあるので、
+        // 送らずに合成し直して鳴らす
+        routeLog('presynth.inherited-broken', { job: shortId(job.id), state });
+        await this.op(this.command.del(streamKey)).catch(() => undefined);
+        return this.playSynthJob(job, ctx, heldMs, { muted: false, route: undefined });
+      }
     }
     if (entry?.run !== undefined) {
       // 先送りの合成がまだ番を待っていれば PC の番に上げ、番が来るまで待つ（最初の音の時計はその後から数える）
       this.synthesisGate.promote(job.id);
-      const begun = await this.waitBounded(Promise.race([entry.run.started, entry.done]), ctx, Number.MAX_SAFE_INTEGER);
+      const begun = await this.waitBounded(Promise.race([entry.run.started, entry.done]), ctx, NO_DEADLINE);
       if (begun === 'held') {
         return { status: 'held' };
       }
@@ -1613,16 +1647,43 @@ export class PlaybackWorker {
       heldMs,
     });
     routeLog('presynth.played', { job: shortId(job.id), status: outcome.status, reason: outcome.reason });
-    if (entry === undefined && !ctx.cancelled && (outcome.status === 'skipped' || (outcome.status === 'failed' && (outcome.reason === 'first-audio-timeout' || outcome.reason === 'slow-arrival')))) {
-      // 入れ替わる前の worker が先送りを途中で止めた（中断の印・終わりの印が無い）。PC で鳴らす前なので、送らずに合成し直す
-      routeLog('presynth.inherited-broken', { job: shortId(job.id), status: outcome.status, reason: outcome.reason });
+    if (entry !== undefined && outcome.status !== 'done' && outcome.status !== 'held' && !ctx.cancelled && (entry.writer?.bytes ?? 0) === 0) {
+      // 先送りの合成が音を書かずに終わった（429 などの失敗・止めた）。PC の番で合成し直す。まだ Para Code へつないで
+      // いなければ、同じ ticket でモバイルへも送る
+      await settleWithin(entry.done, SYNTHESIS_SETTLE_MS);
+      routeLog('presynth.resynthesize', { job: shortId(job.id), status: outcome.status, reason: outcome.reason, connected: entry.connected });
       await this.op(this.command.del(streamKey)).catch(() => undefined);
-      return this.playSynthJob(job, ctx, heldMs, { muted: false, route: undefined });
+      return this.playSynthJob(job, ctx, heldMs, { muted: false, route: entry.connected ? undefined : this.voiceRouteFor(job) });
     }
     if (outcome.status !== 'done' && entry?.run?.failed === true) {
       return { status: 'failed', reason: 'synthesis-failed' };
     }
     return outcome;
+  }
+
+  /**
+   * 入れ替わる前の worker が先送りした Stream の終わり方。最後の項目が終わりの印なら complete。まだ書いている途中なら
+   * 少しだけ（{@link INHERITED_END_WAIT_MS}）待つ。中断の印・無い・待っても終わらないときはそれぞれ返す。
+   */
+  private async inheritedStreamState(streamKey: string, ctx: JobContext): Promise<'complete' | 'missing' | 'aborted' | 'unfinished'> {
+    const deadline = this.now() + INHERITED_END_WAIT_MS;
+    while (true) {
+      const last = await this.op(this.command.xRevRange(streamKey, '+', '-', { COUNT: 1 })).catch(() => []);
+      if (last.length === 0) {
+        return 'missing';
+      }
+      const message = last[0].message as Record<string, string>;
+      if (message.e !== undefined) {
+        return 'complete';
+      }
+      if (message.a !== undefined || message.c !== undefined) {
+        return 'aborted';
+      }
+      if (this.now() >= deadline || ctx.cancelled || !this.active) {
+        return 'unfinished';
+      }
+      await delay(100);
+    }
   }
 
   /**
@@ -1634,25 +1695,37 @@ export class PlaybackWorker {
       routeLog('expired.dropped', { job: shortId(job.id), reason: route.expectLocalPlayback ? 'local-ticket' : 'no-listeners' });
       return;
     }
+    if (this.backgroundForwards.size >= EXPIRED_FORWARD_MAX_PENDING) {
+      // 期限切れが続くほど混んでいる。古い声を裏で溜め続けない（使わなかった ticket は扱い終えたときに返す）
+      routeLog('expired.dropped', { job: shortId(job.id), reason: 'backlog' });
+      return;
+    }
+    const config = this.deps.loadConfig();
+    if (synthesisSetupError(config, job.params) !== undefined) {
+      return;
+    }
     this.backgroundRoutes.add(route);
     const ctx: JobContext = { id: job.id, reported: true, cancelled: false, kills: new Set() };
     this.backgroundContexts.add(ctx);
+    let target: ParaCodeVoiceTarget | undefined;
     const task = (async () => {
-      const config = this.deps.loadConfig();
-      if (synthesisSetupError(config, job.params) !== undefined) {
-        return;
-      }
-      const target = await route.obtain();
-      if (target === undefined || target.localPlayback === true || mobileListening(target) !== true) {
-        routeLog('expired.dropped', { job: shortId(job.id), reason: target === undefined ? 'no-ticket' : 'no-listeners' });
-        return;
-      }
-      route.used.add(target.ticket);
       const tagged = hasEmotionTags(job.params.text);
+      // ticket は合成の番が来てから取る（番を待つ間に切れない）。送れないと分かったら合成しない
+      const beforeSynthesis = async () => {
+        target = await route.obtain();
+        if (target === undefined || target.localPlayback === true || mobileListening(target) !== true) {
+          routeLog('expired.dropped', { job: shortId(job.id), reason: target === undefined ? 'no-ticket' : 'no-listeners' });
+          return false;
+        }
+        route.used.add(target.ticket);
+        return true;
+      };
       const { forward, onStart } = this.gatedForward(() => target, { gainKey: this.synthGainKey(config, job.params), tagged });
       // 聞こえる順には入らない（PC では鳴らさない）ので、前の発話の文脈はつながない
-      const synthesis = this.runSynthesis(config, job.params, ctx, undefined, forward, { jobId: job.id, prevVoiceId: () => undefined, priority: 'presynth', onStart });
+      const synthesis = this.runSynthesis(config, job.params, ctx, undefined, forward, { jobId: job.id, prevVoiceId: () => undefined, priority: 'presynth', onStart, beforeSynthesis });
       ctx.kills.add(synthesis.stop);
+      // 1 発話の上限は番が来てから数える
+      await Promise.race([synthesis.started, synthesis.done]);
       let timer: NodeJS.Timeout | undefined;
       await Promise.race([synthesis.done, new Promise<void>(resolve => { timer = setTimeout(resolve, MAX_UTTERANCE_MS); })]);
       clearTimeout(timer);
@@ -1661,7 +1734,9 @@ export class PlaybackWorker {
         forward.abort();
       }
       await settleWithin(synthesis.done, SYNTHESIS_SETTLE_MS);
-      routeLog('expired.forwarded', { job: shortId(job.id), ok: synthesis.completed, listeners: target.mobileListeners });
+      if (target !== undefined && route.used.has(target.ticket)) {
+        routeLog('expired.forwarded', { job: shortId(job.id), ok: synthesis.completed, listeners: target.mobileListeners });
+      }
     })().catch(error => {
       console.error('Expired forward error:', summarizeError(error));
     }).finally(() => {
@@ -1728,12 +1803,19 @@ export class PlaybackWorker {
     if (this.presynths.size >= PRESYNTH_MAX_ENTRIES || bytes >= PRESYNTH_MAX_BYTES) {
       return;
     }
-    const [high, normal] = await this.op(Promise.all([this.command.lRange(HIGH_QUEUE_KEY, 0, -1), this.command.lRange(NORMAL_QUEUE_KEY, 0, -1)]));
+    // 取り出す側の端（右端）から決まった数だけ読む（250ms ごとに列を全部読まない）
+    const [high, normal] = await this.op(Promise.all([
+      this.command.lRange(HIGH_QUEUE_KEY, -PRESYNTH_SCAN_WINDOW, -1),
+      this.command.lRange(NORMAL_QUEUE_KEY, -PRESYNTH_SCAN_WINDOW, -1),
+    ]));
     if (!this.active || this.presynthRunning) {
       return;
     }
     const jobs = jobsInDequeueOrder(high, normal);
-    this.dropOrphanedPresynths(new Set(jobs.map(queued => queued.id)));
+    if (high.length < PRESYNTH_SCAN_WINDOW && normal.length < PRESYNTH_SCAN_WINDOW) {
+      // 列を全部読めたときだけ、見えない件を片付ける（読んだ窓の外の件を消えたと取り違えない）
+      this.dropOrphanedPresynths(new Set(jobs.map(queued => queued.id)));
+    }
     let config: AppConfig | undefined;
     for (let index = 0; index < jobs.length; index++) {
       const job = jobs[index];
@@ -1777,6 +1859,7 @@ export class PlaybackWorker {
       writer: undefined,
       run: undefined,
       released: false,
+      connected: false,
     };
     this.presynths.set(job.id, entry);
     let decidedPresynth = false;
@@ -1832,16 +1915,27 @@ export class PlaybackWorker {
         await this.op(this.command.del(audioStreamKey(job.id))).catch(() => undefined);
         return settle('declined', 'redis-error');
       }
-      route!.used.add(target.ticket);
       const config = this.deps.loadConfig();
       const params = job.params;
-      const { forward, onStart } = this.gatedForward(() => target, { gainKey: this.synthGainKey(config, params), tagged: hasEmotionTags(params.text) });
       const ctx: JobContext = { id: job.id, reported: true, cancelled: false, kills: new Set() };
+      const gated = this.gatedForward(() => target, { gainKey: this.synthGainKey(config, params), tagged: hasEmotionTags(params.text) });
+      const forward = gated.forward;
+      const onStart = () => {
+        // ここで初めて ticket を Para Code へ渡す。つなぐ前に止めた件は、PC の番が同じ ticket で送り直せる
+        if (!ctx.cancelled && this.active) {
+          entry.connected = true;
+          route!.used.add(target.ticket);
+        }
+        gated.onStart();
+      };
       const startedAt = this.now();
       // 文脈は番が来たときの列で決め直す（見回りの後に high の声が前に入ることがある）
       const prevVoiceAtTurn = async () => {
         try {
-          const [high, normal] = await this.op(Promise.all([this.command.lRange(HIGH_QUEUE_KEY, 0, -1), this.command.lRange(NORMAL_QUEUE_KEY, 0, -1)]));
+          const [high, normal] = await this.op(Promise.all([
+            this.command.lRange(HIGH_QUEUE_KEY, -PRESYNTH_SCAN_WINDOW, -1),
+            this.command.lRange(NORMAL_QUEUE_KEY, -PRESYNTH_SCAN_WINDOW, -1),
+          ]));
           const jobs = jobsInDequeueOrder(high, normal);
           const index = jobs.findIndex(queued => queued.id === job.id);
           const prev = index < 0 ? undefined : prevVoiceBefore(jobs, index, this.currentVoiceId ?? this.lastVoiceId);
@@ -1852,13 +1946,15 @@ export class PlaybackWorker {
       };
       const run = this.runSynthesis(config, params, ctx, writer, forward, { jobId: job.id, prevVoiceId: prevVoiceAtTurn, priority: 'presynth', onStart });
       // 1 発話の上限（番を待つ間を含む）。止まった合成で先送りの枠を握り続けない
-      const limit = setTimeout(() => {
-        run.stop();
-        forward.abort();
-      }, MAX_UTTERANCE_MS + SYNTH_EXTRA_LIMIT_MS);
       entry.writer = writer;
       entry.run = run;
       entry.done = (async () => {
+        // 1 発話の上限は番が来てから数える（番を待つ間で使い切らない）
+        await Promise.race([run.started, run.done]);
+        const limit = setTimeout(() => {
+          run.stop();
+          forward.abort();
+        }, MAX_UTTERANCE_MS + SYNTH_EXTRA_LIMIT_MS);
         await run.done;
         clearTimeout(limit);
         await settleWithin(writer.settled(), SYNTHESIS_SETTLE_MS);
@@ -1898,9 +1994,27 @@ export class PlaybackWorker {
       if (now - entry.missingSince >= PRESYNTH_ORPHAN_MS) {
         routeLog('presynth.orphaned', { job: shortId(entry.jobId) });
         this.releasePresynth(entry);
+        // ほかの worker が積む時の控えで送っているかもしれないので、ticket は返さずに忘れるだけ
+        this.routes.delete(entry.jobId);
+      }
+    }
+    // 先送りを見送った件の送り先も、この worker が扱わずに列から消えたら忘れる
+    for (const jobId of [...this.routes.keys()]) {
+      if (queued.has(jobId) || this.currentVoiceId === jobId || this.mainClaimed.has(jobId) || this.presynths.has(jobId) || this.backgroundRoutes.has(this.routes.get(jobId)!)) {
+        this.routeMissingSince.delete(jobId);
+        continue;
+      }
+      const since = this.routeMissingSince.get(jobId) ?? now;
+      this.routeMissingSince.set(jobId, since);
+      if (now - since >= PRESYNTH_ORPHAN_MS) {
+        this.routes.delete(jobId);
+        this.routeMissingSince.delete(jobId);
       }
     }
   }
+
+  /** 送り先が列にも PC の番にも見えなくなった時刻 */
+  private readonly routeMissingSince = new Map<string, number>();
 
   /** PC の側がこの件を扱い終えた。合成が終わってから Stream と印を消す。 */
   private releasePresynth(entry: PresynthEntry): void {
@@ -1924,6 +2038,11 @@ export class PlaybackWorker {
     if (abort) {
       for (const entry of this.presynths.values()) {
         entry.run?.stop();
+        if (!entry.connected) {
+          // まだ Para Code へ送っていない。印を外して、次の worker が今どおり合成してモバイルへも送れるようにする
+          entry.writer?.discard();
+          void this.op(this.command.del([audioStreamKey(entry.jobId), presynthKey(entry.jobId)]), 1_000).catch(() => undefined);
+        }
       }
       for (const ctx of this.backgroundContexts) {
         this.cancel(ctx, 'worker-stopped');
