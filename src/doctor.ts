@@ -143,13 +143,13 @@ export async function runDoctor(config: AppConfig): Promise<void> {
   // [1/4] Node.js
   const nodeVersion = process.version;
   const nodeMajor = parseInt(nodeVersion.slice(1).split('.')[0], 10);
-  if (nodeMajor >= 18) {
+  if (nodeMajor >= 22) {
     console.log(`[1/${totalChecks}] Node.js`);
-    console.log(`  OK  ${nodeVersion} (>= 18.x)`);
+    console.log(`  OK  ${nodeVersion} (>= 22.x)`);
     okCount++;
   } else {
     console.log(`[1/${totalChecks}] Node.js`);
-    console.log(`  NG  ${nodeVersion} -- Node.js 18以上が必要です`);
+    console.log(`  NG  ${nodeVersion} -- Node.js 22以上が必要です`);
   }
   console.log('');
 

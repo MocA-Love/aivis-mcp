@@ -21,7 +21,7 @@ https://github.com/user-attachments/assets/c42722bd-8f2f-4543-bdc6-71668db3751d
 
 ## 必要条件
 
-- Node.js 18.x以上
+- Node.js 22.x以上
 - Aivis Cloud
   APIキー（[Aivis Hub](https://hub.aivis-project.com/cloud-api/api-keys)から取得）、または
   ElevenLabs APIキー（[ElevenLabs](https://elevenlabs.io/app/settings/api-keys)から取得）
